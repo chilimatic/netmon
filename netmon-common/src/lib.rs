@@ -165,12 +165,80 @@ impl PacketSource for &[u8] {
     }
 }
 
+/// Walks IPv6 extension headers from `next` at `off`. Returns the upper
+/// protocol, its offset, and false for a non-first fragment.
+#[inline(always)]
+fn skip_ipv6_ext<S: PacketSource>(s: &S, mut next: u8, mut off: usize) -> (u8, usize, bool) {
+    let mut first = true;
+    for _ in 0..MAX_IPV6_EXT {
+        let len = match next {
+            // Hop-by-hop, routing, destination options: (len + 1) * 8.
+            0 | 43 | 60 => match s.read::<2>(off) {
+                Some(e) => {
+                    next = e[0];
+                    (e[1] as usize + 1) * 8
+                }
+                None => break,
+            },
+            // Fragment: 8 bytes. Offset != 0 means no transport header.
+            44 => match s.read::<4>(off) {
+                Some(e) => {
+                    next = e[0];
+                    if u16::from_be_bytes([e[2], e[3]]) & 0xfff8 != 0 {
+                        first = false;
+                    }
+                    8
+                }
+                None => break,
+            },
+            // Authentication header: (len + 2) * 4.
+            51 => match s.read::<2>(off) {
+                Some(e) => {
+                    next = e[0];
+                    (e[1] as usize + 2) * 4
+                }
+                None => break,
+            },
+            _ => break,
+        };
+        off += len;
+    }
+    (next, off, first)
+}
+
+/// 802.1Q and 802.1ad (QinQ) VLAN tag protocol ids.
+pub const ETH_P_8021Q: u16 = 0x8100;
+pub const ETH_P_8021AD: u16 = 0x88A8;
+/// VLAN tags followed in packet data (QinQ has 2).
+pub const MAX_VLAN_TAGS: usize = 2;
+/// IPv6 extension headers followed before giving up.
+pub const MAX_IPV6_EXT: usize = 6;
+
 /// Parses the IP header at `l3_offset` and, for TCP and UDP, the ports.
-/// `ethertype` is the host-order L3 protocol (`ETH_P_IP` or `ETH_P_IPV6`).
-/// Other protocols return `None`. IPv6 extension headers are not followed:
-/// such packets are counted with the extension header as `proto` and port 0.
+/// `ethertype` is the host-order L3 protocol (`ETH_P_IP`, `ETH_P_IPV6`, or
+/// a VLAN tag protocol when the NIC did not strip the tag). Other protocols
+/// return `None`.
+///
+/// Up to MAX_VLAN_TAGS tags and MAX_IPV6_EXT IPv6 extension headers are
+/// skipped. Non-first fragments carry no ports. When a header cannot be
+/// read, the packet is returned with what is known (fail-open): `proto` is
+/// then the last header type and the ports are 0.
 #[inline(always)]
 pub fn parse_packet<S: PacketSource>(s: &S, l3_offset: usize, ethertype: u16) -> Option<Packet> {
+    let mut l3_offset = l3_offset;
+    let mut ethertype = ethertype;
+    // Tags are in the data only on devices with a link-layer header, where
+    // l3_offset points at the TCI after the tag protocol id.
+    if l3_offset != 0 {
+        for _ in 0..MAX_VLAN_TAGS {
+            if ethertype != ETH_P_8021Q && ethertype != ETH_P_8021AD {
+                break;
+            }
+            let t: [u8; 4] = s.read(l3_offset)?;
+            ethertype = u16::from_be_bytes([t[2], t[3]]);
+            l3_offset += 4;
+        }
+    }
     let mut p = Packet {
         family: 0,
         proto: 0,
@@ -205,11 +273,12 @@ pub fn parse_packet<S: PacketSource>(s: &S, l3_offset: usize, ethertype: u16) ->
                 return None;
             }
             p.family = 6;
-            p.proto = h[6];
             p.src.copy_from_slice(&h[8..24]);
             p.dst.copy_from_slice(&h[24..40]);
-            l4_offset = l3_offset + 40;
-            has_ports = true;
+            let (proto, off, first) = skip_ipv6_ext(s, h[6], l3_offset + 40);
+            p.proto = proto;
+            l4_offset = off;
+            has_ports = first;
         }
         _ => return None,
     }
@@ -346,24 +415,85 @@ mod tests {
         assert_eq!(eg.reversed().reversed(), eg);
     }
 
-    // The kernel parser does not follow VLAN tags or IPv6 extension headers
-    // yet (REVIEW 9, Phase 2). These tests pin today's behavior so the
-    // change in Phase 2 is visible.
-
-    #[test]
-    fn vlan_ethertype_is_not_parsed() {
-        assert!(parse_packet(&&TCP_V4[..], 14, 0x8100).is_none());
+    /// TCP_V4 with VLAN tags inserted after the MAC addresses.
+    fn tagged(tpids: &[u16]) -> ([u8; 128], usize, u16) {
+        let mut b = [0u8; 128];
+        let mut n = 12;
+        for (i, t) in tpids.iter().enumerate() {
+            b[n..n + 2].copy_from_slice(&t.to_be_bytes());
+            b[n + 2..n + 4].copy_from_slice(&(100 + i as u16).to_be_bytes());
+            n += 4;
+        }
+        b[n..n + 42].copy_from_slice(&TCP_V4[12..54]);
+        (b, n + 42, tpids[0])
     }
 
     #[test]
-    fn ipv6_extension_header_gives_no_ports() {
-        let mut b = [0u8; 14 + 40 + 8 + 4];
+    fn vlan_tags_are_skipped() {
+        for tpids in [&[ETH_P_8021Q][..], &[ETH_P_8021AD, ETH_P_8021Q][..]] {
+            let (b, len, et) = tagged(tpids);
+            // skb->protocol is the outer tag; l3_offset points after it.
+            let p = parse_packet(&&b[..len], 14, et).unwrap();
+            assert_eq!((p.family, p.sport, p.dport), (4, 40000, 443), "{tpids:x?}");
+        }
+        // Three tags are more than followed: no IP header found.
+        let (b, len, et) = tagged(&[ETH_P_8021AD, ETH_P_8021Q, ETH_P_8021Q]);
+        assert!(parse_packet(&&b[..len], 14, et).is_none());
+    }
+
+    /// IPv6 TCP 40000 -> 443 behind the given extension headers.
+    fn ipv6_with(ext: &[(u8, &[u8])]) -> ([u8; 256], usize) {
+        let mut b = [0u8; 256];
         b[14] = 0x60;
-        b[14 + 6] = 0; // hop-by-hop
-        b[14 + 40] = IPPROTO_TCP; // next header after it
-        b[14 + 48..14 + 50].copy_from_slice(&40000u16.to_be_bytes());
-        let p = parse_packet(&&b[..], 14, ETH_P_IPV6).unwrap();
-        assert_eq!((p.family, p.proto, p.sport, p.dport), (6, 0, 0, 0));
+        b[14 + 6] = ext.first().map_or(IPPROTO_TCP, |e| e.0);
+        let mut n = 54;
+        for (i, (_, body)) in ext.iter().enumerate() {
+            b[n..n + body.len()].copy_from_slice(body);
+            b[n] = ext.get(i + 1).map_or(IPPROTO_TCP, |e| e.0);
+            n += body.len();
+        }
+        b[n..n + 2].copy_from_slice(&40000u16.to_be_bytes());
+        b[n + 2..n + 4].copy_from_slice(&443u16.to_be_bytes());
+        (b, n + 20)
+    }
+
+    #[test]
+    fn ipv6_extension_headers_are_followed() {
+        let hop = [0u8; 8];
+        let mut dst = [0u8; 16];
+        dst[1] = 1; // 16 bytes
+        let mut ah = [0u8; 12];
+        ah[1] = 1; // (1 + 2) * 4 = 12 bytes
+        let frag_first = [0u8; 8];
+        let (b, len) = ipv6_with(&[(0, &hop), (60, &dst), (51, &ah), (44, &frag_first)]);
+        let p = parse_packet(&&b[..len], 14, ETH_P_IPV6).unwrap();
+        assert_eq!((p.family, p.proto, p.sport, p.dport), (6, IPPROTO_TCP, 40000, 443));
+    }
+
+    #[test]
+    fn ipv6_non_first_fragment_has_no_ports() {
+        let mut frag = [0u8; 8];
+        frag[2..4].copy_from_slice(&(185u16 << 3).to_be_bytes());
+        let (b, len) = ipv6_with(&[(44, &frag)]);
+        let p = parse_packet(&&b[..len], 14, ETH_P_IPV6).unwrap();
+        assert_eq!((p.proto, p.sport, p.dport), (IPPROTO_TCP, 0, 0));
+    }
+
+    #[test]
+    fn truncated_extension_header_fails_open() {
+        let (b, _) = ipv6_with(&[(0, &[0u8; 8])]);
+        // Cut inside the hop-by-hop header: still counted, no ports.
+        let p = parse_packet(&&b[..14 + 40 + 1], 14, ETH_P_IPV6).unwrap();
+        assert_eq!((p.family, p.proto, p.sport), (6, 0, 0));
+    }
+
+    #[test]
+    fn too_many_extension_headers_stop_the_walk() {
+        let hop = [0u8; 8];
+        let ext = [(60u8, &hop[..]); MAX_IPV6_EXT + 1];
+        let (b, len) = ipv6_with(&ext);
+        let p = parse_packet(&&b[..len], 14, ETH_P_IPV6).unwrap();
+        assert_eq!((p.proto, p.sport), (60, 0));
     }
 }
 

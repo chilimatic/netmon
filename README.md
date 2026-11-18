@@ -163,5 +163,6 @@ Counting:
   once per interface. The header total skips `lo` but counts the rest.
 - Forwarded traffic (router, bridge) is shown as if the host sent it: on
   egress the source is taken as local.
-- IPv6 extension headers are not followed; such packets count with port 0.
+- Up to 2 VLAN tags and 6 IPv6 extension headers are followed. Fragments
+  after the first, and packets with more headers, count with port 0.
 - Interface totals count from netmon's start, not from boot.

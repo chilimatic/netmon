@@ -117,6 +117,25 @@ stable kernel API):
 - Safety: loopback and the SSH session netmon runs in are never blocked
   (lockout guard). Without the daemon (Phase 7) blocks end when netmon exits.
 
+**Decisions** (see `docs/REVIEW.md`): fail-open; lockout guard for
+loopback, the SSH session and DNS to the local resolver.
+
+**Steps.**
+1. **Parser hardening.** VLAN tags (up to 2) without offload, bounded walk
+   over IPv6 extension headers (hop-by-hop, routing, destination options,
+   fragment, AH), non-first fragments have no ports. Shared parser, so the
+   tests run on the host.
+2. **IP and port blocks.** LPM tries for v4/v6 remotes and a port map,
+   enforced in `connect4/6` and `sendmsg4/6` (EPERM) and in TC
+   (`TC_ACT_SHOT`) for traffic without a local socket. Lockout guard in the
+   kernel. Drop counters per rule. UI: `b` blocks the selected remote,
+   Rules tab, `d` removes.
+3. **Process blocks.** Block by exe path: a `sched_process_exec`
+   tracepoint marks tgids whose exe is blocked, a `/proc` scan catches
+   running processes, `connect`/`sendmsg` deny marked tgids.
+4. **Interface events.** Netlink link notifications replace the 2-tick
+   poll (REVIEW 19).
+
 **Acceptance.**
 - Block a `curl` connection: it fails, drop counter rises, unblock restores.
 - Block `1.1.1.1/32`: `ping 1.1.1.1` fails, other hosts work.

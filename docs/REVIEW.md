@@ -66,7 +66,17 @@ Status column: `P0` = fixed in Phase 0, `Pn` = fixed in roadmap phase n,
 - No fuzz test over `decode()` (security reviewer's harness found item 1).
 - No end-to-end test of the eBPF side (netns + veth pair).
 
-## Decisions needed before the firewall phases
+## Decisions (2026-11-18)
+
+- **Fail-open.** Packets the parser cannot read pass. Blocks live in the
+  netmon process and end when it exits or crashes (until the daemon, Phase
+  7).
+- **Lockout guard.** Never blocked: loopback, the SSH session netmon runs
+  in (`SSH_CONNECTION`), DNS to the local system resolver (127.0.0.53 and
+  the stub addresses in `/etc/resolv.conf`, port 53).
+- Prompt mechanism (Phase 5): still open.
+
+## Decisions needed before the firewall phases (original list)
 
 1. **Prompt mechanism (Phase 5).** Options: (a) cgroup `connect` hook denies
    while a prompt is open: app gets `EPERM`, user retries; (b) drop the SYN in
