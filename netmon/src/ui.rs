@@ -24,7 +24,7 @@ fn rate(v: f64) -> String {
 /// Rows the traffic graph takes. Hidden when the terminal is too short.
 const GRAPH_HEIGHT: u16 = 10;
 
-pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Option<&Capture>, drops: u64) {
+pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Option<&Capture>) {
     let graph_height = if app.show_graph && f.area().height >= GRAPH_HEIGHT + 10 { GRAPH_HEIGHT } else { 0 };
     let [header, graph, tabs, body, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -73,7 +73,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         Tab::Connections => draw_conns(f, app, c, names, body),
         Tab::Processes => draw_procs(f, app, c, body),
         Tab::Interfaces => draw_ifaces(f, app, c, names, body),
-        Tab::Capture => draw_capture(f, cap, names, drops, body),
+        Tab::Capture => draw_capture(f, cap, names, body),
     }
 
     let sort = match app.sort {
@@ -153,7 +153,7 @@ fn draw_graph(f: &mut Frame, app: &App, c: &Collector, area: Rect) {
     f.render_widget(chart, area);
 }
 
-fn draw_capture(f: &mut Frame, cap: Option<&Capture>, names: &Names, drops: u64, area: Rect) {
+fn draw_capture(f: &mut Frame, cap: Option<&Capture>, names: &Names, area: Rect) {
     let Some(cap) = cap else {
         f.render_widget(
             Paragraph::new(
@@ -175,10 +175,11 @@ fn draw_capture(f: &mut Frame, cap: Option<&Capture>, names: &Names, drops: u64,
     };
     f.render_widget(
         Paragraph::new(format!(
-            " {}   kept {}  received {}  ring drops {drops}   {follow}",
+            " {}   kept {}  received {}  ring drops {}   {follow}",
             cap.target.label(),
             cap.packets.len(),
-            cap.received
+            cap.received,
+            cap.dropped
         ))
         .style(Style::new().fg(Color::Yellow)),
         info,
@@ -378,7 +379,7 @@ mod tests {
         }
         let mut app = App { show_graph, ..App::default() };
         let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
-        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, 0)).unwrap();
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None)).unwrap();
         let buf = term.backend().buffer();
         (0..height)
             .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
@@ -409,10 +410,11 @@ mod tests {
         for _ in 0..3 {
             cap.push(Captured::from_event(&ev, cap.mono_to_wall));
         }
+        cap.dropped = 7;
         let mut app = App { tab: Tab::Capture, show_graph: false, ..App::default() };
         let mut term = Terminal::new(TestBackend::new(140, 30)).unwrap();
         let c = Collector::new(30);
-        term.draw(|f| draw(f, &mut app, &c, &Names::default(), Some(&cap), 7)).unwrap();
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), Some(&cap))).unwrap();
         let buf = term.backend().buffer();
         let screen = (0..30)
             .map(|y| (0..140).map(|x| buf[(x, y)].symbol()).collect::<String>())

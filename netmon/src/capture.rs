@@ -85,6 +85,10 @@ pub struct Capture {
     pub selected: usize,
     /// CLOCK_MONOTONIC -> wall clock offset in nanoseconds.
     pub mono_to_wall: i128,
+    /// Packets this capture lost because the ring buffer was full.
+    pub dropped: u64,
+    /// Kernel drop counter (counts since load) when the capture started.
+    pub drop_base: u64,
 }
 
 impl Capture {
@@ -98,6 +102,8 @@ impl Capture {
             follow: true,
             selected: 0,
             mono_to_wall: mono_to_wall_offset(),
+            dropped: 0,
+            drop_base: 0,
         }
     }
 

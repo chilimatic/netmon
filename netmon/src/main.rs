@@ -140,19 +140,27 @@ impl Monitor {
 
     fn start_capture(&mut self, target: Target) -> anyhow::Result<()> {
         self.probe.capture_off()?;
-        match &target {
+        // Packets still queued belong to the old capture.
+        self.probe.discard_packets();
+        let mut cap = Capture::new(target);
+        cap.drop_base = self.probe.capture_drops();
+        let target = &cap.target;
+        match target {
             Target::Interface { index, .. } => self.probe.capture_iface(*index)?,
             Target::Process { pid, .. } => self.probe.capture_flows(&self.process_flows(*pid))?,
             Target::Connection { key, .. } => self.probe.capture_flows(&HashSet::from([*key]))?,
         }
-        self.capture = Some(Capture::new(target));
+        self.capture = Some(cap);
         Ok(())
     }
 
-    fn drain_capture(&mut self) {
-        let Some(cap) = self.capture.as_mut() else { return };
+    /// Moves up to `max` packets from the ring into the capture and updates
+    /// its drop count.
+    fn drain_capture(&mut self, max: usize) {
+        let Some(cap) = self.capture.as_mut().filter(|c| c.running) else { return };
         let offset = cap.mono_to_wall;
-        self.probe.drain_packets(DRAIN_BATCH, |ev| cap.push(Captured::from_event(ev, offset)));
+        self.probe.drain_packets(max, |ev| cap.push(Captured::from_event(ev, offset)));
+        cap.dropped = self.probe.capture_drops().saturating_sub(cap.drop_base);
     }
 
     /// Turns the selected row of a tab into a capture target.
@@ -200,6 +208,9 @@ impl Monitor {
                 if let Err(e) = self.probe.capture_off() {
                     app.status = format!("stop failed: {e:#}");
                 }
+                // Keep what the kernel already captured. The ring holds at
+                // most CAPTURE_RING_BYTES, so this ends.
+                self.drain_capture(usize::MAX);
                 // Packets stay for viewing and saving until the next capture.
                 if let Some(cap) = self.capture.as_mut() {
                     cap.running = false;
@@ -274,8 +285,7 @@ fn run_tui(mon: &mut Monitor, args: &Args) -> anyhow::Result<()> {
         mon.tick();
         let mut next = Instant::now() + interval;
         while !app.quit {
-            let drops = if mon.capture.is_some() { mon.probe.capture_drops() } else { 0 };
-            terminal.draw(|f| ui::draw(f, &mut app, mon.view(), &mon.names, mon.capture.as_ref(), drops))?;
+            terminal.draw(|f| ui::draw(f, &mut app, mon.view(), &mon.names, mon.capture.as_ref()))?;
             let mut timeout = next.saturating_duration_since(Instant::now());
             if mon.capture.as_ref().is_some_and(|c| c.running) {
                 timeout = timeout.min(CAPTURE_POLL);
@@ -289,7 +299,7 @@ fn run_tui(mon: &mut Monitor, args: &Args) -> anyhow::Result<()> {
                 mon.handle(&mut app, action);
             }
             mon.set_paused(app.paused);
-            mon.drain_capture();
+            mon.drain_capture(DRAIN_BATCH);
             if Instant::now() >= next {
                 next += interval;
                 let errs = mon.tick();
