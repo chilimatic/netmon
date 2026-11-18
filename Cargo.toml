@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["netmon", "netmon-common", "netmon-ebpf"]
+default-members = ["netmon", "netmon-common"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+aya = { version = "0.14", default-features = false }
+aya-build = { version = "0.2.0", default-features = false }
+aya-ebpf = { version = "0.2.1", default-features = false }
+anyhow = { version = "1", default-features = true }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+procfs = "0.18"
+ratatui = "0.30"
+which = { version = "8", default-features = false }
+
+[profile.release.package.netmon-ebpf]
+debug = 2
+codegen-units = 1
