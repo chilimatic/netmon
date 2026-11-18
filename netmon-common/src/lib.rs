@@ -47,6 +47,28 @@ pub struct FlowStats {
 
 /// Entries in the socket owner map.
 pub const MAX_SOCK_OWNERS: u32 = 16_384;
+/// Entries in the bound socket (listener) map.
+pub const MAX_LISTENERS: u32 = 4_096;
+
+/// A bound local address: what `bind()` gave a socket. Wildcard binds have
+/// an all-zero address.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ListenKey {
+    pub addr: [u8; 16],
+    pub port: u16,
+    pub proto: u8,
+    pub family: u8,
+}
+
+/// Owner of a bound socket. `cookie` lets the release hook remove only
+/// its own entry when several sockets share a port (SO_REUSEPORT).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListenOwner {
+    pub owner: SockOwner,
+    pub cookie: u64,
+}
 
 /// Length of a task name (`comm`), with the trailing NUL.
 pub const COMM_LEN: usize = 16;
@@ -112,6 +134,10 @@ unsafe impl aya::Pod for FlowKey {}
 unsafe impl aya::Pod for FlowStats {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for SockOwner {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ListenKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ListenOwner {}
 
 /// Network and transport header fields of one packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

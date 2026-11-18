@@ -46,6 +46,9 @@ Fix every finding marked `P0` in `docs/REVIEW.md`, in small commits:
 
 ## Phase 1 – Kernel-side process identity
 
+**Status: done** (steps 1–3: `7566557`, `391e5aa` and the listener
+commit after them).
+
 **Why.** Rules by process and the first-connection prompt need the owner of a
 flow before its first packet leaves. `/proc` polling is late (up to 1 s),
 misses short-lived sockets, and can be fooled by binding a port (REVIEW 3, 6,

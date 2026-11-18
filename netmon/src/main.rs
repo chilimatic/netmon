@@ -23,7 +23,7 @@ use crate::{
     collector::Collector,
     ifaces::Names,
     probe::{Kernel, Probe},
-    procmap::{Owner, OwnerCache, ProcCache, SocketTable, read_details},
+    procmap::{Listeners, Owner, OwnerCache, ProcCache, SocketTable, read_details},
 };
 
 /// Live view of network connections: owning process, interface and traffic.
@@ -130,7 +130,9 @@ impl<K: Kernel> Monitor<K> {
         self.probe.forget(&expired);
         let probe = &self.probe;
         let kernel = |cookie| probe.sock_owner(cookie).map(|o| Owner::from_kernel(&o));
-        self.collector.resolve(&SocketTable::read(&mut self.owners), kernel);
+        let listeners =
+            Listeners::build(probe.listeners().into_iter().map(|(proto, a, o)| (proto, a, Owner::from_kernel(&o))));
+        self.collector.resolve(&SocketTable::read(&mut self.owners), &listeners, kernel);
         self.procs.prune(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
         for o in self.collector.flows.values_mut().filter_map(|f| f.owner.as_mut()) {
             self.procs.fill(o, read_details);
@@ -438,6 +440,9 @@ mod tests {
         }
         fn sock_owner(&self, _: u64) -> Option<netmon_common::SockOwner> {
             None
+        }
+        fn listeners(&self) -> Vec<(u8, std::net::SocketAddr, netmon_common::SockOwner)> {
+            Vec::new()
         }
     }
 

@@ -129,10 +129,19 @@ follow new packets, `s` save as `.pcap`, `c` clear, `x` stop.
 
 ## Limits
 
-Owners come from kernel hooks on `connect`, `sendmsg` and socket creation
-(the detail line says "owner from kernel"). Flows without one, such as
-sockets opened before netmon started or accepted server connections, fall
-back to a guess from `/proc` ("owner from /proc"):
+Owners come from kernel hooks, best source first (the detail line under
+the Connections table names it):
+
+1. `kernel`: the process that created, connected or sent on the flow's own
+   socket.
+2. `/proc`: the process holding the socket with the exact addresses.
+3. `kernel (bind)`: the process that bound the local address (servers, UDP
+   receivers). Accepted connections have no connect hook, so they land here
+   when `/proc` is too late.
+4. `/proc (port)`: a guess by local port.
+
+A weaker source never replaces a stronger one. Limits of the `/proc`
+sources:
 
 - Sockets that open and close between two refreshes (a DNS query, a short
   `curl`) are often never seen and show as `?`.

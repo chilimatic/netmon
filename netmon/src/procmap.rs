@@ -94,15 +94,49 @@ impl Bound {
     /// Lower is better: exact address before wildcard, unconnected before
     /// connected. None when the socket cannot receive for `ip`.
     fn rank(&self, ip: IpAddr) -> Option<u8> {
-        let addr = if self.ip == ip {
-            0
-        } else if self.ip.is_unspecified() && (self.ip.is_ipv6() || ip.is_ipv4()) {
-            // [::] also takes IPv4 on dual-stack sockets; 0.0.0.0 only IPv4.
-            2
-        } else {
-            return None;
-        };
-        Some(addr + u8::from(!self.unconnected))
+        Some(bind_rank(self.ip, ip)? + u8::from(!self.unconnected))
+    }
+}
+
+/// How well a socket bound to `bound` matches traffic to local `ip`:
+/// 0 exact address, 2 wildcard, None no match. [::] also takes IPv4 on
+/// dual-stack sockets; 0.0.0.0 only IPv4.
+fn bind_rank(bound: IpAddr, ip: IpAddr) -> Option<u8> {
+    if bound == ip {
+        Some(0)
+    } else if bound.is_unspecified() && (bound.is_ipv6() || ip.is_ipv4()) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Bound sockets recorded by the kernel post_bind hooks.
+#[derive(Default)]
+pub struct Listeners {
+    by_port: HashMap<(u8, u16), Vec<(IpAddr, Owner)>>,
+}
+
+impl Listeners {
+    pub fn build(entries: impl IntoIterator<Item = (u8, SocketAddr, Owner)>) -> Self {
+        let mut l = Listeners::default();
+        for (proto, addr, owner) in entries {
+            let addr = normalize(addr);
+            l.by_port.entry((proto, addr.port())).or_default().push((addr.ip(), owner));
+        }
+        l
+    }
+
+    /// Owner of the socket bound to the flow's local address, exact
+    /// address before wildcard.
+    pub fn lookup(&self, proto: u8, local: SocketAddr) -> Option<&Owner> {
+        let local = normalize(local);
+        self.by_port
+            .get(&(proto, local.port()))?
+            .iter()
+            .filter_map(|(ip, o)| bind_rank(*ip, local.ip()).map(|r| (r, o)))
+            .min_by_key(|(r, _)| *r)
+            .map(|(_, o)| o)
     }
 }
 
@@ -129,17 +163,24 @@ impl SocketTable {
         t
     }
 
+    #[cfg(test)]
     pub fn lookup(&self, proto: u8, local: SocketAddr, remote: SocketAddr) -> Option<&SockInfo> {
+        self.lookup_kind(proto, local, remote).map(|(i, _)| i)
+    }
+
+    /// Like `lookup`, and tells whether the match was the exact 4-tuple
+    /// (true) or the port fallback (false).
+    pub fn lookup_kind(&self, proto: u8, local: SocketAddr, remote: SocketAddr) -> Option<(&SockInfo, bool)> {
         let (local, remote) = (normalize(local), normalize(remote));
         if let Some(i) = self.exact.get(&(proto, local, remote)) {
-            return Some(i);
+            return Some((i, true));
         }
         self.by_port
             .get(&(proto, local.port()))?
             .iter()
             .filter_map(|b| b.rank(local.ip()).map(|r| (r, &b.info)))
             .min_by_key(|(r, _)| *r)
-            .map(|(_, i)| i)
+            .map(|(_, i)| (i, false))
     }
 
     /// Reads the current socket table from /proc. Owners come from the
@@ -496,6 +537,27 @@ mod tests {
         let mut c = Owner::new(7, "new");
         cache.fill(&mut c, |_| None);
         assert_eq!(c.details, None);
+    }
+
+    #[test]
+    fn listeners_match_address_or_wildcard() {
+        let l = Listeners::build([
+            (IPPROTO_TCP, sa("[::]:8000"), Owner::new(1, "python3")),
+            (IPPROTO_UDP, sa("127.0.0.53:53"), Owner::new(2, "resolved")),
+            (IPPROTO_UDP, sa("0.0.0.0:53"), Owner::new(3, "dnsmasq")),
+        ]);
+        assert_eq!(l.lookup(IPPROTO_TCP, sa("127.0.0.1:8000")).unwrap().pid, 1, "[::] takes v4");
+        assert_eq!(l.lookup(IPPROTO_UDP, sa("127.0.0.53:53")).unwrap().pid, 2, "exact beats wildcard");
+        assert_eq!(l.lookup(IPPROTO_UDP, sa("10.0.0.2:53")).unwrap().pid, 3);
+        assert!(l.lookup(IPPROTO_UDP, sa("[fe80::1]:53")).is_none(), "0.0.0.0 does not take v6");
+        assert!(l.lookup(IPPROTO_TCP, sa("10.0.0.2:8001")).is_none());
+    }
+
+    #[test]
+    fn lookup_kind_tells_exact_from_fallback() {
+        let t = table();
+        assert!(t.lookup_kind(IPPROTO_TCP, sa("10.0.0.2:40000"), sa("1.1.1.1:443")).unwrap().1);
+        assert!(!t.lookup_kind(IPPROTO_TCP, sa("10.0.0.2:80"), sa("9.9.9.9:1")).unwrap().1);
     }
 }
 

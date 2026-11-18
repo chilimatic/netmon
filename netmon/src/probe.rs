@@ -1,7 +1,7 @@
 //! Loads the eBPF object, attaches the TC programs and the socket owner
 //! hooks, and reads the maps.
 
-use std::{collections::HashSet, fs::File};
+use std::{collections::HashSet, fs::File, net::SocketAddr};
 
 use anyhow::{Context as _, bail};
 use aya::{
@@ -14,7 +14,7 @@ use aya::{
 };
 use netmon_common::{
     CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, CaptureConfig, FlowKey, FlowStats, MAX_CAPTURE_FLOWS, MAX_FLOWS,
-    PacketEvent, SockOwner,
+    ListenKey, ListenOwner, PacketEvent, SockOwner,
 };
 
 use crate::ifaces::Iface;
@@ -51,6 +51,7 @@ pub struct Probe {
     packets: RingBuf<MapData>,
     drops: PerCpuArray<MapData, u64>,
     sock_owner: HashMap<MapData, u64, SockOwner>,
+    listeners: HashMap<MapData, ListenKey, ListenOwner>,
     attached: HashSet<u32>,
     failed: HashSet<u32>,
     /// Socket owner hooks that did not load or attach.
@@ -59,7 +60,7 @@ pub struct Probe {
 
 /// Root of the cgroup v2 tree. Hooks here see every process on the host.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
-const SOCK_HOOKS: [&str; 1] = ["sock_create"];
+const SOCK_HOOKS: [&str; 4] = ["sock_create", "post_bind4", "post_bind6", "sock_release"];
 const SOCK_ADDR_HOOKS: [&str; 4] = ["connect4", "connect6", "sendmsg4", "sendmsg6"];
 
 impl Probe {
@@ -87,6 +88,7 @@ impl Probe {
         let packets = RingBuf::try_from(take("PACKETS")?)?;
         let drops = PerCpuArray::try_from(take("CAPTURE_DROPS")?)?;
         let sock_owner = HashMap::try_from(take("SOCK_OWNER")?)?;
+        let listeners = HashMap::try_from(take("LISTENERS")?)?;
         let hook_errors = attach_owner_hooks(&mut ebpf);
         Ok(Probe {
             ebpf,
@@ -99,6 +101,7 @@ impl Probe {
             packets,
             drops,
             sock_owner,
+            listeners,
             attached: HashSet::new(),
             failed: HashSet::new(),
             hook_errors,
@@ -228,6 +231,8 @@ pub trait Kernel {
     fn forget(&mut self, keys: &[FlowKey]);
     /// Owner recorded by the cgroup hooks for a socket cookie.
     fn sock_owner(&self, cookie: u64) -> Option<SockOwner>;
+    /// Bound sockets recorded by the post_bind hooks: proto, address, owner.
+    fn listeners(&self) -> Vec<(u8, SocketAddr, SockOwner)>;
 }
 
 impl Kernel for Probe {
@@ -325,6 +330,14 @@ impl Kernel for Probe {
 
     fn sock_owner(&self, cookie: u64) -> Option<SockOwner> {
         self.sock_owner.get(&cookie, 0).ok()
+    }
+
+    fn listeners(&self) -> Vec<(u8, SocketAddr, SockOwner)> {
+        self.listeners
+            .iter()
+            .flatten()
+            .map(|(k, v)| (k.proto, crate::collector::addr(k.family, &k.addr, k.port), v.owner))
+            .collect()
     }
 }
 

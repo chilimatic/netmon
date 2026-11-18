@@ -15,8 +15,9 @@ use aya_ebpf::{
 };
 use netmon_common::{
     CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES, CaptureConfig, FlowKey,
-    FlowStats, LOOPBACK_IFINDEX, MAX_CAPTURE_FLOWS, MAX_FLOWS, MAX_IFACES, MAX_SOCK_OWNERS,
-    PacketEvent, PacketSource, SockOwner, parse_packet,
+    FlowStats, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey, ListenOwner,
+    MAX_CAPTURE_FLOWS, MAX_FLOWS, MAX_IFACES, MAX_LISTENERS, MAX_SOCK_OWNERS, PacketEvent,
+    PacketSource, SockOwner, parse_packet,
 };
 
 /// Byte counters per flow and interface.
@@ -49,6 +50,15 @@ static CAPTURE_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 /// Monitoring only, so LRU is fine: an evicted entry falls back to /proc.
 #[map]
 static SOCK_OWNER: LruHashMap<u64, SockOwner> = LruHashMap::with_max_entries(MAX_SOCK_OWNERS, 0);
+
+/// Bound sockets (servers, UDP receivers) -> owner, from post_bind.
+#[map]
+static LISTENERS: LruHashMap<ListenKey, ListenOwner> = LruHashMap::with_max_entries(MAX_LISTENERS, 0);
+
+/// Socket cookie -> its LISTENERS key, so sock_release can find the entry:
+/// the release hook may not read the socket's address.
+#[map]
+static LISTEN_BY_COOKIE: LruHashMap<u64, ListenKey> = LruHashMap::with_max_entries(MAX_LISTENERS, 0);
 
 struct Skb<'a>(&'a TcContext);
 
@@ -213,13 +223,75 @@ fn record_owner(ctx: *mut c_void) {
     {
         return;
     }
-    let owner = SockOwner {
+    let _ = SOCK_OWNER.insert(&cookie, &current_owner(tgid), 0);
+}
+
+#[inline(always)]
+fn current_owner(tgid: u32) -> SockOwner {
+    SockOwner {
         tgid,
         uid: bpf_get_current_uid_gid() as u32,
         cgroup_id: unsafe { bpf_get_current_cgroup_id() },
         comm: bpf_get_current_comm().unwrap_or([0; 16]),
-    };
-    let _ = SOCK_OWNER.insert(&cookie, &owner, 0);
+    }
+}
+
+/// Records the owner of a bound TCP or UDP socket under its bound address.
+#[inline(always)]
+fn record_bind(ctx: &SockContext, family: u8) {
+    let sk = ctx.sock;
+    let proto = unsafe { (*sk).protocol } as u8;
+    if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
+        return;
+    }
+    let mut key = ListenKey { proto, family, port: unsafe { (*sk).src_port } as u16, ..Default::default() };
+    // Each post_bind type may read only its own family's address field.
+    // The fields hold network byte order, so native-order bytes are the
+    // address bytes.
+    if family == 4 {
+        key.addr[..4].copy_from_slice(&unsafe { (*sk).src_ip4 }.to_ne_bytes());
+    } else {
+        let ip6 = unsafe { (*sk).src_ip6 };
+        let mut i = 0;
+        while i < 4 {
+            key.addr[i * 4..i * 4 + 4].copy_from_slice(&ip6[i].to_ne_bytes());
+            i += 1;
+        }
+    }
+    let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let value = ListenOwner { owner: current_owner(tgid), cookie };
+    let _ = LISTENERS.insert(&key, &value, 0);
+    let _ = LISTEN_BY_COOKIE.insert(&cookie, &key, 0);
+}
+
+#[cgroup_sock(post_bind4)]
+pub fn post_bind4(ctx: SockContext) -> i32 {
+    record_bind(&ctx, 4);
+    ALLOW
+}
+
+#[cgroup_sock(post_bind6)]
+pub fn post_bind6(ctx: SockContext) -> i32 {
+    record_bind(&ctx, 6);
+    ALLOW
+}
+
+/// Removes the listener entry of a closed bound socket, unless another
+/// socket has bound the same address since.
+#[cgroup_sock(sock_release)]
+pub fn sock_release(ctx: SockContext) -> i32 {
+    let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
+    if let Some(key) = unsafe { LISTEN_BY_COOKIE.get(&cookie) } {
+        let key = *key;
+        if let Some(v) = unsafe { LISTENERS.get(&key) }
+            && v.cookie == cookie
+        {
+            let _ = LISTENERS.remove(&key);
+        }
+        let _ = LISTEN_BY_COOKIE.remove(&cookie);
+    }
+    ALLOW
 }
 
 #[cgroup_sock(sock_create)]

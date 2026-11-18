@@ -470,6 +470,7 @@ mod tests {
         c.ingest([(k, FlowStats { tx_bytes: 5, cookie: 9, ..Default::default() })], 1.0);
         let f = c.flows.get_mut(&k).unwrap();
         f.owner_cookie = 9;
+        f.owner_source = crate::collector::OwnerSource::Kernel;
         f.owner = Some(Owner {
             details: Some(ProcDetails {
                 exe: "/usr/bin/curl".into(),

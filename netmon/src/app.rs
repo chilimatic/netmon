@@ -388,11 +388,7 @@ fn conn_row(f: &Flow, names: &Names) -> ConnRow {
         exe: d.exe.clone(),
         user: d.user.clone(),
         unit: d.unit.clone(),
-        source: match (&f.owner, f.owner_cookie) {
-            (None, _) => "",
-            (Some(_), 0) => "/proc",
-            (Some(_), _) => "kernel",
-        },
+        source: if f.owner.is_some() { f.owner_source.label() } else { "" },
         proto: match f.key.proto {
             IPPROTO_TCP => "tcp",
             IPPROTO_UDP => "udp",
@@ -442,7 +438,7 @@ mod tests {
             vec![RawSock { proto: IPPROTO_TCP, local: "10.0.0.2:1".parse().unwrap(), remote: "1.1.1.1:443".parse().unwrap(), state: "ESTAB", inode: 9 }],
             &HashMap::from([(9, Owner::new(7, "curl"))]),
         );
-        c.resolve(&table, |_| None);
+        c.resolve(&table, &crate::procmap::Listeners::default(), |_| None);
         c
     }
 
