@@ -297,4 +297,25 @@ mod tests {
         assert_eq!(eg.reversed(), ing);
         assert_eq!(eg.reversed().reversed(), eg);
     }
+
+    // The kernel parser does not follow VLAN tags or IPv6 extension headers
+    // yet (REVIEW 9, Phase 2). These tests pin today's behavior so the
+    // change in Phase 2 is visible.
+
+    #[test]
+    fn vlan_ethertype_is_not_parsed() {
+        assert!(parse_packet(&&TCP_V4[..], 14, 0x8100).is_none());
+    }
+
+    #[test]
+    fn ipv6_extension_header_gives_no_ports() {
+        let mut b = [0u8; 14 + 40 + 8 + 4];
+        b[14] = 0x60;
+        b[14 + 6] = 0; // hop-by-hop
+        b[14 + 40] = IPPROTO_TCP; // next header after it
+        b[14 + 48..14 + 50].copy_from_slice(&40000u16.to_be_bytes());
+        let p = parse_packet(&&b[..], 14, ETH_P_IPV6).unwrap();
+        assert_eq!((p.family, p.proto, p.sport, p.dport), (6, 0, 0, 0));
+    }
 }
+

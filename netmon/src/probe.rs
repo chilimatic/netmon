@@ -90,35 +90,6 @@ impl Probe {
         })
     }
 
-    /// Attaches to interfaces not seen before. Returns errors for new
-    /// failures only, so a broken interface is reported once.
-    pub fn attach_new(&mut self, ifaces: &[Iface]) -> Vec<String> {
-        let mut errors = Vec::new();
-        let live: HashSet<u32> = ifaces.iter().map(|i| i.index).collect();
-        // Interface indexes of removed devices can be reused: forget them,
-        // with their L3 offset.
-        for gone in self.attached.iter().chain(&self.failed).filter(|i| !live.contains(i)) {
-            let _ = self.l3_offset.remove(gone);
-        }
-        self.attached.retain(|i| live.contains(i));
-        self.failed.retain(|i| live.contains(i));
-        for iface in ifaces {
-            if self.attached.contains(&iface.index) || self.failed.contains(&iface.index) {
-                continue;
-            }
-            match self.attach(iface) {
-                Ok(()) => {
-                    self.attached.insert(iface.index);
-                }
-                Err(e) => {
-                    self.failed.insert(iface.index);
-                    errors.push(format!("{}: {e:#}", iface.name));
-                }
-            }
-        }
-        errors
-    }
-
     fn attach(&mut self, iface: &Iface) -> anyhow::Result<()> {
         // Missing means 14 (Ethernet). Set or clear it, so a reused index
         // never keeps the offset of an old device.
@@ -137,53 +108,6 @@ impl Probe {
             prog.attach(&iface.name, ty)?;
         }
         Ok(())
-    }
-
-    pub fn attached_count(&self) -> usize {
-        self.attached.len()
-    }
-
-    /// Current counters, summed over all CPUs.
-    pub fn snapshot(&self) -> Vec<(FlowKey, FlowStats)> {
-        self.flows
-            .iter()
-            .flatten()
-            .map(|(k, per_cpu)| {
-                let mut sum = FlowStats::default();
-                for s in per_cpu.iter() {
-                    sum.tx_bytes += s.tx_bytes;
-                    sum.rx_bytes += s.rx_bytes;
-                    sum.tx_pkts += s.tx_pkts;
-                    sum.rx_pkts += s.rx_pkts;
-                }
-                (k, sum)
-            })
-            .collect()
-    }
-
-    /// Captures every packet on one interface.
-    pub fn capture_iface(&mut self, ifindex: u32) -> anyhow::Result<()> {
-        self.set_capture_keys(&HashSet::new())?;
-        self.capture_cfg.set(0, CaptureConfig { mode: CAPTURE_IFACE, ifindex }, 0)?;
-        Ok(())
-    }
-
-    /// Captures packets of the given flows. Call again to update the set.
-    pub fn capture_flows(&mut self, keys: &HashSet<FlowKey>) -> anyhow::Result<()> {
-        self.set_capture_keys(keys)?;
-        self.capture_cfg.set(0, CaptureConfig { mode: CAPTURE_FLOWS, ifindex: 0 }, 0)?;
-        Ok(())
-    }
-
-    /// Stops capturing. Packets already in the ring stay there for
-    /// `drain_packets`; call `discard_packets` to drop them.
-    pub fn capture_off(&mut self) -> anyhow::Result<()> {
-        self.capture_cfg.set(0, CaptureConfig { mode: CAPTURE_OFF, ifindex: 0 }, 0)?;
-        self.set_capture_keys(&HashSet::new())
-    }
-
-    pub fn discard_packets(&mut self) {
-        while self.packets.next().is_some() {}
     }
 
     /// Makes the kernel key set equal to `capture_set`, which always
@@ -222,9 +146,104 @@ impl Probe {
             None => bail!("{skipped} flows not captured: limit is {MAX_CAPTURE_FLOWS}"),
         }
     }
+}
 
+/// What the main loop needs from the kernel side. `Probe` is the real one;
+/// tests use a fake.
+pub trait Kernel {
+    /// Attaches to interfaces not seen before. Returns errors for new
+    /// failures only, so a broken interface is reported once.
+    fn attach_new(&mut self, ifaces: &[Iface]) -> Vec<String>;
+    fn attached_count(&self) -> usize;
+    /// Current counters, summed over all CPUs.
+    fn snapshot(&self) -> Vec<(FlowKey, FlowStats)>;
+    /// Captures every packet on one interface.
+    fn capture_iface(&mut self, ifindex: u32) -> anyhow::Result<()>;
+    /// Captures packets of the given flows. Call again to update the set.
+    fn capture_flows(&mut self, keys: &HashSet<FlowKey>) -> anyhow::Result<()>;
+    /// Stops capturing. Packets already in the ring stay there for
+    /// `drain_packets`; call `discard_packets` to drop them.
+    fn capture_off(&mut self) -> anyhow::Result<()>;
+    fn discard_packets(&mut self);
     /// Takes up to `max` captured packets from the ring buffer.
-    pub fn drain_packets(&mut self, max: usize, mut f: impl FnMut(&PacketEvent)) {
+    fn drain_packets(&mut self, max: usize, f: impl FnMut(&PacketEvent));
+    /// Packets lost because the ring buffer was full, since load. Callers
+    /// subtract the value at capture start.
+    fn capture_drops(&self) -> u64;
+    fn forget(&mut self, keys: &[FlowKey]);
+}
+
+impl Kernel for Probe {
+    fn attach_new(&mut self, ifaces: &[Iface]) -> Vec<String> {
+        let mut errors = Vec::new();
+        let live: HashSet<u32> = ifaces.iter().map(|i| i.index).collect();
+        // Interface indexes of removed devices can be reused: forget them,
+        // with their L3 offset.
+        for gone in self.attached.iter().chain(&self.failed).filter(|i| !live.contains(i)) {
+            let _ = self.l3_offset.remove(gone);
+        }
+        self.attached.retain(|i| live.contains(i));
+        self.failed.retain(|i| live.contains(i));
+        for iface in ifaces {
+            if self.attached.contains(&iface.index) || self.failed.contains(&iface.index) {
+                continue;
+            }
+            match self.attach(iface) {
+                Ok(()) => {
+                    self.attached.insert(iface.index);
+                }
+                Err(e) => {
+                    self.failed.insert(iface.index);
+                    errors.push(format!("{}: {e:#}", iface.name));
+                }
+            }
+        }
+        errors
+    }
+
+    fn attached_count(&self) -> usize {
+        self.attached.len()
+    }
+
+    fn snapshot(&self) -> Vec<(FlowKey, FlowStats)> {
+        self.flows
+            .iter()
+            .flatten()
+            .map(|(k, per_cpu)| {
+                let mut sum = FlowStats::default();
+                for s in per_cpu.iter() {
+                    sum.tx_bytes += s.tx_bytes;
+                    sum.rx_bytes += s.rx_bytes;
+                    sum.tx_pkts += s.tx_pkts;
+                    sum.rx_pkts += s.rx_pkts;
+                }
+                (k, sum)
+            })
+            .collect()
+    }
+
+    fn capture_iface(&mut self, ifindex: u32) -> anyhow::Result<()> {
+        self.set_capture_keys(&HashSet::new())?;
+        self.capture_cfg.set(0, CaptureConfig { mode: CAPTURE_IFACE, ifindex }, 0)?;
+        Ok(())
+    }
+
+    fn capture_flows(&mut self, keys: &HashSet<FlowKey>) -> anyhow::Result<()> {
+        self.set_capture_keys(keys)?;
+        self.capture_cfg.set(0, CaptureConfig { mode: CAPTURE_FLOWS, ifindex: 0 }, 0)?;
+        Ok(())
+    }
+
+    fn capture_off(&mut self) -> anyhow::Result<()> {
+        self.capture_cfg.set(0, CaptureConfig { mode: CAPTURE_OFF, ifindex: 0 }, 0)?;
+        self.set_capture_keys(&HashSet::new())
+    }
+
+    fn discard_packets(&mut self) {
+        while self.packets.next().is_some() {}
+    }
+
+    fn drain_packets(&mut self, max: usize, mut f: impl FnMut(&PacketEvent)) {
         for _ in 0..max {
             let Some(item) = self.packets.next() else { break };
             if item.len() >= size_of::<PacketEvent>() {
@@ -235,13 +254,11 @@ impl Probe {
         }
     }
 
-    /// Packets lost because the ring buffer was full, since load. Callers
-    /// subtract the value at capture start.
-    pub fn capture_drops(&self) -> u64 {
+    fn capture_drops(&self) -> u64 {
         self.drops.get(&0, 0).map(|v| v.iter().sum()).unwrap_or(0)
     }
 
-    pub fn forget(&mut self, keys: &[FlowKey]) {
+    fn forget(&mut self, keys: &[FlowKey]) {
         for k in keys {
             let _ = self.flows.remove(k);
         }

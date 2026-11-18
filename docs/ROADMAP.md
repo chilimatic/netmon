@@ -24,6 +24,9 @@ the order below is the build order.
 
 ## Phase 0 – Review fixes
 
+**Status: done** (commits `bd83a87`, `bad5eb7`, `974aa9e`, `b1190b2`,
+`40abd38` and the test commit after them).
+
 Fix every finding marked `P0` in `docs/REVIEW.md`, in small commits:
 
 1. **Crash and safety:** decoder panic (1), tcx return value (2), pcap save

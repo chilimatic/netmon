@@ -22,7 +22,7 @@ use crate::{
     capture::{Capture, Captured, Target},
     collector::Collector,
     ifaces::Names,
-    probe::Probe,
+    probe::{Kernel, Probe},
     procmap::{OwnerCache, SocketTable},
 };
 
@@ -59,8 +59,10 @@ const CAPTURE_POLL: Duration = Duration::from_millis(50);
 /// Max packets taken from the ring buffer per poll, so the UI stays responsive.
 const DRAIN_BATCH: usize = 4_096;
 
-struct Monitor {
-    probe: Probe,
+/// The main loop's state. Generic over the kernel side so tests can run it
+/// with a fake.
+struct Monitor<K: Kernel = Probe> {
+    probe: K,
     collector: Collector,
     names: Names,
     last: Instant,
@@ -74,7 +76,12 @@ struct Monitor {
 
 impl Monitor {
     fn new(args: &Args) -> anyhow::Result<(Self, Vec<String>)> {
-        let mut probe = Probe::load()?;
+        Monitor::with_kernel(Probe::load()?, args)
+    }
+}
+
+impl<K: Kernel> Monitor<K> {
+    fn with_kernel(mut probe: K, args: &Args) -> anyhow::Result<(Self, Vec<String>)> {
         let ifs = ifaces::list();
         let errors = probe.attach_new(&ifs);
         if probe.attached_count() == 0 {
@@ -101,6 +108,10 @@ impl Monitor {
 
     /// Reads the counters, refreshes owners and attaches to new interfaces.
     fn tick(&mut self) -> Vec<String> {
+        self.tick_at(Instant::now())
+    }
+
+    fn tick_at(&mut self, now: Instant) -> Vec<String> {
         let mut errors = Vec::new();
         // Interface hot-plug check every 2 ticks.
         if self.ticks.is_multiple_of(2) {
@@ -108,7 +119,6 @@ impl Monitor {
             self.names.update(&ifs);
             errors = self.probe.attach_new(&ifs);
         }
-        let now = Instant::now();
         let dt = now.duration_since(self.last).as_secs_f64();
         self.last = now;
         let expired = self.collector.ingest(self.probe.snapshot(), dt);
@@ -355,5 +365,187 @@ mod tests {
         assert_eq!(args(10, 30).expire_ticks(), 300);
         assert_eq!(args(5000, 1).expire_ticks(), 1);
         assert_eq!(args(0, 30).interval(), Duration::from_millis(100));
+    }
+
+    use std::collections::VecDeque;
+
+    use netmon_common::{CAPTURE_LEN, FlowStats, IPPROTO_TCP, PacketEvent};
+
+    use crate::{ifaces::Iface, procmap::Owner};
+
+    #[derive(Debug, PartialEq)]
+    enum Mode {
+        Off,
+        Iface(u32),
+        Flows(HashSet<netmon_common::FlowKey>),
+    }
+
+    /// Kernel stand-in: counters and a packet ring set by the test.
+    struct Fake {
+        flows: Vec<(netmon_common::FlowKey, FlowStats)>,
+        ring: VecDeque<PacketEvent>,
+        mode: Mode,
+        drops: u64,
+    }
+
+    impl Kernel for Fake {
+        fn attach_new(&mut self, _: &[Iface]) -> Vec<String> {
+            Vec::new()
+        }
+        fn attached_count(&self) -> usize {
+            1
+        }
+        fn snapshot(&self) -> Vec<(netmon_common::FlowKey, FlowStats)> {
+            self.flows.clone()
+        }
+        fn capture_iface(&mut self, ifindex: u32) -> anyhow::Result<()> {
+            self.mode = Mode::Iface(ifindex);
+            Ok(())
+        }
+        fn capture_flows(&mut self, keys: &HashSet<netmon_common::FlowKey>) -> anyhow::Result<()> {
+            self.mode = Mode::Flows(keys.clone());
+            Ok(())
+        }
+        fn capture_off(&mut self) -> anyhow::Result<()> {
+            self.mode = Mode::Off;
+            Ok(())
+        }
+        fn discard_packets(&mut self) {
+            self.ring.clear();
+        }
+        fn drain_packets(&mut self, max: usize, mut f: impl FnMut(&PacketEvent)) {
+            for _ in 0..max {
+                let Some(ev) = self.ring.pop_front() else { break };
+                f(&ev);
+            }
+        }
+        fn capture_drops(&self) -> u64 {
+            self.drops
+        }
+        fn forget(&mut self, keys: &[netmon_common::FlowKey]) {
+            self.flows.retain(|(k, _)| !keys.contains(k));
+        }
+    }
+
+    fn key(port: u16) -> netmon_common::FlowKey {
+        // TEST-NET-2 addresses and high ports: no real socket matches them.
+        let mut k = netmon_common::FlowKey {
+            family: 4,
+            proto: IPPROTO_TCP,
+            local_port: port,
+            remote_port: 443,
+            ifindex: 2,
+            ..Default::default()
+        };
+        k.local_addr[..4].copy_from_slice(&[198, 51, 100, 2]);
+        k.remote_addr[..4].copy_from_slice(&[198, 51, 100, 9]);
+        k
+    }
+
+    fn tx(bytes: u64) -> FlowStats {
+        FlowStats { tx_bytes: bytes, ..Default::default() }
+    }
+
+    fn packet() -> PacketEvent {
+        PacketEvent { ts_ns: 0, ifindex: 2, len: 0, cap_len: 0, ethertype: 0x0800, egress: 1, has_l2: 1, data: [0; CAPTURE_LEN] }
+    }
+
+    fn monitor() -> (Monitor<Fake>, Instant) {
+        let fake = Fake { flows: Vec::new(), ring: VecDeque::new(), mode: Mode::Off, drops: 0 };
+        let (mut m, _) = Monitor::with_kernel(fake, &args(1000, 30)).unwrap();
+        let t0 = Instant::now();
+        m.last = t0;
+        (m, t0)
+    }
+
+    fn secs(t0: Instant, s: u64) -> Instant {
+        t0 + Duration::from_secs(s)
+    }
+
+    #[test]
+    fn pause_freezes_view_and_keeps_rates_right() {
+        let (mut m, t0) = monitor();
+        m.probe.flows = vec![(key(50001), tx(0))];
+        m.tick_at(secs(t0, 1));
+        m.set_paused(true);
+        m.probe.flows = vec![(key(50001), tx(1000))];
+        m.tick_at(secs(t0, 2));
+        assert_eq!(m.view().flows[&key(50001)].tx_rate, 0.0, "view frozen");
+        assert_eq!(m.collector.flows[&key(50001)].tx_rate, 1000.0, "counting goes on");
+        // 60 s paused, 1000 B/s all the time.
+        for s in 3..=61 {
+            m.probe.flows = vec![(key(50001), tx(1000 * (s - 1)))];
+            m.tick_at(secs(t0, s));
+        }
+        m.set_paused(false);
+        assert_eq!(m.view().flows[&key(50001)].tx_rate, 1000.0, "no spike after resume");
+    }
+
+    #[test]
+    fn connection_capture_start_stop_and_restart() {
+        let (mut m, t0) = monitor();
+        m.probe.flows = vec![(key(50001), tx(10))];
+        m.tick_at(secs(t0, 1));
+        m.probe.drops = 5;
+        let mut app = App::default();
+        m.handle(&mut app, Action::StartCapture(Tab::Connections));
+        assert_eq!(app.tab, Tab::Capture, "{}", app.status);
+        assert_eq!(m.probe.mode, Mode::Flows(HashSet::from([key(50001)])));
+
+        m.probe.ring.extend([packet(), packet()]);
+        m.probe.drops = 7;
+        m.drain_capture(DRAIN_BATCH);
+        let cap = m.capture.as_ref().unwrap();
+        assert_eq!((cap.packets.len(), cap.dropped), (2, 2), "drops count from capture start");
+
+        // Stop keeps what is still queued in the ring.
+        m.probe.ring.extend([packet(), packet(), packet()]);
+        m.handle(&mut app, Action::StopCapture);
+        let cap = m.capture.as_ref().unwrap();
+        assert!(!cap.running);
+        assert_eq!(cap.packets.len(), 5);
+        assert_eq!(m.probe.mode, Mode::Off);
+
+        // A stopped capture takes no more packets; a new one discards leftovers.
+        m.probe.ring.push_back(packet());
+        m.drain_capture(DRAIN_BATCH);
+        assert_eq!(m.capture.as_ref().unwrap().packets.len(), 5);
+        m.handle(&mut app, Action::StartCapture(Tab::Interfaces));
+        assert_eq!(m.probe.mode, Mode::Iface(2));
+        assert!(m.probe.ring.is_empty());
+        assert_eq!(m.capture.as_ref().unwrap().packets.len(), 0);
+    }
+
+    #[test]
+    fn process_capture_follows_new_flows_until_stopped() {
+        let (mut m, t0) = monitor();
+        let owner = Some(Owner { pid: 4242, comm: "curl".into() });
+        m.probe.flows = vec![(key(50001), tx(10))];
+        m.tick_at(secs(t0, 1));
+        m.collector.flows.get_mut(&key(50001)).unwrap().owner = owner.clone();
+        m.start_capture(Target::Process { pid: 4242, comm: "curl".into() }).unwrap();
+        assert_eq!(m.probe.mode, Mode::Flows(HashSet::from([key(50001)])));
+
+        m.probe.flows.push((key(50002), tx(10)));
+        m.tick_at(secs(t0, 2));
+        m.collector.flows.get_mut(&key(50002)).unwrap().owner = owner;
+        m.sync_process_capture().unwrap();
+        assert_eq!(m.probe.mode, Mode::Flows(HashSet::from([key(50001), key(50002)])));
+
+        let mut app = App::default();
+        m.handle(&mut app, Action::StopCapture);
+        m.tick_at(secs(t0, 3));
+        assert_eq!(m.probe.mode, Mode::Off, "a stopped capture does not restart");
+    }
+
+    #[test]
+    fn capture_needs_known_owner() {
+        let (mut m, t0) = monitor();
+        m.probe.flows = vec![(key(50001), tx(10))];
+        m.tick_at(secs(t0, 1));
+        let mut app = App { tab: Tab::Processes, ..App::default() };
+        m.handle(&mut app, Action::StartCapture(Tab::Processes));
+        assert!(app.status.contains("owner unknown"), "{}", app.status);
+        assert!(m.capture.is_none());
     }
 }

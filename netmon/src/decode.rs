@@ -156,6 +156,15 @@ fn ipv6(p: &[u8], d: &mut Decoded) {
     l4(next, &p[off.min(p.len())..end], d);
 }
 
+/// Appends a port; IPv6 addresses get brackets, as in `[::1]:443`.
+fn add_port(addr: &mut String, port: u16) {
+    if addr.contains(':') {
+        *addr = format!("[{addr}]:{port}");
+    } else {
+        addr.push_str(&format!(":{port}"));
+    }
+}
+
 fn tcp_flags(f: u8) -> String {
     const NAMES: [(u8, &str); 8] = [
         (0x02, "SYN"),
@@ -211,8 +220,8 @@ fn tcp(p: &[u8], d: &mut Decoded) {
     let flags = tcp_flags(p[13]);
     let win = u16_at(p, 14).unwrap();
     let payload = p.len().saturating_sub(hlen);
-    d.summary.src.push_str(&format!(":{sp}"));
-    d.summary.dst.push_str(&format!(":{dp}"));
+    add_port(&mut d.summary.src, sp);
+    add_port(&mut d.summary.dst, dp);
     d.summary.info = format!("[{flags}] seq {seq} ack {ack} win {win} len {payload}");
     d.lines.push(format!("  TCP     {sp} → {dp}  [{flags}]  seq {seq}  ack {ack}  win {win}  hdr {hlen}B  payload {payload}B"));
 }
@@ -225,8 +234,8 @@ fn udp(p: &[u8], d: &mut Decoded) {
     }
     let (sp, dp) = (u16_at(p, 0).unwrap(), u16_at(p, 2).unwrap());
     let len = u16_at(p, 4).unwrap();
-    d.summary.src.push_str(&format!(":{sp}"));
-    d.summary.dst.push_str(&format!(":{dp}"));
+    add_port(&mut d.summary.src, sp);
+    add_port(&mut d.summary.dst, dp);
     d.summary.info = format!("len {}", len.saturating_sub(8));
     d.lines.push(format!("  UDP     {sp} → {dp}  len {len}"));
     if sp == 53 || dp == 53 || sp == 5353 || dp == 5353 {
@@ -452,5 +461,40 @@ pub mod tests {
         assert_eq!(lines[0], "0000  47 45 54 20 2f 20 48 54  54 50 2f 31 2e 31 0d 0a  GET / HTTP/1.1..");
         assert!(lines[1].starts_with("0010  48 6f 73 74 "));
         assert!(lines[1].ends_with("Host"));
+    }
+
+    #[test]
+    fn decodes_vlan_tagged_frame() {
+        let syn = tcp_syn();
+        let mut b = syn[..12].to_vec();
+        b.extend_from_slice(&[0x81, 0x00, 0x20, 0x64]); // prio 1, id 100
+        b.extend_from_slice(&syn[12..]);
+        let d = decode(&b);
+        assert!(d.lines.iter().any(|l| l.contains("VLAN    id 100 prio 1")), "{:?}", d.lines);
+        assert_eq!(d.summary.dst, "1.1.1.1:443");
+    }
+
+    #[test]
+    fn decodes_ipv6_extension_headers() {
+        let syn = tcp_syn();
+        let tcp = &syn[34..54];
+        let mut ip6 = vec![0u8; 40];
+        ip6[0] = 0x60;
+        ip6[4..6].copy_from_slice(&((8 + 16 + tcp.len()) as u16).to_be_bytes());
+        ip6[6] = 0; // hop-by-hop
+        ip6[7] = 64;
+        ip6[23] = 1; // ::1
+        ip6[39] = 2; // ::2
+        let mut b = vec![0u8; 12];
+        b.extend_from_slice(&[0x86, 0xdd]);
+        b.extend_from_slice(&ip6);
+        b.extend_from_slice(&[60, 0, 0, 0, 0, 0, 0, 0]); // hop-by-hop -> dest options, 8 B
+        b.extend_from_slice(&[6, 1]); // dest options -> TCP, 16 B
+        b.extend_from_slice(&[0; 14]);
+        b.extend_from_slice(tcp);
+        let d = decode(&b);
+        assert_eq!(d.lines.iter().filter(|l| l.contains("ext hdr")).count(), 2, "{:?}", d.lines);
+        assert_eq!(d.summary.proto, "TCP");
+        assert_eq!(d.summary.dst, "[::2]:443");
     }
 }
