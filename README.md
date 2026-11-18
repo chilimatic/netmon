@@ -47,7 +47,7 @@ sudo setcap cap_bpf,cap_net_admin,cap_perfmon,cap_sys_ptrace,cap_dac_read_search
 Without the TUI: `netmon --once 3` samples 3 s and prints a table.
 
 Keys: `←`/`→` (or `Tab`, `1-4`) switch view, `Esc` clear filter, `Enter` capture the selected row, `r`/`t`/`n` sort by rate/total/name, `/` filter,
-`p` pause, `g` toggle the traffic graph, `↑↓` select, `q` quit.
+`p` pause the view (counting goes on), `g` toggle the traffic graph, `↑↓` select, `q` quit.
 
 The graph on top shows total traffic of all interfaces except `lo` for the
 last 120 samples: download above the zero line, upload below. Each half has

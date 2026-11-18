@@ -1,7 +1,7 @@
 //! Turns cumulative kernel counters into per-flow rates and keeps history.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
@@ -12,8 +12,7 @@ use crate::procmap::{Owner, SocketTable};
 /// Ticks of history kept for the graphs.
 pub const HISTORY: usize = 120;
 
-/// The loopback device always has ifindex 1 on Linux.
-pub const LOOPBACK_IFINDEX: u32 = 1;
+pub use netmon_common::LOOPBACK_IFINDEX;
 
 #[derive(Clone, Debug)]
 pub struct Flow {
@@ -33,12 +32,14 @@ pub struct Flow {
 pub struct IfaceStats {
     pub tx_rate: f64,
     pub rx_rate: f64,
+    /// Bytes since netmon started. Grows only, also when flows expire.
     pub tx_total: u64,
     pub rx_total: u64,
     /// Combined bytes per second, oldest first.
     pub history: VecDeque<u64>,
 }
 
+#[derive(Clone)]
 pub struct Collector {
     pub flows: HashMap<FlowKey, Flow>,
     pub ifaces: HashMap<u32, IfaceStats>,
@@ -71,9 +72,15 @@ impl Collector {
         dt: f64,
     ) -> Vec<FlowKey> {
         let dt = dt.max(1e-3);
-        let mut seen = HashMap::with_capacity(self.flows.len());
+        let mut seen = HashSet::with_capacity(self.flows.len());
+        // Per interface: tx and rx bytes in this interval.
+        let mut deltas: HashMap<u32, (u64, u64)> = HashMap::new();
         for (key, cur) in snapshot {
-            seen.insert(key, ());
+            // Map iteration can return a key twice after an LRU eviction.
+            // The second copy would have delta 0 and zero the rate.
+            if !seen.insert(key) {
+                continue;
+            }
             let flow = self.flows.entry(key).or_insert_with(|| Flow {
                 key,
                 local: addr(key.family, &key.local_addr, key.local_port),
@@ -94,8 +101,11 @@ impl Collector {
             flow.rx_rate = drx as f64 / dt;
             flow.idle_ticks = if dtx == 0 && drx == 0 { flow.idle_ticks + 1 } else { 0 };
             flow.total = cur;
+            let d = deltas.entry(key.ifindex).or_default();
+            d.0 += dtx;
+            d.1 += drx;
         }
-        self.flows.retain(|k, _| seen.contains_key(k));
+        self.flows.retain(|k, _| seen.contains(k));
 
         let expired: Vec<FlowKey> = self
             .flows
@@ -107,39 +117,30 @@ impl Collector {
             self.flows.remove(k);
         }
 
-        self.update_ifaces();
+        self.update_ifaces(&deltas, dt);
         expired
     }
 
-    fn update_ifaces(&mut self) {
-        let mut sums: HashMap<u32, (f64, f64, u64, u64)> = HashMap::new();
-        for f in self.flows.values() {
-            let s = sums.entry(f.key.ifindex).or_default();
-            s.0 += f.tx_rate;
-            s.1 += f.rx_rate;
-            s.2 += f.total.tx_bytes;
-            s.3 += f.total.rx_bytes;
+    /// Rates come from this interval's bytes. Totals add them up, so they
+    /// never go down when flows expire.
+    fn update_ifaces(&mut self, deltas: &HashMap<u32, (u64, u64)>, dt: f64) {
+        for (idx, &(dtx, drx)) in deltas {
+            let st = self.ifaces.entry(*idx).or_default();
+            st.tx_total += dtx;
+            st.rx_total += drx;
         }
+        let mut total = (0.0, 0.0);
         for (idx, st) in self.ifaces.iter_mut() {
-            if !sums.contains_key(idx) {
-                st.tx_rate = 0.0;
-                st.rx_rate = 0.0;
-                push(&mut st.history, 0);
+            let (dtx, drx) = deltas.get(idx).copied().unwrap_or_default();
+            st.tx_rate = dtx as f64 / dt;
+            st.rx_rate = drx as f64 / dt;
+            push(&mut st.history, (st.tx_rate + st.rx_rate) as u64);
+            if *idx != LOOPBACK_IFINDEX {
+                total.0 += st.tx_rate;
+                total.1 += st.rx_rate;
             }
         }
-        let total = sums
-            .iter()
-            .filter(|(idx, _)| **idx != LOOPBACK_IFINDEX)
-            .fold((0.0, 0.0), |(t, r), (_, s)| (t + s.0, r + s.1));
         push(&mut self.total_history, total);
-        for (idx, (tx, rx, txt, rxt)) in sums {
-            let st = self.ifaces.entry(idx).or_default();
-            st.tx_rate = tx;
-            st.rx_rate = rx;
-            st.tx_total = txt;
-            st.rx_total = rxt;
-            push(&mut st.history, (tx + rx) as u64);
-        }
     }
 
     /// Fills owner and state from the socket table. Keeps the last known
@@ -230,5 +231,36 @@ mod tests {
         c.ingest([(key(1, LOOPBACK_IFINDEX), stats(0, 0)), (key(2, 2), stats(0, 0))], 1.0);
         c.ingest([(key(1, LOOPBACK_IFINDEX), stats(500, 500)), (key(2, 2), stats(7, 9))], 1.0);
         assert_eq!(c.total_history.back(), Some(&(7.0, 9.0)));
+    }
+
+    #[test]
+    fn duplicate_snapshot_key_is_ignored() {
+        let mut c = Collector::new(30);
+        c.ingest([(key(1, 2), stats(100, 0))], 1.0);
+        c.ingest([(key(1, 2), stats(300, 0)), (key(1, 2), stats(300, 0))], 1.0);
+        assert_eq!(c.flows[&key(1, 2)].tx_rate, 200.0);
+        assert_eq!(c.ifaces[&2].tx_rate, 200.0);
+    }
+
+    #[test]
+    fn interface_totals_survive_expiry() {
+        let mut c = Collector::new(1);
+        c.ingest([(key(1, 2), stats(100, 50))], 1.0);
+        assert_eq!((c.ifaces[&2].tx_total, c.ifaces[&2].rx_total), (100, 50));
+        // Idle: expires, but the bytes stay counted.
+        c.ingest([(key(1, 2), stats(100, 50))], 1.0);
+        assert!(c.flows.is_empty());
+        c.ingest([(key(2, 2), stats(10, 0))], 1.0);
+        assert_eq!((c.ifaces[&2].tx_total, c.ifaces[&2].rx_total), (110, 50));
+        assert_eq!(c.ifaces[&2].tx_rate, 10.0);
+    }
+
+    #[test]
+    fn long_interval_gives_average_rate() {
+        let mut c = Collector::new(30);
+        c.ingest([(key(1, 2), stats(0, 0))], 1.0);
+        c.ingest([(key(1, 2), stats(6000, 0))], 60.0);
+        assert_eq!(c.flows[&key(1, 2)].tx_rate, 100.0);
+        assert_eq!(c.total_history.back(), Some(&(100.0, 0.0)));
     }
 }

@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     EbpfContext,
-    bindings::{TC_ACT_UNSPEC, __sk_buff},
+    bindings::{BPF_NOEXIST, TC_ACT_UNSPEC, __sk_buff},
     cty::c_void,
     helpers::{bpf_ktime_get_ns, bpf_skb_load_bytes},
     macros::{classifier, map},
@@ -12,7 +12,7 @@ use aya_ebpf::{
 };
 use netmon_common::{
     CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES, CaptureConfig, FlowKey,
-    FlowStats, MAX_CAPTURE_FLOWS, MAX_FLOWS, MAX_IFACES, PacketEvent, PacketSource,
+    FlowStats, LOOPBACK_IFINDEX, MAX_CAPTURE_FLOWS, MAX_FLOWS, MAX_IFACES, PacketEvent, PacketSource,
     parse_packet,
 };
 
@@ -82,10 +82,18 @@ fn handle(ctx: &TcContext, egress: bool) {
     }
 
     let Some(cfg) = CAPTURE_CFG.get(0) else { return };
+    // Every loopback packet passes egress and then ingress. Capture it once,
+    // on egress. The ingress side of the flow is the reversed key.
+    let lo = ifindex == LOOPBACK_IFINDEX;
+    if lo && !egress {
+        return;
+    }
     let hit = match cfg.mode {
         CAPTURE_IFACE => cfg.ifindex == ifindex,
         CAPTURE_FLOWS => match &key {
-            Some(k) => unsafe { CAPTURE_KEYS.get(k) }.is_some(),
+            Some(k) => unsafe {
+                CAPTURE_KEYS.get(k).is_some() || (lo && CAPTURE_KEYS.get(&k.reversed()).is_some())
+            },
             None => false,
         },
         _ => false,
@@ -114,7 +122,18 @@ fn count(ctx: &TcContext, key: &FlowKey, egress: bool) {
         } else {
             FlowStats { rx_bytes: len, rx_pkts: 1, ..Default::default() }
         };
-        let _ = FLOWS.insert(key, &s, 0);
+        // Two CPUs can see a new flow at the same time. A plain insert would
+        // replace the other CPU's entry and lose its count. With NOEXIST the
+        // second insert fails and that CPU adds to its own slot instead.
+        if FLOWS.insert(key, &s, BPF_NOEXIST as u64).is_err()
+            && let Some(p) = FLOWS.get_ptr_mut(key)
+        {
+            let p = unsafe { &mut *p };
+            p.tx_bytes += s.tx_bytes;
+            p.tx_pkts += s.tx_pkts;
+            p.rx_bytes += s.rx_bytes;
+            p.rx_pkts += s.rx_pkts;
+        }
     }
 }
 

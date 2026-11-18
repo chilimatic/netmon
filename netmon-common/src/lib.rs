@@ -13,6 +13,9 @@ pub const MAX_FLOWS: u32 = 65_536;
 /// Max interfaces with an explicit L3 offset.
 pub const MAX_IFACES: u32 = 1_024;
 
+/// The loopback device always has ifindex 1 on Linux.
+pub const LOOPBACK_IFINDEX: u32 = 1;
+
 /// One direction-independent flow as seen on one interface.
 /// IPv4 addresses use the first 4 bytes; the rest stays zero.
 #[repr(C)]
@@ -190,6 +193,18 @@ impl FlowKey {
             _pad: [0; 2],
         }
     }
+
+    /// The same flow seen from the other end (local and remote swapped).
+    #[inline(always)]
+    pub fn reversed(&self) -> Self {
+        FlowKey {
+            local_addr: self.remote_addr,
+            remote_addr: self.local_addr,
+            local_port: self.remote_port,
+            remote_port: self.local_port,
+            ..*self
+        }
+    }
 }
 
 #[cfg(test)]
@@ -272,5 +287,14 @@ mod tests {
         let ing = FlowKey::from_packet(&reply, 3, false);
         assert_eq!(eg, ing);
         assert_eq!(eg.local_port, 40000);
+    }
+
+    #[test]
+    fn reversed_swaps_ends() {
+        let p = parse_packet(&&TCP_V4[..], 14, ETH_P_IP).unwrap();
+        let eg = FlowKey::from_packet(&p, 1, true);
+        let ing = FlowKey::from_packet(&p, 1, false);
+        assert_eq!(eg.reversed(), ing);
+        assert_eq!(eg.reversed().reversed(), eg);
     }
 }

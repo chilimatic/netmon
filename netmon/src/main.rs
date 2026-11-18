@@ -41,6 +41,19 @@ struct Args {
     once: Option<u64>,
 }
 
+impl Args {
+    /// Refresh interval, at least 100 ms.
+    fn interval(&self) -> Duration {
+        Duration::from_millis(self.interval_ms.max(100))
+    }
+
+    /// Idle ticks before a flow expires, from the clamped interval.
+    fn expire_ticks(&self) -> u32 {
+        let ms = self.interval().as_millis() as u64;
+        (self.expire_secs.saturating_mul(1000) / ms).clamp(1, u32::MAX as u64) as u32
+    }
+}
+
 /// How often captured packets are read while a capture runs.
 const CAPTURE_POLL: Duration = Duration::from_millis(50);
 /// Max packets taken from the ring buffer per poll, so the UI stays responsive.
@@ -53,6 +66,9 @@ struct Monitor {
     last: Instant,
     ticks: u64,
     capture: Option<Capture>,
+    /// Copy of the collector shown while paused. Counting goes on behind it,
+    /// so rates are right again after resume.
+    frozen: Option<Collector>,
 }
 
 impl Monitor {
@@ -65,9 +81,21 @@ impl Monitor {
         }
         let mut names = Names::default();
         names.update(&ifs);
-        let expire_ticks = (args.expire_secs * 1000 / args.interval_ms.max(1)).max(1) as u32;
-        let collector = Collector::new(expire_ticks);
-        Ok((Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None }, errors))
+        let collector = Collector::new(args.expire_ticks());
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None };
+        Ok((mon, errors))
+    }
+
+    /// What the UI shows: the frozen copy while paused, else live data.
+    fn view(&self) -> &Collector {
+        self.frozen.as_ref().unwrap_or(&self.collector)
+    }
+
+    /// Freezes or unfreezes the view to match the pause state.
+    fn set_paused(&mut self, paused: bool) {
+        if paused != self.frozen.is_some() {
+            self.frozen = paused.then(|| self.collector.clone());
+        }
     }
 
     /// Reads the counters, refreshes owners and attaches to new interfaces.
@@ -130,20 +158,22 @@ impl Monitor {
     /// Turns the selected row of a tab into a capture target.
     fn target_for(&self, app: &App, tab: Tab) -> Result<Target, String> {
         let pick = |len: usize| if len == 0 { None } else { Some(app.selected.min(len - 1)) };
+        // Rows as the user sees them, so a paused view picks the shown row.
+        let c = self.view();
         match tab {
             Tab::Interfaces => {
-                let rows = app.iface_rows(&self.collector, &self.names);
+                let rows = app.iface_rows(c, &self.names);
                 let r = pick(rows.len()).map(|i| &rows[i]).ok_or("no interface selected")?;
                 Ok(Target::Interface { index: r.index, name: r.name.clone() })
             }
             Tab::Processes => {
-                let rows = app.proc_rows(&self.collector);
+                let rows = app.proc_rows(c);
                 let r = pick(rows.len()).map(|i| &rows[i]).ok_or("no process selected")?;
                 let pid = r.pid_num.ok_or("owner unknown: capture its connections instead")?;
                 Ok(Target::Process { pid, comm: r.process.clone() })
             }
             Tab::Connections => {
-                let rows = app.conn_rows(&self.collector, &self.names);
+                let rows = app.conn_rows(c, &self.names);
                 let r = pick(rows.len()).map(|i| &rows[i]).ok_or("no connection selected")?;
                 Ok(Target::Connection {
                     key: r.key,
@@ -237,7 +267,7 @@ fn print_once(mon: &mut Monitor, secs: u64) -> anyhow::Result<()> {
 }
 
 fn run_tui(mon: &mut Monitor, args: &Args) -> anyhow::Result<()> {
-    let interval = Duration::from_millis(args.interval_ms.max(100));
+    let interval = args.interval();
     let mut app = App { interval_secs: interval.as_secs_f64(), ..App::default() };
     let mut terminal = ratatui::init();
     let result = (|| -> anyhow::Result<()> {
@@ -245,7 +275,7 @@ fn run_tui(mon: &mut Monitor, args: &Args) -> anyhow::Result<()> {
         let mut next = Instant::now() + interval;
         while !app.quit {
             let drops = if mon.capture.is_some() { mon.probe.capture_drops() } else { 0 };
-            terminal.draw(|f| ui::draw(f, &mut app, &mon.collector, &mon.names, mon.capture.as_ref(), drops))?;
+            terminal.draw(|f| ui::draw(f, &mut app, mon.view(), &mon.names, mon.capture.as_ref(), drops))?;
             let mut timeout = next.saturating_duration_since(Instant::now());
             if mon.capture.as_ref().is_some_and(|c| c.running) {
                 timeout = timeout.min(CAPTURE_POLL);
@@ -258,17 +288,13 @@ fn run_tui(mon: &mut Monitor, args: &Args) -> anyhow::Result<()> {
             {
                 mon.handle(&mut app, action);
             }
+            mon.set_paused(app.paused);
             mon.drain_capture();
             if Instant::now() >= next {
                 next += interval;
-                if app.paused {
-                    // Keep the time base fresh so rates stay correct after resume.
-                    mon.last = Instant::now();
-                } else {
-                    let errs = mon.tick();
-                    if let Some(e) = errs.first() {
-                        app.status = e.clone();
-                    }
+                let errs = mon.tick();
+                if let Some(e) = errs.first() {
+                    app.status = e.clone();
                 }
             }
         }
@@ -299,4 +325,22 @@ fn map_key(k: KeyEvent) -> Option<Key> {
         KeyCode::End => Key::End,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(interval_ms: u64, expire_secs: u64) -> Args {
+        Args { interval_ms, expire_secs, once: None }
+    }
+
+    #[test]
+    fn expiry_uses_clamped_interval() {
+        assert_eq!(args(1000, 30).expire_ticks(), 30);
+        // 10 ms is clamped to 100 ms: 30 s are 300 ticks, not 3000.
+        assert_eq!(args(10, 30).expire_ticks(), 300);
+        assert_eq!(args(5000, 1).expire_ticks(), 1);
+        assert_eq!(args(0, 30).interval(), Duration::from_millis(100));
+    }
 }

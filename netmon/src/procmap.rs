@@ -36,11 +36,38 @@ pub struct RawSock {
 }
 
 /// Socket lookup by exact 4-tuple, with a fallback by local port for
-/// listeners and unconnected UDP sockets.
+/// listeners and unconnected UDP sockets. The fallback also needs the bound
+/// address to match the flow's local address, or to be a wildcard. Without
+/// that, traffic of a container to 8.8.8.8:53 would be given to the
+/// resolver bound to 127.0.0.53:53.
 #[derive(Default)]
 pub struct SocketTable {
     exact: HashMap<(u8, SocketAddr, SocketAddr), SockInfo>,
-    by_port: HashMap<(u8, u16), SockInfo>,
+    by_port: HashMap<(u8, u16), Vec<Bound>>,
+}
+
+#[derive(Clone, Debug)]
+struct Bound {
+    ip: IpAddr,
+    /// Listener or unconnected socket (no peer).
+    unconnected: bool,
+    info: SockInfo,
+}
+
+impl Bound {
+    /// Lower is better: exact address before wildcard, unconnected before
+    /// connected. None when the socket cannot receive for `ip`.
+    fn rank(&self, ip: IpAddr) -> Option<u8> {
+        let addr = if self.ip == ip {
+            0
+        } else if self.ip.is_unspecified() && (self.ip.is_ipv6() || ip.is_ipv4()) {
+            // [::] also takes IPv4 on dual-stack sockets; 0.0.0.0 only IPv4.
+            2
+        } else {
+            return None;
+        };
+        Some(addr + u8::from(!self.unconnected))
+    }
 }
 
 impl SocketTable {
@@ -53,12 +80,13 @@ impl SocketTable {
             };
             let local = normalize(s.local);
             let remote = normalize(s.remote);
-            let unbound_peer = remote.port() == 0;
-            // Prefer listeners and unconnected sockets for the port fallback.
-            if unbound_peer || !t.by_port.contains_key(&(s.proto, local.port())) {
-                t.by_port.insert((s.proto, local.port()), info.clone());
-            }
-            if !unbound_peer {
+            let unconnected = remote.port() == 0;
+            t.by_port.entry((s.proto, local.port())).or_default().push(Bound {
+                ip: local.ip(),
+                unconnected,
+                info: info.clone(),
+            });
+            if !unconnected {
                 t.exact.insert((s.proto, local, remote), info);
             }
         }
@@ -67,9 +95,15 @@ impl SocketTable {
 
     pub fn lookup(&self, proto: u8, local: SocketAddr, remote: SocketAddr) -> Option<&SockInfo> {
         let (local, remote) = (normalize(local), normalize(remote));
-        self.exact
-            .get(&(proto, local, remote))
-            .or_else(|| self.by_port.get(&(proto, local.port())))
+        if let Some(i) = self.exact.get(&(proto, local, remote)) {
+            return Some(i);
+        }
+        self.by_port
+            .get(&(proto, local.port()))?
+            .iter()
+            .filter_map(|b| b.rank(local.ip()).map(|r| (r, &b.info)))
+            .min_by_key(|(r, _)| *r)
+            .map(|(_, i)| i)
     }
 
     /// Reads the current socket table and owners from /proc.
@@ -213,5 +247,36 @@ mod tests {
     #[test]
     fn unknown_is_none() {
         assert!(table().lookup(IPPROTO_TCP, sa("10.0.0.2:1"), sa("1.1.1.1:2")).is_none());
+    }
+
+    #[test]
+    fn port_fallback_needs_matching_address() {
+        let t = SocketTable::build(
+            vec![RawSock { proto: IPPROTO_UDP, local: sa("127.0.0.53:53"), remote: sa("0.0.0.0:0"), state: "", inode: 3 }],
+            &owners(),
+        );
+        // Container DNS seen on a bridge: local is the remote resolver.
+        assert!(t.lookup(IPPROTO_UDP, sa("8.8.8.8:53"), sa("172.17.0.2:40000")).is_none());
+        assert!(t.lookup(IPPROTO_UDP, sa("127.0.0.53:53"), sa("127.0.0.1:40000")).is_some());
+    }
+
+    #[test]
+    fn v4_wildcard_does_not_take_v6() {
+        assert!(table().lookup(IPPROTO_UDP, sa("[fe80::1]:5353"), sa("[ff02::fb]:5353")).is_none());
+    }
+
+    #[test]
+    fn exact_bind_beats_wildcard() {
+        let t = SocketTable::build(
+            vec![
+                RawSock { proto: IPPROTO_TCP, local: sa("0.0.0.0:80"), remote: sa("0.0.0.0:0"), state: "LISTEN", inode: 2 },
+                RawSock { proto: IPPROTO_TCP, local: sa("10.0.0.2:80"), remote: sa("0.0.0.0:0"), state: "LISTEN", inode: 1 },
+            ],
+            &owners(),
+        );
+        let i = t.lookup(IPPROTO_TCP, sa("10.0.0.2:80"), sa("9.9.9.9:1")).unwrap();
+        assert_eq!(i.owner.as_ref().unwrap().pid, 10);
+        let i = t.lookup(IPPROTO_TCP, sa("10.0.0.3:80"), sa("9.9.9.9:1")).unwrap();
+        assert_eq!(i.owner.as_ref().unwrap().pid, 20);
     }
 }
