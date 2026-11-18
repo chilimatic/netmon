@@ -268,6 +268,19 @@ fn render_table(f: &mut Frame, app: &mut App, table: Table, ids: &[RowId], area:
 fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area: Rect) {
     let rows = app.conn_rows(c, names);
     let ids: Vec<RowId> = rows.iter().map(|r| r.id()).collect();
+    let [area, detail] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let line = match app.selected_in(&ids).map(|i| &rows[i]) {
+        Some(r) if !r.source.is_empty() => format!(
+            " exe {}   user {}   unit {}   owner from {}",
+            or_dash(&r.exe),
+            or_dash(&r.user),
+            or_dash(&r.unit),
+            r.source
+        ),
+        Some(_) => " owner unknown".to_string(),
+        None => String::new(),
+    };
+    f.render_widget(Paragraph::new(line).style(Style::new().fg(Color::Cyan)), detail);
     let table = Table::new(
         rows.into_iter().map(|r| {
             Row::new(vec![
@@ -300,6 +313,10 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area: 
     render_table(f, app, table, &ids, area);
 }
 
+fn or_dash(s: &str) -> &str {
+    if s.is_empty() { "-" } else { s }
+}
+
 fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, area: Rect) {
     let rows = app.proc_rows(c);
     let ids: Vec<RowId> = rows.iter().map(|r| r.id()).collect();
@@ -308,6 +325,8 @@ fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, area: Rect) {
             Row::new(vec![
                 Cell::from(r.process),
                 Cell::from(r.pid),
+                Cell::from(r.user),
+                Cell::from(r.exe),
                 Cell::from(Line::from(r.conns.to_string()).right_aligned()),
                 Cell::from(Line::from(rate(r.tx_rate)).right_aligned()),
                 Cell::from(Line::from(rate(r.rx_rate)).right_aligned()),
@@ -315,15 +334,17 @@ fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, area: Rect) {
             ])
         }),
         [
-            Constraint::Fill(1),
+            Constraint::Length(16),
             Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Fill(1),
             Constraint::Length(6),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(10),
         ],
     )
-    .header(header_row(&["Process", "PID", "Flows", "↑", "↓", "Total"]));
+    .header(header_row(&["Process", "PID", "User", "Exe", "Flows", "↑", "↓", "Total"]));
     render_table(f, app, table, &ids, area);
 }
 
@@ -433,4 +454,42 @@ mod tests {
         assert!(!render(100, 30, false).contains("traffic (excl. lo)"));
         assert!(!render(100, 15, true).contains("traffic (excl. lo)"));
     }
+
+    fn screen(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let (w, h) = (buf.area.width, buf.area.height);
+        (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn owner_details_in_detail_line_and_process_tab() {
+        use crate::procmap::{Owner, ProcDetails};
+        let mut c = Collector::new(30);
+        let mut k = FlowKey { family: 4, proto: 6, local_port: 1, remote_port: 443, ifindex: 2, ..Default::default() };
+        k.local_addr[..4].copy_from_slice(&[10, 0, 0, 2]);
+        c.ingest([(k, FlowStats { tx_bytes: 5, cookie: 9, ..Default::default() })], 1.0);
+        let f = c.flows.get_mut(&k).unwrap();
+        f.owner_cookie = 9;
+        f.owner = Some(Owner {
+            details: Some(ProcDetails {
+                exe: "/usr/bin/curl".into(),
+                user: "j".into(),
+                unit: "app-foo.scope".into(),
+                cgroup: "/user.slice/app-foo.scope".into(),
+            }),
+            ..Owner::new(7, "renamed")
+        });
+        let mut app = App { show_graph: false, ..App::default() };
+        let mut term = Terminal::new(TestBackend::new(140, 12)).unwrap();
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None)).unwrap();
+        let s = screen(&term);
+        println!("{s}");
+        assert!(s.contains("exe /usr/bin/curl   user j   unit app-foo.scope   owner from kernel"));
+        app.tab = Tab::Processes;
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None)).unwrap();
+        let s = screen(&term);
+        println!("{s}");
+        assert!(s.contains("renamed") && s.contains("/usr/bin/curl"));
+    }
 }
+

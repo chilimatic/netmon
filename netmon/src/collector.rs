@@ -286,9 +286,9 @@ mod tests {
         c.ingest([(k, FlowStats { tx_bytes: 1, ..Default::default() })], 1.0);
         let table = SocketTable::build(
             vec![RawSock { proto: 6, local: "10.0.0.2:1".parse().unwrap(), remote: "1.1.1.1:443".parse().unwrap(), state: "ESTAB", inode: 9 }],
-            &HashMap::from([(9, Owner { pid: 7, comm: "proc".into() })]),
+            &HashMap::from([(9, Owner::new(7, "proc"))]),
         );
-        let kernel = |cookie: u64| (cookie == 77).then(|| Owner { pid: 8, comm: "hook".into() });
+        let kernel = |cookie: u64| (cookie == 77).then(|| Owner::new(8, "hook"));
         c.resolve(&table, kernel);
         assert_eq!(c.flows[&k].owner.as_ref().unwrap().pid, 7, "no cookie yet: /proc");
         c.ingest([(k, FlowStats { tx_bytes: 2, cookie: 77, ..Default::default() })], 1.0);

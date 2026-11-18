@@ -7,6 +7,7 @@ use netmon_common::{FlowKey, IPPROTO_TCP, IPPROTO_UDP};
 use crate::{
     collector::{Collector, Flow},
     ifaces::Names,
+    procmap::ProcDetails,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +68,12 @@ pub struct ConnRow {
     pub key: FlowKey,
     pub process: String,
     pub pid: String,
+    /// Exe path, user, unit; empty when unknown.
+    pub exe: String,
+    pub user: String,
+    pub unit: String,
+    /// Where the owner came from: "kernel", "/proc" or "".
+    pub source: &'static str,
     pub proto: &'static str,
     pub local: String,
     pub remote: String,
@@ -81,6 +88,8 @@ pub struct ProcRow {
     pub pid_num: Option<u32>,
     pub process: String,
     pub pid: String,
+    pub user: String,
+    pub exe: String,
     pub conns: usize,
     pub tx_rate: f64,
     pub rx_rate: f64,
@@ -291,7 +300,9 @@ impl App {
             .flows
             .values()
             .map(|f| conn_row(f, names))
-            .filter(|r| self.matches(&[&r.process, &r.pid, &r.local, &r.remote, &r.iface, r.proto]))
+            .filter(|r| {
+                self.matches(&[&r.process, &r.pid, &r.exe, &r.user, &r.unit, &r.local, &r.remote, &r.iface, r.proto])
+            })
             .collect();
         match self.sort {
             Sort::Rate => rows.sort_by(|a, b| (b.tx_rate + b.rx_rate).total_cmp(&(a.tx_rate + a.rx_rate)).then(b.total.cmp(&a.total))),
@@ -305,10 +316,13 @@ impl App {
         let mut by: HashMap<(String, String), ProcRow> = HashMap::new();
         for f in c.flows.values() {
             let (process, pid) = owner_cols(f);
+            let d = details(f);
             let r = by.entry((process.clone(), pid.clone())).or_insert(ProcRow {
                 pid_num: f.owner.as_ref().map(|o| o.pid),
                 process,
                 pid,
+                user: d.user.clone(),
+                exe: d.exe.clone(),
                 conns: 0,
                 tx_rate: 0.0,
                 rx_rate: 0.0,
@@ -319,7 +333,7 @@ impl App {
             r.rx_rate += f.rx_rate;
             r.total += f.total.tx_bytes + f.total.rx_bytes;
         }
-        let mut rows: Vec<ProcRow> = by.into_values().filter(|r| self.matches(&[&r.process, &r.pid])).collect();
+        let mut rows: Vec<ProcRow> = by.into_values().filter(|r| self.matches(&[&r.process, &r.pid, &r.user, &r.exe])).collect();
         match self.sort {
             Sort::Rate => rows.sort_by(|a, b| (b.tx_rate + b.rx_rate).total_cmp(&(a.tx_rate + a.rx_rate)).then(b.total.cmp(&a.total))),
             Sort::Total => rows.sort_by(|a, b| b.total.cmp(&a.total)),
@@ -357,12 +371,28 @@ fn owner_cols(f: &Flow) -> (String, String) {
     }
 }
 
+static NO_DETAILS: ProcDetails =
+    ProcDetails { exe: String::new(), user: String::new(), unit: String::new(), cgroup: String::new() };
+
+fn details(f: &Flow) -> &ProcDetails {
+    f.owner.as_ref().and_then(|o| o.details.as_ref()).unwrap_or(&NO_DETAILS)
+}
+
 fn conn_row(f: &Flow, names: &Names) -> ConnRow {
     let (process, pid) = owner_cols(f);
+    let d = details(f);
     ConnRow {
         key: f.key,
         process,
         pid,
+        exe: d.exe.clone(),
+        user: d.user.clone(),
+        unit: d.unit.clone(),
+        source: match (&f.owner, f.owner_cookie) {
+            (None, _) => "",
+            (Some(_), 0) => "/proc",
+            (Some(_), _) => "kernel",
+        },
         proto: match f.key.proto {
             IPPROTO_TCP => "tcp",
             IPPROTO_UDP => "udp",
@@ -410,7 +440,7 @@ mod tests {
         c.ingest([mk(1, 100), mk(2, 5000)], 1.0);
         let table = SocketTable::build(
             vec![RawSock { proto: IPPROTO_TCP, local: "10.0.0.2:1".parse().unwrap(), remote: "1.1.1.1:443".parse().unwrap(), state: "ESTAB", inode: 9 }],
-            &HashMap::from([(9, Owner { pid: 7, comm: "curl".into() })]),
+            &HashMap::from([(9, Owner::new(7, "curl"))]),
         );
         c.resolve(&table, |_| None);
         c

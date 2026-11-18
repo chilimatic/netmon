@@ -129,8 +129,10 @@ follow new packets, `s` save as `.pcap`, `c` clear, `x` stop.
 
 ## Limits
 
-Owners (process name and PID) are a best guess from `/proc`, made after the
-packets were counted:
+Owners come from kernel hooks on `connect`, `sendmsg` and socket creation
+(the detail line says "owner from kernel"). Flows without one, such as
+sockets opened before netmon started or accepted server connections, fall
+back to a guess from `/proc` ("owner from /proc"):
 
 - Sockets that open and close between two refreshes (a DNS query, a short
   `curl`) are often never seen and show as `?`.
@@ -141,7 +143,10 @@ packets were counted:
   traffic of that port.
 - A socket shared after `fork` shows the first process found that holds it.
 - The process name is `comm`, which every process can change itself. Do not
-  use it as proof of identity.
+  use it as proof of identity. The Processes tab and the detail line under
+  the Connections table show the exe path, user and systemd unit, read from
+  `/proc/<pid>/exe` and `/proc/<pid>/cgroup` once per process. A process that
+  exits before netmon reads them shows `-`.
 
 Counting:
 

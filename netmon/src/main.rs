@@ -23,7 +23,7 @@ use crate::{
     collector::Collector,
     ifaces::Names,
     probe::{Kernel, Probe},
-    procmap::{Owner, OwnerCache, SocketTable},
+    procmap::{Owner, OwnerCache, ProcCache, SocketTable, read_details},
 };
 
 /// Live view of network connections: owning process, interface and traffic.
@@ -72,6 +72,7 @@ struct Monitor<K: Kernel = Probe> {
     /// so rates are right again after resume.
     frozen: Option<Collector>,
     owners: OwnerCache,
+    procs: ProcCache,
 }
 
 impl Monitor {
@@ -94,7 +95,7 @@ impl<K: Kernel> Monitor<K> {
         let mut names = Names::default();
         names.update(&ifs);
         let collector = Collector::new(args.expire_ticks());
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default() };
         Ok((mon, errors))
     }
 
@@ -130,6 +131,10 @@ impl<K: Kernel> Monitor<K> {
         let probe = &self.probe;
         let kernel = |cookie| probe.sock_owner(cookie).map(|o| Owner::from_kernel(&o));
         self.collector.resolve(&SocketTable::read(&mut self.owners), kernel);
+        self.procs.prune(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
+        for o in self.collector.flows.values_mut().filter_map(|f| f.owner.as_mut()) {
+            self.procs.fill(o, read_details);
+        }
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {
             errors.push(format!("capture: {e:#}"));
@@ -528,7 +533,7 @@ mod tests {
     #[test]
     fn process_capture_follows_new_flows_until_stopped() {
         let (mut m, t0) = monitor();
-        let owner = Some(Owner { pid: 4242, comm: "curl".into() });
+        let owner = Some(Owner::new(4242, "curl"));
         m.probe.flows = vec![(key(50001), tx(10))];
         m.tick_at(secs(t0, 1));
         m.collector.flows.get_mut(&key(50001)).unwrap().owner = owner.clone();

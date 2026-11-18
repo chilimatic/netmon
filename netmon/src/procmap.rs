@@ -15,17 +15,44 @@ use procfs::{
     process::{FDTarget, all_processes},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Owner {
     pub pid: u32,
+    /// Task name. Any process can change its own; never proof of identity.
     pub comm: String,
+    pub uid: Option<u32>,
+    /// Set by `ProcCache::fill`. None until then, or when unreadable
+    /// (process gone, kernel thread).
+    pub details: Option<ProcDetails>,
+}
+
+/// Facts about a process that the process itself cannot fake.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcDetails {
+    /// Path of the running binary, from /proc/<pid>/exe.
+    pub exe: String,
+    /// User name for the uid, or the uid as a number.
+    pub user: String,
+    /// systemd unit or scope from the cgroup path, e.g. `sshd.service`.
+    pub unit: String,
+    /// Full cgroup v2 path.
+    pub cgroup: String,
 }
 
 impl Owner {
+    pub fn new(pid: u32, comm: &str) -> Self {
+        Owner { pid, comm: comm.into(), ..Default::default() }
+    }
+
     /// Owner recorded by the kernel hooks.
     pub fn from_kernel(o: &netmon_common::SockOwner) -> Self {
         let end = o.comm.iter().position(|b| *b == 0).unwrap_or(o.comm.len());
-        Owner { pid: o.tgid, comm: crate::text::sanitize(&String::from_utf8_lossy(&o.comm[..end])) }
+        Owner {
+            pid: o.tgid,
+            comm: crate::text::sanitize(&String::from_utf8_lossy(&o.comm[..end])),
+            uid: Some(o.uid),
+            details: None,
+        }
     }
 }
 
@@ -183,6 +210,80 @@ pub fn normalize(a: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Exe, user and unit per pid, read once per process. Entries of exited
+/// processes are dropped, so a reused pid is read again.
+#[derive(Default)]
+pub struct ProcCache {
+    by_pid: HashMap<u32, Option<ProcDetails>>,
+    users: Option<HashMap<u32, String>>,
+}
+
+impl ProcCache {
+    /// Forgets processes that are gone.
+    pub fn prune(&mut self, alive: impl Fn(u32) -> bool) {
+        self.by_pid.retain(|pid, _| alive(*pid));
+    }
+
+    /// Fills `owner.details` (and `uid` if unknown) from the cache, reading
+    /// /proc on the first sight of a pid.
+    pub fn fill(&mut self, owner: &mut Owner, read: impl FnOnce(u32) -> Option<RawDetails>) {
+        if owner.details.is_some() {
+            return;
+        }
+        let users = self.users.get_or_insert_with(read_users);
+        let entry = self.by_pid.entry(owner.pid).or_insert_with(|| {
+            read(owner.pid).map(|r| ProcDetails {
+                user: users.get(&r.uid).cloned().unwrap_or_else(|| r.uid.to_string()),
+                unit: unit_of(&r.cgroup).to_string(),
+                exe: crate::text::sanitize(&r.exe),
+                cgroup: crate::text::sanitize(&r.cgroup),
+            })
+        });
+        owner.details = entry.clone();
+    }
+}
+
+/// What /proc says about a process, before formatting.
+pub struct RawDetails {
+    pub exe: String,
+    pub uid: u32,
+    pub cgroup: String,
+}
+
+/// Reads exe, owner uid and cgroup v2 path of a process.
+pub fn read_details(pid: u32) -> Option<RawDetails> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = Path::new("/proc").join(pid.to_string());
+    let uid = std::fs::metadata(&dir).ok()?.uid();
+    // Kernel threads have no exe; keep them with an empty path.
+    let exe = std::fs::read_link(dir.join("exe")).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let cgroup = std::fs::read_to_string(dir.join("cgroup")).unwrap_or_default();
+    let cgroup = cgroup.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("").to_string();
+    Some(RawDetails { exe, uid, cgroup })
+}
+
+/// The most specific systemd unit or scope in a cgroup path:
+/// `/user.slice/user-1000.slice/app.slice/app-firefox-1.scope` gives
+/// `app-firefox-1.scope`. Falls back to the last path component.
+pub fn unit_of(cgroup: &str) -> &str {
+    let mut parts = cgroup.split('/').filter(|p| !p.is_empty()).rev();
+    let last = parts.clone().next().unwrap_or("");
+    parts.find(|p| p.ends_with(".service") || p.ends_with(".scope")).unwrap_or(last)
+}
+
+/// uid -> user name from /etc/passwd.
+fn read_users() -> HashMap<u32, String> {
+    let text = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split(':');
+            let name = f.next()?;
+            let uid = f.nth(1)?.parse().ok()?;
+            Some((uid, crate::text::sanitize(name)))
+        })
+        .collect()
+}
+
 fn tcp_state(s: &TcpState) -> &'static str {
     match s {
         TcpState::Established => "ESTAB",
@@ -236,10 +337,7 @@ fn read_owners() -> HashMap<u64, Owner> {
                 let comm = comm.get_or_insert_with(|| {
                     p.stat().map(|s| crate::text::sanitize(&s.comm)).unwrap_or_else(|_| "?".into())
                 });
-                owners.entry(inode).or_insert_with(|| Owner {
-                    pid: p.pid as u32,
-                    comm: comm.clone(),
-                });
+                owners.entry(inode).or_insert_with(|| Owner::new(p.pid as u32, comm));
             }
         }
     }
@@ -256,9 +354,9 @@ mod tests {
 
     fn owners() -> HashMap<u64, Owner> {
         HashMap::from([
-            (1, Owner { pid: 10, comm: "curl".into() }),
-            (2, Owner { pid: 20, comm: "nginx".into() }),
-            (3, Owner { pid: 30, comm: "dig".into() }),
+            (1, Owner::new(10, "curl")),
+            (2, Owner::new(20, "nginx")),
+            (3, Owner::new(30, "dig")),
         ])
     }
 
@@ -341,7 +439,7 @@ mod tests {
     }
 
     fn owner(pid: u32) -> Owner {
-        Owner { pid, comm: format!("p{pid}") }
+        Owner::new(pid, &format!("p{pid}"))
     }
 
     #[test]
@@ -369,4 +467,35 @@ mod tests {
         assert_eq!(c.owners[&1].pid, 11);
         assert_eq!(c.scans, 2);
     }
+
+    #[test]
+    fn unit_from_cgroup_path() {
+        assert_eq!(unit_of("/system.slice/sshd.service"), "sshd.service");
+        assert_eq!(
+            unit_of("/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox-1.scope"),
+            "app-firefox-1.scope"
+        );
+        assert_eq!(unit_of("/system.slice/docker-abc.scope/init"), "docker-abc.scope");
+        assert_eq!(unit_of("/kubepods/pod1"), "pod1");
+        assert_eq!(unit_of("/"), "");
+    }
+
+    #[test]
+    fn proc_cache_reads_each_pid_once() {
+        let mut cache = ProcCache { users: Some(HashMap::from([(1000, "j".to_string())])), ..Default::default() };
+        let raw = || Some(RawDetails { exe: "/usr/bin/curl".into(), uid: 1000, cgroup: "/user.slice/s.scope".into() });
+        let mut a = Owner::new(7, "renamed");
+        cache.fill(&mut a, |_| raw());
+        let d = a.details.clone().unwrap();
+        assert_eq!((d.exe.as_str(), d.user.as_str(), d.unit.as_str()), ("/usr/bin/curl", "j", "s.scope"));
+        let mut b = Owner::new(7, "other");
+        cache.fill(&mut b, |_| unreachable!("cached"));
+        assert_eq!(b.details, a.details);
+        // Process gone: the pid is read again when it shows up next.
+        cache.prune(|_| false);
+        let mut c = Owner::new(7, "new");
+        cache.fill(&mut c, |_| None);
+        assert_eq!(c.details, None);
+    }
 }
+
