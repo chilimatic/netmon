@@ -10,10 +10,11 @@ use ratatui::{
 };
 
 use crate::{
+    rules::Rules,
     app::{App, RowId, Sort, Tab, human},
     capture::Capture,
     decode::hexdump,
-    collector::{Collector, HISTORY},
+    collector::{Collector, HISTORY, addr},
     ifaces::Names,
 };
 
@@ -24,7 +25,7 @@ fn rate(v: f64) -> String {
 /// Rows the traffic graph takes. Hidden when the terminal is too short.
 const GRAPH_HEIGHT: u16 = 10;
 
-pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Option<&Capture>) {
+pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Option<&Capture>, rules: &Rules) {
     let graph_height = if app.show_graph && f.area().height >= GRAPH_HEIGHT + 10 { GRAPH_HEIGHT } else { 0 };
     let [header, graph, tabs, body, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -49,10 +50,11 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     };
     f.render_widget(
         Paragraph::new(format!(
-            " netmon   ↑ {}  ↓ {}   flows {}{}{}   {}",
+            " netmon   ↑ {}  ↓ {}   flows {}{}{}{}   {}",
             rate(tx),
             rate(rx),
             c.flows.len(),
+            if rules.rules.is_empty() { String::new() } else { format!("  BLOCKING {} rules", rules.rules.len()) },
             paused,
             capturing,
             app.status
@@ -70,7 +72,8 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     );
 
     match app.tab {
-        Tab::Connections => draw_conns(f, app, c, names, body),
+        Tab::Connections => draw_conns(f, app, c, names, rules, body),
+        Tab::Rules => draw_rules(f, app, rules, body),
         Tab::Processes => draw_procs(f, app, c, body),
         Tab::Interfaces => draw_ifaces(f, app, c, names, body),
         Tab::Capture => draw_capture(f, cap, names, body),
@@ -84,10 +87,13 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     let footer_text = if app.editing_filter {
         format!(" filter: {}█   (Enter keep, Esc clear)", app.filter)
     } else if app.tab == Tab::Capture {
-        " q quit  ←→/1-4 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
+        " q quit  ←→/1-5 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
+    } else if app.tab == Tab::Rules {
+        " q quit  ←→/1-5 view  ↑↓ select  d remove rule   blocks end when netmon exits".to_string()
     } else {
+        let block = if app.tab == Tab::Connections { "  b/B block ip/port" } else { "" };
         format!(
-            " q quit  ←→/1-4 view  Enter capture selected  r/t/n sort [{sort}]  / filter [{}]  p pause  g graph  ↑↓ select",
+            " q quit  ←→/1-5 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  p pause  g graph",
             app.filter
         )
     };
@@ -265,7 +271,7 @@ fn render_table(f: &mut Frame, app: &mut App, table: Table, ids: &[RowId], area:
     );
 }
 
-fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area: Rect) {
+fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, rules: &Rules, area: Rect) {
     let rows = app.conn_rows(c, names);
     let ids: Vec<RowId> = rows.iter().map(|r| r.id()).collect();
     let [area, detail] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
@@ -283,6 +289,9 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area: 
     f.render_widget(Paragraph::new(line).style(Style::new().fg(Color::Cyan)), detail);
     let table = Table::new(
         rows.into_iter().map(|r| {
+            let remote = addr(r.key.family, &r.key.remote_addr, r.key.remote_port);
+            let blocked = rules.matching(r.key.proto, remote).is_some();
+            let style = if blocked { Style::new().fg(Color::Red) } else { Style::new() };
             Row::new(vec![
                 Cell::from(r.process),
                 Cell::from(r.pid),
@@ -295,6 +304,7 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area: 
                 Cell::from(Line::from(rate(r.rx_rate)).right_aligned()),
                 Cell::from(Line::from(human(r.total as f64)).right_aligned()),
             ])
+            .style(style)
         }),
         [
             Constraint::Length(16),
@@ -310,6 +320,35 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area: 
         ],
     )
     .header(header_row(&["Process", "PID", "Proto", "Local", "Remote", "Iface", "State", "↑", "↓", "Total"]));
+    render_table(f, app, table, &ids, area);
+}
+
+fn draw_rules(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
+    if rules.rules.is_empty() {
+        f.render_widget(
+            Paragraph::new(
+                "\n  No blocks.\n\n  In Connections, b blocks the selected row's remote address and B its\n  \
+                 remote port. Blocks end when netmon exits. Loopback, this SSH session and\n  \
+                 DNS to the resolvers in /etc/resolv.conf are never blocked.",
+            )
+            .block(Block::new().borders(Borders::TOP)),
+            area,
+        );
+        return;
+    }
+    let ids: Vec<RowId> = rules.rules.iter().map(|r| RowId::Rule(r.id)).collect();
+    let table = Table::new(
+        rules.rules.iter().map(|r| {
+            Row::new(vec![
+                Cell::from(r.id.to_string()),
+                Cell::from(r.target.to_string()),
+                Cell::from(Line::from(r.drops.to_string()).right_aligned()),
+            ])
+            .style(Style::new().fg(Color::Red))
+        }),
+        [Constraint::Length(5), Constraint::Fill(1), Constraint::Length(12)],
+    )
+    .header(header_row(&["Rule", "Block", "Drops"]));
     render_table(f, app, table, &ids, area);
 }
 
@@ -400,7 +439,7 @@ mod tests {
         }
         let mut app = App { show_graph, ..App::default() };
         let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
-        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None)).unwrap();
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &Rules::default())).unwrap();
         let buf = term.backend().buffer();
         (0..height)
             .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>())
@@ -435,7 +474,7 @@ mod tests {
         let mut app = App { tab: Tab::Capture, show_graph: false, ..App::default() };
         let mut term = Terminal::new(TestBackend::new(140, 30)).unwrap();
         let c = Collector::new(30);
-        term.draw(|f| draw(f, &mut app, &c, &Names::default(), Some(&cap))).unwrap();
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), Some(&cap), &Rules::default())).unwrap();
         let buf = term.backend().buffer();
         let screen = (0..30)
             .map(|y| (0..140).map(|x| buf[(x, y)].symbol()).collect::<String>())
@@ -482,15 +521,39 @@ mod tests {
         });
         let mut app = App { show_graph: false, ..App::default() };
         let mut term = Terminal::new(TestBackend::new(140, 12)).unwrap();
-        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None)).unwrap();
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &Rules::default())).unwrap();
         let s = screen(&term);
         println!("{s}");
         assert!(s.contains("exe /usr/bin/curl   user j   unit app-foo.scope   owner from kernel"));
         app.tab = Tab::Processes;
-        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None)).unwrap();
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &Rules::default())).unwrap();
         let s = screen(&term);
         println!("{s}");
         assert!(s.contains("renamed") && s.contains("/usr/bin/curl"));
+    }
+
+    #[test]
+    fn blocked_rows_and_rules_tab() {
+        use crate::rules::BlockTarget;
+        let mut c = Collector::new(30);
+        let mut k = FlowKey { family: 4, proto: 6, local_port: 1, remote_port: 443, ifindex: 2, ..Default::default() };
+        k.remote_addr[..4].copy_from_slice(&[1, 1, 1, 1]);
+        c.ingest([(k, FlowStats { tx_bytes: 5, ..Default::default() })], 1.0);
+        let mut rules = Rules::default();
+        rules.add(BlockTarget::host("1.1.1.1".parse().unwrap())).unwrap();
+        rules.rules[0].drops = 42;
+        let mut app = App { show_graph: false, ..App::default() };
+        let mut term = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &rules)).unwrap();
+        let buf = term.backend().buffer();
+        let row = (0..10).find(|y| (0..120).map(|x| buf[(x, *y)].symbol()).collect::<String>().contains("1.1.1.1:443")).unwrap();
+        assert_eq!(buf[(0, row)].fg, Color::Red, "blocked row is red");
+        assert!(screen(&term).contains("BLOCKING 1 rules"));
+        app.tab = Tab::Rules;
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &rules)).unwrap();
+        let s = screen(&term);
+        println!("{s}");
+        assert!(s.contains("host 1.1.1.1") && s.contains("42"));
     }
 }
 

@@ -47,6 +47,55 @@ pub struct FlowStats {
 
 /// Entries in the socket owner map.
 pub const MAX_SOCK_OWNERS: u32 = 16_384;
+/// Block rules (remote networks and ports). Rule ids are 0..MAX_RULES and
+/// index the per-rule drop counters.
+pub const MAX_RULES: u32 = 1_024;
+/// Lockout guard entries.
+pub const MAX_GUARD: u32 = 64;
+
+/// A remote port to block for one transport protocol.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PortKey {
+    pub port: u16,
+    pub proto: u8,
+    pub _pad: u8,
+}
+
+/// A remote endpoint that is never blocked (SSH session, DNS resolver).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct GuardKey {
+    pub addr: [u8; 16],
+    pub port: u16,
+    pub family: u8,
+    pub _pad: u8,
+}
+
+/// True for 127.0.0.0/8, ::1 and IPv4-mapped 127.x. Loopback is never
+/// blocked.
+#[inline(always)]
+pub fn is_loopback(family: u8, addr: &[u8; 16]) -> bool {
+    if family == 4 {
+        return addr[0] == 127;
+    }
+    let mut i = 0;
+    let mut zero_head = true;
+    while i < 10 {
+        if addr[i] != 0 {
+            zero_head = false;
+        }
+        i += 1;
+    }
+    if !zero_head {
+        return false;
+    }
+    if addr[10] == 0xff && addr[11] == 0xff {
+        return addr[12] == 127;
+    }
+    addr[10] == 0 && addr[11] == 0 && addr[12] == 0 && addr[13] == 0 && addr[14] == 0 && addr[15] == 1
+}
+
 /// Entries in the bound socket (listener) map.
 pub const MAX_LISTENERS: u32 = 4_096;
 
@@ -136,6 +185,10 @@ unsafe impl aya::Pod for FlowStats {}
 unsafe impl aya::Pod for SockOwner {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ListenKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PortKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for GuardKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ListenOwner {}
 
@@ -494,6 +547,28 @@ mod tests {
         let (b, len) = ipv6_with(&ext);
         let p = parse_packet(&&b[..len], 14, ETH_P_IPV6).unwrap();
         assert_eq!((p.proto, p.sport), (60, 0));
+    }
+
+    #[test]
+    fn loopback_detection() {
+        let v4 = |a: [u8; 4]| {
+            let mut b = [0u8; 16];
+            b[..4].copy_from_slice(&a);
+            b
+        };
+        assert!(is_loopback(4, &v4([127, 0, 0, 53])));
+        assert!(!is_loopback(4, &v4([10, 0, 0, 1])));
+        let mut one = [0u8; 16];
+        one[15] = 1;
+        assert!(is_loopback(6, &one));
+        let mut mapped = [0u8; 16];
+        mapped[10..16].copy_from_slice(&[0xff, 0xff, 127, 0, 0, 1]);
+        assert!(is_loopback(6, &mapped));
+        mapped[12] = 10;
+        assert!(!is_loopback(6, &mapped));
+        let mut fe80 = one;
+        fe80[0] = 0xfe;
+        assert!(!is_loopback(6, &fe80));
     }
 }
 

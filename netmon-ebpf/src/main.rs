@@ -3,21 +3,21 @@
 
 use aya_ebpf::{
     EbpfContext,
-    bindings::{BPF_NOEXIST, TC_ACT_UNSPEC, __sk_buff},
+    bindings::{BPF_NOEXIST, TC_ACT_SHOT, TC_ACT_UNSPEC, __sk_buff},
     cty::c_void,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
         bpf_get_current_uid_gid, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_skb_load_bytes,
     },
     macros::{cgroup_sock, cgroup_sock_addr, classifier, map},
-    maps::{Array, HashMap, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, LpmTrie, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf, lpm_trie::Key},
     programs::{SockAddrContext, SockContext, TcContext},
 };
 use netmon_common::{
     CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES, CaptureConfig, FlowKey,
-    FlowStats, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey, ListenOwner,
-    MAX_CAPTURE_FLOWS, MAX_FLOWS, MAX_IFACES, MAX_LISTENERS, MAX_SOCK_OWNERS, PacketEvent,
-    PacketSource, SockOwner, parse_packet,
+    FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey, ListenOwner,
+    MAX_CAPTURE_FLOWS, MAX_FLOWS, MAX_GUARD, MAX_IFACES, MAX_LISTENERS, MAX_RULES,
+    MAX_SOCK_OWNERS, PacketEvent, PacketSource, PortKey, SockOwner, is_loopback, parse_packet,
 };
 
 /// Byte counters per flow and interface.
@@ -60,6 +60,65 @@ static LISTENERS: LruHashMap<ListenKey, ListenOwner> = LruHashMap::with_max_entr
 #[map]
 static LISTEN_BY_COOKIE: LruHashMap<u64, ListenKey> = LruHashMap::with_max_entries(MAX_LISTENERS, 0);
 
+// Block rules. Verdict maps are never LRU: an evicted rule would silently
+// stop blocking. Userspace keeps them; they end with the process (fail-open).
+
+/// Remote IPv4 networks to block -> rule id.
+#[map]
+static BLOCK_V4: LpmTrie<[u8; 4], u32> = LpmTrie::with_max_entries(MAX_RULES, 0);
+
+/// Remote IPv6 networks to block -> rule id.
+#[map]
+static BLOCK_V6: LpmTrie<[u8; 16], u32> = LpmTrie::with_max_entries(MAX_RULES, 0);
+
+/// Remote ports to block -> rule id.
+#[map]
+static BLOCK_PORT: HashMap<PortKey, u32> = HashMap::with_max_entries(MAX_RULES, 0);
+
+/// Number of rules. 0 skips every lookup. Index 0 only.
+#[map]
+static RULE_COUNT: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Remote endpoints that are never blocked (lockout guard).
+#[map]
+static GUARD: HashMap<GuardKey, u8> = HashMap::with_max_entries(MAX_GUARD, 0);
+
+/// Packets and socket calls stopped, per rule id.
+#[map]
+static RULE_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(MAX_RULES, 0);
+
+/// The rule that blocks traffic to `addr`:`port`, if any. Loopback and
+/// guarded endpoints always pass.
+#[inline(always)]
+fn verdict(family: u8, addr: &[u8; 16], proto: u8, port: u16) -> Option<u32> {
+    if RULE_COUNT.get(0).copied().unwrap_or(0) == 0 || is_loopback(family, addr) {
+        return None;
+    }
+    let guard = GuardKey { addr: *addr, port, family, _pad: 0 };
+    if unsafe { GUARD.get(&guard) }.is_some() {
+        return None;
+    }
+    let net = if family == 4 {
+        BLOCK_V4.get(&Key::new(32, [addr[0], addr[1], addr[2], addr[3]]))
+    } else {
+        BLOCK_V6.get(&Key::new(128, *addr))
+    };
+    if let Some(id) = net {
+        return Some(*id);
+    }
+    if port != 0 && (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+        return unsafe { BLOCK_PORT.get(&PortKey { port, proto, _pad: 0 }) }.copied();
+    }
+    None
+}
+
+#[inline(always)]
+fn count_drop(rule: u32) {
+    if let Some(d) = RULE_DROPS.get_ptr_mut(rule) {
+        unsafe { *d += 1 };
+    }
+}
+
 struct Skb<'a>(&'a TcContext);
 
 impl PacketSource for Skb<'_> {
@@ -69,24 +128,22 @@ impl PacketSource for Skb<'_> {
     }
 }
 
-// The programs only observe. They return TC_ACT_UNSPEC (TCX_NEXT), which
-// lets the next program on the hook run. TC_ACT_OK would be TCX_PASS and
-// would skip every tcx program attached after netmon.
+// Pass is TC_ACT_UNSPEC (TCX_NEXT), which lets the next program on the hook
+// run. TC_ACT_OK would be TCX_PASS and would skip every tcx program attached
+// after netmon. Blocked packets get TC_ACT_SHOT.
 
 #[classifier]
 pub fn tc_egress(ctx: TcContext) -> i32 {
-    handle(&ctx, true);
-    TC_ACT_UNSPEC
+    handle(&ctx, true)
 }
 
 #[classifier]
 pub fn tc_ingress(ctx: TcContext) -> i32 {
-    handle(&ctx, false);
-    TC_ACT_UNSPEC
+    handle(&ctx, false)
 }
 
 #[inline(always)]
-fn handle(ctx: &TcContext, egress: bool) {
+fn handle(ctx: &TcContext, egress: bool) -> i32 {
     let skb = ctx.as_ptr() as *const __sk_buff;
     let ifindex = unsafe { (*skb).ifindex };
     // skb->protocol holds a big-endian u16.
@@ -95,16 +152,24 @@ fn handle(ctx: &TcContext, egress: bool) {
 
     let key = parse_packet(&Skb(ctx), l3 as usize, ethertype)
         .map(|pkt| FlowKey::from_packet(&pkt, ifindex, egress));
+    let mut action = TC_ACT_UNSPEC;
     if let Some(key) = &key {
         count(ctx, key, egress);
+        // Unparsed packets have no key and pass (fail-open).
+        if ifindex != LOOPBACK_IFINDEX
+            && let Some(rule) = verdict(key.family, &key.remote_addr, key.proto, key.remote_port)
+        {
+            count_drop(rule);
+            action = TC_ACT_SHOT;
+        }
     }
 
-    let Some(cfg) = CAPTURE_CFG.get(0) else { return };
+    let Some(cfg) = CAPTURE_CFG.get(0) else { return action };
     // Every loopback packet passes egress and then ingress. Capture it once,
     // on egress. The ingress side of the flow is the reversed key.
     let lo = ifindex == LOOPBACK_IFINDEX;
     if lo && !egress {
-        return;
+        return action;
     }
     let hit = match cfg.mode {
         CAPTURE_IFACE => cfg.ifindex == ifindex,
@@ -119,6 +184,7 @@ fn handle(ctx: &TcContext, egress: bool) {
     if hit {
         capture(ctx, ifindex, ethertype, l3 != 0, egress);
     }
+    action
 }
 
 #[inline(always)]
@@ -202,11 +268,42 @@ fn capture(ctx: &TcContext, ifindex: u32, ethertype: u16, has_l2: bool, egress: 
     entry.submit(0);
 }
 
-// Socket owner hooks on the root cgroup. They run in the context of the
-// process that creates or uses the socket. They only record and must always
-// return 1: 0 would deny the socket call with EPERM.
+// Socket hooks on the root cgroup. They run in the context of the process
+// that creates or uses the socket. They return 1 (allow), except connect and
+// sendmsg to a blocked destination, which return 0: the call fails with
+// EPERM.
 
 const ALLOW: i32 = 1;
+const DENY: i32 = 0;
+
+/// Verdict for a connect/sendmsg destination. user_port holds the port in
+/// network order in its low 16 bits; native-order bytes give the wire bytes.
+#[inline(always)]
+fn addr_verdict(ctx: &SockAddrContext, family: u8) -> i32 {
+    let sa = ctx.sock_addr;
+    let proto = unsafe { (*sa).protocol } as u8;
+    let pb = unsafe { (*sa).user_port }.to_ne_bytes();
+    let port = u16::from_be_bytes([pb[0], pb[1]]);
+    let mut addr = [0u8; 16];
+    // Each hook may read only its own family's address field.
+    if family == 4 {
+        addr[..4].copy_from_slice(&unsafe { (*sa).user_ip4 }.to_ne_bytes());
+    } else {
+        let ip6 = unsafe { (*sa).user_ip6 };
+        let mut i = 0;
+        while i < 4 {
+            addr[i * 4..i * 4 + 4].copy_from_slice(&ip6[i].to_ne_bytes());
+            i += 1;
+        }
+    }
+    match verdict(family, &addr, proto, port) {
+        Some(rule) => {
+            count_drop(rule);
+            DENY
+        }
+        None => ALLOW,
+    }
+}
 
 /// Writes the current process as owner of the socket behind `ctx`. Skips the
 /// write when the entry already names this process, so busy UDP senders do
@@ -303,25 +400,25 @@ pub fn sock_create(ctx: SockContext) -> i32 {
 #[cgroup_sock_addr(connect4)]
 pub fn connect4(ctx: SockAddrContext) -> i32 {
     record_owner(ctx.as_ptr());
-    ALLOW
+    addr_verdict(&ctx, 4)
 }
 
 #[cgroup_sock_addr(connect6)]
 pub fn connect6(ctx: SockAddrContext) -> i32 {
     record_owner(ctx.as_ptr());
-    ALLOW
+    addr_verdict(&ctx, 6)
 }
 
 #[cgroup_sock_addr(sendmsg4)]
 pub fn sendmsg4(ctx: SockAddrContext) -> i32 {
     record_owner(ctx.as_ptr());
-    ALLOW
+    addr_verdict(&ctx, 4)
 }
 
 #[cgroup_sock_addr(sendmsg6)]
 pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
     record_owner(ctx.as_ptr());
-    ALLOW
+    addr_verdict(&ctx, 6)
 }
 
 #[cfg(not(test))]

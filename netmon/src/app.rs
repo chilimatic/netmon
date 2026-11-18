@@ -16,10 +16,11 @@ pub enum Tab {
     Processes,
     Interfaces,
     Capture,
+    Rules,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Connections, Tab::Processes, Tab::Interfaces, Tab::Capture];
+    pub const ALL: [Tab; 5] = [Tab::Connections, Tab::Processes, Tab::Interfaces, Tab::Capture, Tab::Rules];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -27,25 +28,20 @@ impl Tab {
             Tab::Processes => "Processes",
             Tab::Interfaces => "Interfaces",
             Tab::Capture => "Capture",
+            Tab::Rules => "Rules",
         }
+    }
+
+    fn index(self) -> usize {
+        Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
 
     fn prev(self) -> Tab {
-        match self {
-            Tab::Connections => Tab::Capture,
-            Tab::Processes => Tab::Connections,
-            Tab::Interfaces => Tab::Processes,
-            Tab::Capture => Tab::Interfaces,
-        }
+        Tab::ALL[(self.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
     }
 
     fn next(self) -> Tab {
-        match self {
-            Tab::Connections => Tab::Processes,
-            Tab::Processes => Tab::Interfaces,
-            Tab::Interfaces => Tab::Capture,
-            Tab::Capture => Tab::Connections,
-        }
+        Tab::ALL[(self.index() + 1) % Tab::ALL.len()]
     }
 }
 
@@ -62,6 +58,7 @@ pub enum RowId {
     Conn(FlowKey),
     Proc(String, String),
     Iface(u32),
+    Rule(u32),
 }
 
 pub struct ConnRow {
@@ -188,6 +185,13 @@ pub enum Action {
     MovePacket(isize),
     /// Jump to the oldest (false) or newest (true) packet.
     JumpPacket(bool),
+    /// Block (or unblock, if blocked) the remote address of the selected
+    /// connection.
+    ToggleBlockRemote,
+    /// Block (or unblock) the remote port of the selected connection.
+    ToggleBlockPort,
+    /// Remove the selected rule in the Rules tab.
+    RemoveRule,
 }
 
 impl App {
@@ -235,7 +239,13 @@ impl App {
             Key::Char('2') => self.set_tab(Tab::Processes),
             Key::Char('3') => self.set_tab(Tab::Interfaces),
             Key::Char('4') => self.set_tab(Tab::Capture),
-            Key::Enter if self.tab != Tab::Capture => return Some(Action::StartCapture(self.tab)),
+            Key::Char('5') => self.set_tab(Tab::Rules),
+            Key::Char('b') if self.tab == Tab::Connections => return Some(Action::ToggleBlockRemote),
+            Key::Char('B') if self.tab == Tab::Connections => return Some(Action::ToggleBlockPort),
+            Key::Char('d') if self.tab == Tab::Rules => return Some(Action::RemoveRule),
+            Key::Enter if matches!(self.tab, Tab::Connections | Tab::Processes | Tab::Interfaces) => {
+                return Some(Action::StartCapture(self.tab));
+            }
             Key::Char('r') => self.sort = Sort::Rate,
             Key::Char('t') => self.sort = Sort::Total,
             Key::Char('n') => self.sort = Sort::Process,
@@ -478,7 +488,7 @@ mod tests {
     fn arrows_switch_tabs_and_esc_does_not_quit() {
         let mut app = App::default();
         app.on_key(Key::Left);
-        assert_eq!(app.tab, Tab::Capture, "wraps around");
+        assert_eq!(app.tab, Tab::Rules, "wraps around");
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Connections);
         app.on_key(Key::Right);
@@ -535,4 +545,20 @@ mod tests {
         assert_eq!(app.sync_selection(&ids(&[3, 2])), 0);
         assert_eq!(app.sync_selection(&[]), 0);
     }
+
+    #[test]
+    fn block_keys_only_where_they_apply() {
+        let mut app = App::default();
+        assert_eq!(app.on_key(Key::Char('b')), Some(Action::ToggleBlockRemote));
+        assert_eq!(app.on_key(Key::Char('B')), Some(Action::ToggleBlockPort));
+        assert_eq!(app.on_key(Key::Char('d')), None);
+        app.on_key(Key::Char('5'));
+        assert_eq!(app.tab, Tab::Rules);
+        assert_eq!(app.on_key(Key::Char('d')), Some(Action::RemoveRule));
+        assert_eq!(app.on_key(Key::Char('b')), None);
+        assert_eq!(app.on_key(Key::Enter), None);
+        app.on_key(Key::Right);
+        assert_eq!(app.tab, Tab::Connections, "wraps");
+    }
 }
+

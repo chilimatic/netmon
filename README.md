@@ -90,12 +90,28 @@ Repeat the `install` and `setcap` lines after every rebuild.
 
 Without the TUI: `netmon --once 3` samples 3 s and prints a table.
 
-Keys: `←`/`→` (or `Tab`, `1-4`) switch view, `Esc` clear filter, `Enter` capture the selected row, `r`/`t`/`n` sort by rate/total/name, `/` filter,
+Keys: `←`/`→` (or `Tab`, `1-5`) switch view, `b`/`B` block remote IP/port, `Esc` clear filter, `Enter` capture the selected row, `r`/`t`/`n` sort by rate/total/name, `/` filter,
 `p` pause the view (counting goes on), `g` toggle the traffic graph, `↑↓` select, `q` quit.
 
 The graph on top shows total traffic of all interfaces except `lo` for the
 last 120 samples: download above the zero line, upload below. Each half has
 its own scale (shown on the y axis).
+
+## Blocking
+
+In **Connections**, `b` blocks the selected row's remote address and `B` its
+remote port (TCP or UDP). Press the key again to unblock. Blocked rows turn
+red. The **Rules** tab (`5`) lists every block with its drop count; `d`
+removes the selected one.
+
+- New connections and UDP sends to a blocked destination fail with
+  `Operation not permitted` (cgroup `connect`/`sendmsg` hooks). Packets of
+  existing connections and traffic without a local socket are dropped in
+  TC on every interface.
+- Blocks end when netmon exits or crashes (fail-open). Packets netmon
+  cannot parse pass.
+- Never blocked (lockout guard): loopback, the SSH session netmon runs in,
+  and DNS (port 53) to the nameservers in `/etc/resolv.conf`.
 
 ## Packet capture
 

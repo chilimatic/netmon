@@ -5,6 +5,7 @@ mod decode;
 mod ifaces;
 mod probe;
 mod procmap;
+mod rules;
 mod text;
 mod ui;
 
@@ -24,6 +25,7 @@ use crate::{
     ifaces::Names,
     probe::{Kernel, Probe},
     procmap::{Listeners, Owner, OwnerCache, ProcCache, SocketTable, read_details},
+    rules::{BlockTarget, Rules, guard_endpoints},
 };
 
 /// Live view of network connections: owning process, interface and traffic.
@@ -73,12 +75,15 @@ struct Monitor<K: Kernel = Probe> {
     frozen: Option<Collector>,
     owners: OwnerCache,
     procs: ProcCache,
+    rules: Rules,
 }
 
 impl Monitor {
     fn new(args: &Args) -> anyhow::Result<(Self, Vec<String>)> {
-        let probe = Probe::load()?;
+        let mut probe = Probe::load()?;
         let hook_errors = probe.hook_errors.clone();
+        let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+        probe.set_guard(&guard_endpoints(ssh_connection().as_deref(), &resolv))?;
         let (mon, mut errors) = Monitor::with_kernel(probe, args)?;
         errors.extend(hook_errors);
         Ok((mon, errors))
@@ -95,7 +100,7 @@ impl<K: Kernel> Monitor<K> {
         let mut names = Names::default();
         names.update(&ifs);
         let collector = Collector::new(args.expire_ticks());
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default() };
         Ok((mon, errors))
     }
 
@@ -136,6 +141,9 @@ impl<K: Kernel> Monitor<K> {
         self.procs.prune(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
         for o in self.collector.flows.values_mut().filter_map(|f| f.owner.as_mut()) {
             self.procs.fill(o, read_details);
+        }
+        for rule in &mut self.rules.rules {
+            rule.drops = self.probe.rule_drops(rule.id);
         }
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {
@@ -214,8 +222,46 @@ impl<K: Kernel> Monitor<K> {
                     label: format!("{} {} → {} on {}", r.proto, r.local, r.remote, r.iface),
                 })
             }
-            Tab::Capture => Err("select a row in another tab".into()),
+            Tab::Capture | Tab::Rules => Err("select a row in another tab".into()),
         }
+    }
+
+    /// Adds the rule, or removes it if it exists.
+    fn toggle_block(&mut self, target: BlockTarget) -> String {
+        if let Some(rule) = self.rules.find(&target).cloned() {
+            return self.remove_rule(rule.id);
+        }
+        let id = match self.rules.add(target) {
+            Ok(id) => id,
+            Err(e) => return e,
+        };
+        match self.probe.block(id, &target) {
+            Ok(()) => format!("blocked {target} (until netmon exits; b again or Rules tab to undo)"),
+            Err(e) => {
+                self.rules.remove(id);
+                format!("block failed: {e:#}")
+            }
+        }
+    }
+
+    fn remove_rule(&mut self, id: u32) -> String {
+        let Some(rule) = self.rules.remove(id) else { return "no such rule".into() };
+        match self.probe.unblock(&rule.target) {
+            Ok(()) => format!("unblocked {}", rule.target),
+            Err(e) => {
+                // Still in the kernel: keep it listed so it can be retried.
+                self.rules.rules.push(rule);
+                format!("unblock failed: {e:#}")
+            }
+        }
+    }
+
+    /// The selected connection in the Connections tab.
+    fn selected_conn(&self, app: &App) -> Option<crate::app::ConnRow> {
+        let rows = app.conn_rows(self.view(), &self.names);
+        let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
+        let i = app.selected_in(&ids)?;
+        rows.into_iter().nth(i)
     }
 
     fn handle(&mut self, app: &mut App, action: Action) {
@@ -262,6 +308,29 @@ impl<K: Kernel> Monitor<K> {
                 if let Some(cap) = self.capture.as_mut() {
                     cap.select(d);
                 }
+            }
+            Action::ToggleBlockRemote => {
+                app.status = match self.selected_conn(app) {
+                    Some(r) => {
+                        let remote = collector::addr(r.key.family, &r.key.remote_addr, r.key.remote_port);
+                        self.toggle_block(BlockTarget::host(remote.ip()))
+                    }
+                    None => "no connection selected".into(),
+                };
+            }
+            Action::ToggleBlockPort => {
+                app.status = match self.selected_conn(app) {
+                    Some(r) if r.key.remote_port != 0 => self.toggle_block(BlockTarget::Port(r.key.proto, r.key.remote_port)),
+                    Some(_) => "this connection has no port".into(),
+                    None => "no connection selected".into(),
+                };
+            }
+            Action::RemoveRule => {
+                let ids: Vec<_> = self.rules.rules.iter().map(|r| crate::app::RowId::Rule(r.id)).collect();
+                app.status = match app.selected_in(&ids).map(|i| self.rules.rules[i].id) {
+                    Some(id) => self.remove_rule(id),
+                    None => "no rule selected".into(),
+                };
             }
             Action::JumpPacket(newest) => {
                 if let Some(cap) = self.capture.as_mut() {
@@ -311,7 +380,7 @@ fn run_tui(mon: &mut Monitor, args: &Args, status: String) -> anyhow::Result<()>
         mon.tick();
         let mut next = Instant::now() + interval;
         while !app.quit {
-            terminal.draw(|f| ui::draw(f, &mut app, mon.view(), &mon.names, mon.capture.as_ref()))?;
+            terminal.draw(|f| ui::draw(f, &mut app, mon.view(), &mon.names, mon.capture.as_ref(), &mon.rules))?;
             let mut timeout = next.saturating_duration_since(Instant::now());
             if mon.capture.as_ref().is_some_and(|c| c.running) {
                 timeout = timeout.min(CAPTURE_POLL);
@@ -338,6 +407,29 @@ fn run_tui(mon: &mut Monitor, args: &Args, status: String) -> anyhow::Result<()>
     })();
     ratatui::restore();
     result
+}
+
+/// SSH_CONNECTION of the session netmon runs in. sudo usually drops it from
+/// the environment, so the parent processes (the shell, sshd's child) are
+/// asked too.
+fn ssh_connection() -> Option<String> {
+    if let Ok(v) = std::env::var("SSH_CONNECTION") {
+        return Some(v);
+    }
+    let mut pid = std::process::id() as i32;
+    for _ in 0..16 {
+        let p = procfs::process::Process::new(pid).ok()?;
+        if let Ok(env) = p.environ()
+            && let Some(v) = env.get(std::ffi::OsStr::new("SSH_CONNECTION"))
+        {
+            return Some(v.to_string_lossy().into_owned());
+        }
+        pid = p.stat().ok()?.ppid;
+        if pid <= 1 {
+            return None;
+        }
+    }
+    None
 }
 
 fn map_key(k: KeyEvent) -> Option<Key> {
@@ -399,6 +491,8 @@ mod tests {
         ring: VecDeque<PacketEvent>,
         mode: Mode,
         drops: u64,
+        blocked: Vec<(u32, BlockTarget)>,
+        fail_block: bool,
     }
 
     impl Kernel for Fake {
@@ -444,6 +538,23 @@ mod tests {
         fn listeners(&self) -> Vec<(u8, std::net::SocketAddr, netmon_common::SockOwner)> {
             Vec::new()
         }
+        fn block(&mut self, id: u32, target: &BlockTarget) -> anyhow::Result<()> {
+            if self.fail_block {
+                anyhow::bail!("map full");
+            }
+            self.blocked.push((id, *target));
+            Ok(())
+        }
+        fn unblock(&mut self, target: &BlockTarget) -> anyhow::Result<()> {
+            self.blocked.retain(|(_, t)| t != target);
+            Ok(())
+        }
+        fn rule_drops(&self, id: u32) -> u64 {
+            id as u64 + 100
+        }
+        fn set_guard(&mut self, _: &[std::net::SocketAddr]) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     fn key(port: u16) -> netmon_common::FlowKey {
@@ -470,7 +581,14 @@ mod tests {
     }
 
     fn monitor() -> (Monitor<Fake>, Instant) {
-        let fake = Fake { flows: Vec::new(), ring: VecDeque::new(), mode: Mode::Off, drops: 0 };
+        let fake = Fake {
+            flows: Vec::new(),
+            ring: VecDeque::new(),
+            mode: Mode::Off,
+            drops: 0,
+            blocked: Vec::new(),
+            fail_block: false,
+        };
         let (mut m, _) = Monitor::with_kernel(fake, &args(1000, 30)).unwrap();
         let t0 = Instant::now();
         m.last = t0;
@@ -567,4 +685,40 @@ mod tests {
         assert!(app.status.contains("owner unknown"), "{}", app.status);
         assert!(m.capture.is_none());
     }
+
+    #[test]
+    fn block_toggle_and_remove_from_rules_tab() {
+        let (mut m, t0) = monitor();
+        m.probe.flows = vec![(key(50001), tx(10))];
+        m.tick_at(secs(t0, 1));
+        let mut app = App::default();
+        m.handle(&mut app, Action::ToggleBlockRemote);
+        let host = BlockTarget::host("198.51.100.9".parse().unwrap());
+        assert_eq!(m.probe.blocked, vec![(0, host)], "{}", app.status);
+        assert!(app.status.starts_with("blocked host 198.51.100.9"));
+        m.handle(&mut app, Action::ToggleBlockPort);
+        assert_eq!(m.probe.blocked[1], (1, BlockTarget::Port(IPPROTO_TCP, 443)));
+        m.tick_at(secs(t0, 2));
+        assert_eq!(m.rules.rules[1].drops, 101, "drops read every tick");
+        // b again unblocks.
+        m.handle(&mut app, Action::ToggleBlockRemote);
+        assert_eq!(m.probe.blocked, vec![(1, BlockTarget::Port(IPPROTO_TCP, 443))]);
+        // d in the Rules tab removes the selected rule.
+        app.on_key(crate::app::Key::Char('5'));
+        m.handle(&mut app, Action::RemoveRule);
+        assert!(m.probe.blocked.is_empty() && m.rules.rules.is_empty(), "{}", app.status);
+    }
+
+    #[test]
+    fn failed_block_leaves_no_rule() {
+        let (mut m, t0) = monitor();
+        m.probe.flows = vec![(key(50001), tx(10))];
+        m.tick_at(secs(t0, 1));
+        m.probe.fail_block = true;
+        let mut app = App::default();
+        m.handle(&mut app, Action::ToggleBlockRemote);
+        assert!(app.status.contains("block failed"), "{}", app.status);
+        assert!(m.rules.rules.is_empty());
+    }
 }
+

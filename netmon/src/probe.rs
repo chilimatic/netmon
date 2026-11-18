@@ -1,12 +1,16 @@
 //! Loads the eBPF object, attaches the TC programs and the socket owner
 //! hooks, and reads the maps.
 
-use std::{collections::HashSet, fs::File, net::SocketAddr};
+use std::{
+    collections::HashSet,
+    fs::File,
+    net::{IpAddr, SocketAddr},
+};
 
 use anyhow::{Context as _, bail};
 use aya::{
     Ebpf, EbpfLoader, include_bytes_aligned,
-    maps::{Array, HashMap, MapData, PerCpuArray, PerCpuHashMap, RingBuf},
+    maps::{Array, HashMap, LpmTrie, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues, RingBuf, lpm_trie::Key},
     programs::{
         CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType, tc,
     },
@@ -14,8 +18,10 @@ use aya::{
 };
 use netmon_common::{
     CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, CaptureConfig, FlowKey, FlowStats, MAX_CAPTURE_FLOWS, MAX_FLOWS,
-    ListenKey, ListenOwner, PacketEvent, SockOwner,
+    GuardKey, ListenKey, ListenOwner, PacketEvent, PortKey, SockOwner,
 };
+
+use crate::rules::BlockTarget;
 
 use crate::ifaces::Iface;
 
@@ -52,6 +58,14 @@ pub struct Probe {
     drops: PerCpuArray<MapData, u64>,
     sock_owner: HashMap<MapData, u64, SockOwner>,
     listeners: HashMap<MapData, ListenKey, ListenOwner>,
+    block_v4: LpmTrie<MapData, [u8; 4], u32>,
+    block_v6: LpmTrie<MapData, [u8; 16], u32>,
+    block_port: HashMap<MapData, PortKey, u32>,
+    rule_count: Array<MapData, u32>,
+    rules: u32,
+    guard: HashMap<MapData, GuardKey, u8>,
+    rule_drops: PerCpuArray<MapData, u64>,
+    cpus: usize,
     attached: HashSet<u32>,
     failed: HashSet<u32>,
     /// Socket owner hooks that did not load or attach.
@@ -89,6 +103,12 @@ impl Probe {
         let drops = PerCpuArray::try_from(take("CAPTURE_DROPS")?)?;
         let sock_owner = HashMap::try_from(take("SOCK_OWNER")?)?;
         let listeners = HashMap::try_from(take("LISTENERS")?)?;
+        let block_v4 = LpmTrie::try_from(take("BLOCK_V4")?)?;
+        let block_v6 = LpmTrie::try_from(take("BLOCK_V6")?)?;
+        let block_port = HashMap::try_from(take("BLOCK_PORT")?)?;
+        let rule_count = Array::try_from(take("RULE_COUNT")?)?;
+        let guard = HashMap::try_from(take("GUARD")?)?;
+        let rule_drops = PerCpuArray::try_from(take("RULE_DROPS")?)?;
         let hook_errors = attach_owner_hooks(&mut ebpf);
         Ok(Probe {
             ebpf,
@@ -102,6 +122,14 @@ impl Probe {
             drops,
             sock_owner,
             listeners,
+            block_v4,
+            block_v6,
+            block_port,
+            rule_count,
+            rules: 0,
+            guard,
+            rule_drops,
+            cpus,
             attached: HashSet::new(),
             failed: HashSet::new(),
             hook_errors,
@@ -233,6 +261,24 @@ pub trait Kernel {
     fn sock_owner(&self, cookie: u64) -> Option<SockOwner>;
     /// Bound sockets recorded by the post_bind hooks: proto, address, owner.
     fn listeners(&self) -> Vec<(u8, SocketAddr, SockOwner)>;
+    /// Starts blocking `target` under rule `id`, with its drop count at 0.
+    fn block(&mut self, id: u32, target: &BlockTarget) -> anyhow::Result<()>;
+    fn unblock(&mut self, target: &BlockTarget) -> anyhow::Result<()>;
+    /// Packets dropped and socket calls denied by rule `id`.
+    fn rule_drops(&self, id: u32) -> u64;
+    /// Remote endpoints that are never blocked.
+    fn set_guard(&mut self, endpoints: &[SocketAddr]) -> anyhow::Result<()>;
+}
+
+fn addr_bytes(ip: IpAddr) -> (u8, [u8; 16]) {
+    let mut b = [0u8; 16];
+    match ip {
+        IpAddr::V4(v4) => {
+            b[..4].copy_from_slice(&v4.octets());
+            (4, b)
+        }
+        IpAddr::V6(v6) => (6, v6.octets()),
+    }
 }
 
 impl Kernel for Probe {
@@ -330,6 +376,41 @@ impl Kernel for Probe {
 
     fn sock_owner(&self, cookie: u64) -> Option<SockOwner> {
         self.sock_owner.get(&cookie, 0).ok()
+    }
+
+    fn block(&mut self, id: u32, target: &BlockTarget) -> anyhow::Result<()> {
+        self.rule_drops.set(id, PerCpuValues::try_from(vec![0u64; self.cpus])?, 0)?;
+        match *target {
+            BlockTarget::Net(IpAddr::V4(ip), len) => self.block_v4.insert(&Key::new(len.into(), ip.octets()), id, 0)?,
+            BlockTarget::Net(IpAddr::V6(ip), len) => self.block_v6.insert(&Key::new(len.into(), ip.octets()), id, 0)?,
+            BlockTarget::Port(proto, port) => self.block_port.insert(PortKey { port, proto, _pad: 0 }, id, 0)?,
+        }
+        self.rules += 1;
+        self.rule_count.set(0, self.rules, 0)?;
+        Ok(())
+    }
+
+    fn unblock(&mut self, target: &BlockTarget) -> anyhow::Result<()> {
+        match *target {
+            BlockTarget::Net(IpAddr::V4(ip), len) => self.block_v4.remove(&Key::new(len.into(), ip.octets()))?,
+            BlockTarget::Net(IpAddr::V6(ip), len) => self.block_v6.remove(&Key::new(len.into(), ip.octets()))?,
+            BlockTarget::Port(proto, port) => self.block_port.remove(&PortKey { port, proto, _pad: 0 })?,
+        }
+        self.rules = self.rules.saturating_sub(1);
+        self.rule_count.set(0, self.rules, 0)?;
+        Ok(())
+    }
+
+    fn rule_drops(&self, id: u32) -> u64 {
+        self.rule_drops.get(&id, 0).map(|v| v.iter().sum()).unwrap_or(0)
+    }
+
+    fn set_guard(&mut self, endpoints: &[SocketAddr]) -> anyhow::Result<()> {
+        for ep in endpoints {
+            let (family, addr) = addr_bytes(ep.ip());
+            self.guard.insert(GuardKey { addr, port: ep.port(), family, _pad: 0 }, 1, 0)?;
+        }
+        Ok(())
     }
 
     fn listeners(&self) -> Vec<(u8, SocketAddr, SockOwner)> {
