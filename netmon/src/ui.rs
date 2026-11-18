@@ -74,7 +74,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     match app.tab {
         Tab::Connections => draw_conns(f, app, c, names, rules, body),
         Tab::Rules => draw_rules(f, app, rules, body),
-        Tab::Processes => draw_procs(f, app, c, body),
+        Tab::Processes => draw_procs(f, app, c, rules, body),
         Tab::Interfaces => draw_ifaces(f, app, c, names, body),
         Tab::Capture => draw_capture(f, cap, names, body),
     }
@@ -91,7 +91,11 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     } else if app.tab == Tab::Rules {
         " q quit  ←→/1-5 view  ↑↓ select  d remove rule   blocks end when netmon exits".to_string()
     } else {
-        let block = if app.tab == Tab::Connections { "  b/B block ip/port" } else { "" };
+        let block = match app.tab {
+            Tab::Connections => "  b/B block ip/port",
+            Tab::Processes => "  b block exe",
+            _ => "",
+        };
         format!(
             " q quit  ←→/1-5 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  p pause  g graph",
             app.filter
@@ -290,7 +294,7 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, rules:
     let table = Table::new(
         rows.into_iter().map(|r| {
             let remote = addr(r.key.family, &r.key.remote_addr, r.key.remote_port);
-            let blocked = rules.matching(r.key.proto, remote).is_some();
+            let blocked = rules.matching(r.key.proto, remote, &r.exe).is_some();
             let style = if blocked { Style::new().fg(Color::Red) } else { Style::new() };
             Row::new(vec![
                 Cell::from(r.process),
@@ -328,7 +332,7 @@ fn draw_rules(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
         f.render_widget(
             Paragraph::new(
                 "\n  No blocks.\n\n  In Connections, b blocks the selected row's remote address and B its\n  \
-                 remote port. Blocks end when netmon exits. Loopback, this SSH session and\n  \
+                 remote port; in Processes, b blocks the process's exe. Blocks end when netmon exits. Loopback, this SSH session and\n  \
                  DNS to the resolvers in /etc/resolv.conf are never blocked.",
             )
             .block(Block::new().borders(Borders::TOP)),
@@ -356,11 +360,13 @@ fn or_dash(s: &str) -> &str {
     if s.is_empty() { "-" } else { s }
 }
 
-fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, area: Rect) {
+fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, rules: &Rules, area: Rect) {
     let rows = app.proc_rows(c);
     let ids: Vec<RowId> = rows.iter().map(|r| r.id()).collect();
     let table = Table::new(
         rows.into_iter().map(|r| {
+            let blocked = !r.exe.is_empty() && rules.exes().any(|(p, _)| p == r.exe);
+            let style = if blocked { Style::new().fg(Color::Red) } else { Style::new() };
             Row::new(vec![
                 Cell::from(r.process),
                 Cell::from(r.pid),
@@ -371,6 +377,7 @@ fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, area: Rect) {
                 Cell::from(Line::from(rate(r.rx_rate)).right_aligned()),
                 Cell::from(Line::from(human(r.total as f64)).right_aligned()),
             ])
+            .style(style)
         }),
         [
             Constraint::Length(16),

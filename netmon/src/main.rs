@@ -142,6 +142,7 @@ impl<K: Kernel> Monitor<K> {
         for o in self.collector.flows.values_mut().filter_map(|f| f.owner.as_mut()) {
             self.procs.fill(o, read_details);
         }
+        self.sync_exe_blocks();
         for rule in &mut self.rules.rules {
             rule.drops = self.probe.rule_drops(rule.id);
         }
@@ -231,12 +232,15 @@ impl<K: Kernel> Monitor<K> {
         if let Some(rule) = self.rules.find(&target).cloned() {
             return self.remove_rule(rule.id);
         }
-        let id = match self.rules.add(target) {
+        let id = match self.rules.add(target.clone()) {
             Ok(id) => id,
             Err(e) => return e,
         };
         match self.probe.block(id, &target) {
-            Ok(()) => format!("blocked {target} (until netmon exits; b again or Rules tab to undo)"),
+            Ok(()) => {
+                self.sync_exe_blocks();
+                format!("blocked {target} (until netmon exits; b again or Rules tab to undo)")
+            }
             Err(e) => {
                 self.rules.remove(id);
                 format!("block failed: {e:#}")
@@ -244,9 +248,24 @@ impl<K: Kernel> Monitor<K> {
         }
     }
 
+    /// Marks running processes of blocked exes. The exec and fork
+    /// tracepoints keep the marks current between refreshes; this catches
+    /// processes that ran before the block and any the tracepoints missed.
+    fn sync_exe_blocks(&mut self) {
+        let exes: Vec<(String, u32)> = self.rules.exes().map(|(p, id)| (p.to_string(), id)).collect();
+        if exes.is_empty() {
+            return;
+        }
+        let Ok(procs) = procfs::process::all_processes() else { return };
+        let running = procs.flatten().filter_map(|p| Some((p.pid as u32, p.exe().ok()?.to_string_lossy().into_owned())));
+        for (id, pids) in rules::pids_by_exe(running, &exes) {
+            self.probe.mark_pids(id, &pids);
+        }
+    }
+
     fn remove_rule(&mut self, id: u32) -> String {
         let Some(rule) = self.rules.remove(id) else { return "no such rule".into() };
-        match self.probe.unblock(&rule.target) {
+        match self.probe.unblock(rule.id, &rule.target) {
             Ok(()) => format!("unblocked {}", rule.target),
             Err(e) => {
                 // Still in the kernel: keep it listed so it can be retried.
@@ -323,6 +342,15 @@ impl<K: Kernel> Monitor<K> {
                     Some(r) if r.key.remote_port != 0 => self.toggle_block(BlockTarget::Port(r.key.proto, r.key.remote_port)),
                     Some(_) => "this connection has no port".into(),
                     None => "no connection selected".into(),
+                };
+            }
+            Action::ToggleBlockProcess => {
+                let rows = app.proc_rows(self.view());
+                let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
+                app.status = match app.selected_in(&ids).map(|i| &rows[i]) {
+                    Some(r) if !r.exe.is_empty() => self.toggle_block(BlockTarget::Exe(r.exe.clone())),
+                    Some(_) => "exe unknown for this process: block its remote address instead".into(),
+                    None => "no process selected".into(),
                 };
             }
             Action::RemoveRule => {
@@ -493,6 +521,7 @@ mod tests {
         drops: u64,
         blocked: Vec<(u32, BlockTarget)>,
         fail_block: bool,
+        marked: Vec<(u32, u32)>,
     }
 
     impl Kernel for Fake {
@@ -542,12 +571,15 @@ mod tests {
             if self.fail_block {
                 anyhow::bail!("map full");
             }
-            self.blocked.push((id, *target));
+            self.blocked.push((id, target.clone()));
             Ok(())
         }
-        fn unblock(&mut self, target: &BlockTarget) -> anyhow::Result<()> {
+        fn unblock(&mut self, _: u32, target: &BlockTarget) -> anyhow::Result<()> {
             self.blocked.retain(|(_, t)| t != target);
             Ok(())
+        }
+        fn mark_pids(&mut self, id: u32, pids: &[u32]) {
+            self.marked.extend(pids.iter().map(|p| (id, *p)));
         }
         fn rule_drops(&self, id: u32) -> u64 {
             id as u64 + 100
@@ -588,6 +620,7 @@ mod tests {
             drops: 0,
             blocked: Vec::new(),
             fail_block: false,
+            marked: Vec::new(),
         };
         let (mut m, _) = Monitor::with_kernel(fake, &args(1000, 30)).unwrap();
         let t0 = Instant::now();
@@ -719,6 +752,25 @@ mod tests {
         m.handle(&mut app, Action::ToggleBlockRemote);
         assert!(app.status.contains("block failed"), "{}", app.status);
         assert!(m.rules.rules.is_empty());
+    }
+
+    #[test]
+    fn process_block_marks_running_pids_by_exe() {
+        let (mut m, t0) = monitor();
+        m.probe.flows = vec![(key(50001), tx(10))];
+        m.tick_at(secs(t0, 1));
+        // This test process is a running process with a known exe.
+        let me = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        let pid = std::process::id();
+        let f = m.collector.flows.get_mut(&key(50001)).unwrap();
+        f.owner = Some(crate::procmap::Owner {
+            details: Some(crate::procmap::ProcDetails { exe: me.clone(), ..Default::default() }),
+            ..Owner::new(pid, "test")
+        });
+        let mut app = App { tab: Tab::Processes, ..App::default() };
+        m.handle(&mut app, Action::ToggleBlockProcess);
+        assert_eq!(m.probe.blocked, vec![(0, BlockTarget::Exe(me))], "{}", app.status);
+        assert!(m.probe.marked.contains(&(0, pid)), "running pid marked at once");
     }
 }
 

@@ -12,13 +12,13 @@ use aya::{
     Ebpf, EbpfLoader, include_bytes_aligned,
     maps::{Array, HashMap, LpmTrie, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues, RingBuf, lpm_trie::Key},
     programs::{
-        CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType, tc,
+        CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType, TracePoint, tc,
     },
     util::{KernelVersion, nr_cpus},
 };
 use netmon_common::{
     CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, CaptureConfig, FlowKey, FlowStats, MAX_CAPTURE_FLOWS, MAX_FLOWS,
-    GuardKey, ListenKey, ListenOwner, PacketEvent, PortKey, SockOwner,
+    GuardKey, ListenKey, ListenOwner, MAX_EXE_PATH, PacketEvent, PortKey, SockOwner, TraceCfg,
 };
 
 use crate::rules::BlockTarget;
@@ -65,6 +65,8 @@ pub struct Probe {
     rules: u32,
     guard: HashMap<MapData, GuardKey, u8>,
     rule_drops: PerCpuArray<MapData, u64>,
+    block_exe: HashMap<MapData, [u8; MAX_EXE_PATH], u32>,
+    block_tgid: HashMap<MapData, u32, u32>,
     cpus: usize,
     attached: HashSet<u32>,
     failed: HashSet<u32>,
@@ -109,7 +111,11 @@ impl Probe {
         let rule_count = Array::try_from(take("RULE_COUNT")?)?;
         let guard = HashMap::try_from(take("GUARD")?)?;
         let rule_drops = PerCpuArray::try_from(take("RULE_DROPS")?)?;
-        let hook_errors = attach_owner_hooks(&mut ebpf);
+        let block_exe = HashMap::try_from(take("BLOCK_EXE")?)?;
+        let block_tgid = HashMap::try_from(take("BLOCK_TGID")?)?;
+        let trace_cfg = Array::try_from(take("TRACE_CFG")?)?;
+        let mut hook_errors = attach_owner_hooks(&mut ebpf);
+        hook_errors.extend(attach_exec_tracking(&mut ebpf, trace_cfg));
         Ok(Probe {
             ebpf,
             flows,
@@ -129,6 +135,8 @@ impl Probe {
             rules: 0,
             guard,
             rule_drops,
+            block_exe,
+            block_tgid,
             cpus,
             attached: HashSet::new(),
             failed: HashSet::new(),
@@ -234,6 +242,59 @@ fn attach_owner_hooks(ebpf: &mut Ebpf) -> Vec<String> {
     errors
 }
 
+/// Offset of field `name` in a tracefs event format file, e.g. from
+/// `\tfield:pid_t child_pid;\toffset:44;\tsize:4;\tsigned:1;`.
+pub fn field_offset(format: &str, name: &str) -> Option<u32> {
+    format.lines().find_map(|l| {
+        let decl = l.split("field:").nth(1)?.split(';').next()?;
+        if decl.split_whitespace().last()? != name {
+            return None;
+        }
+        l.split("offset:").nth(1)?.split(';').next()?.trim().parse().ok()
+    })
+}
+
+fn event_format(event: &str) -> std::io::Result<String> {
+    let rel = format!("events/sched/{event}/format");
+    std::fs::read_to_string(format!("/sys/kernel/tracing/{rel}"))
+        .or_else(|_| std::fs::read_to_string(format!("/sys/kernel/debug/tracing/{rel}")))
+}
+
+/// Attaches the exec and fork tracepoints that keep BLOCK_TGID current.
+/// Without them exe blocks still work through the /proc scan, but a new
+/// process can connect before the next refresh.
+fn attach_exec_tracking(ebpf: &mut Ebpf, mut cfg_map: Array<MapData, TraceCfg>) -> Vec<String> {
+    let r = (|| -> anyhow::Result<()> {
+        let exec = event_format("sched_process_exec").context("read sched_process_exec format")?;
+        let fork = event_format("sched_process_fork").context("read sched_process_fork format")?;
+        let cfg = TraceCfg {
+            exec_filename: field_offset(&exec, "filename").context("no filename field in sched_process_exec")?,
+            fork_child_pid: field_offset(&fork, "child_pid").context("no child_pid field in sched_process_fork")?,
+        };
+        cfg_map.set(0, cfg, 0)?;
+        for name in ["sched_process_exec", "sched_process_fork"] {
+            let prog: &mut TracePoint = ebpf.program_mut(name).context("missing")?.try_into()?;
+            prog.load()?;
+            prog.attach("sched", name)?;
+        }
+        Ok(())
+    })();
+    match r {
+        Ok(()) => Vec::new(),
+        Err(e) => vec![format!("exec tracking off (exe blocks act at the next refresh): {e:#}")],
+    }
+}
+
+fn exe_key(path: &str) -> anyhow::Result<[u8; MAX_EXE_PATH]> {
+    let b = path.as_bytes();
+    if b.len() >= MAX_EXE_PATH {
+        bail!("exe path longer than {} bytes", MAX_EXE_PATH - 1);
+    }
+    let mut key = [0u8; MAX_EXE_PATH];
+    key[..b.len()].copy_from_slice(b);
+    Ok(key)
+}
+
 /// What the main loop needs from the kernel side. `Probe` is the real one;
 /// tests use a fake.
 pub trait Kernel {
@@ -263,11 +324,13 @@ pub trait Kernel {
     fn listeners(&self) -> Vec<(u8, SocketAddr, SockOwner)>;
     /// Starts blocking `target` under rule `id`, with its drop count at 0.
     fn block(&mut self, id: u32, target: &BlockTarget) -> anyhow::Result<()>;
-    fn unblock(&mut self, target: &BlockTarget) -> anyhow::Result<()>;
+    fn unblock(&mut self, id: u32, target: &BlockTarget) -> anyhow::Result<()>;
     /// Packets dropped and socket calls denied by rule `id`.
     fn rule_drops(&self, id: u32) -> u64;
     /// Remote endpoints that are never blocked.
     fn set_guard(&mut self, endpoints: &[SocketAddr]) -> anyhow::Result<()>;
+    /// Marks running processes as blocked by exe rule `id`.
+    fn mark_pids(&mut self, id: u32, pids: &[u32]);
 }
 
 fn addr_bytes(ip: IpAddr) -> (u8, [u8; 16]) {
@@ -384,17 +447,26 @@ impl Kernel for Probe {
             BlockTarget::Net(IpAddr::V4(ip), len) => self.block_v4.insert(&Key::new(len.into(), ip.octets()), id, 0)?,
             BlockTarget::Net(IpAddr::V6(ip), len) => self.block_v6.insert(&Key::new(len.into(), ip.octets()), id, 0)?,
             BlockTarget::Port(proto, port) => self.block_port.insert(PortKey { port, proto, _pad: 0 }, id, 0)?,
+            BlockTarget::Exe(ref path) => self.block_exe.insert(exe_key(path)?, id, 0)?,
         }
         self.rules += 1;
         self.rule_count.set(0, self.rules, 0)?;
         Ok(())
     }
 
-    fn unblock(&mut self, target: &BlockTarget) -> anyhow::Result<()> {
+    fn unblock(&mut self, id: u32, target: &BlockTarget) -> anyhow::Result<()> {
         match *target {
             BlockTarget::Net(IpAddr::V4(ip), len) => self.block_v4.remove(&Key::new(len.into(), ip.octets()))?,
             BlockTarget::Net(IpAddr::V6(ip), len) => self.block_v6.remove(&Key::new(len.into(), ip.octets()))?,
             BlockTarget::Port(proto, port) => self.block_port.remove(&PortKey { port, proto, _pad: 0 })?,
+            BlockTarget::Exe(ref path) => {
+                self.block_exe.remove(&exe_key(path)?)?;
+                let marked: Vec<u32> =
+                    self.block_tgid.iter().flatten().filter(|(_, v)| *v == id).map(|(k, _)| k).collect();
+                for tgid in marked {
+                    let _ = self.block_tgid.remove(&tgid);
+                }
+            }
         }
         self.rules = self.rules.saturating_sub(1);
         self.rule_count.set(0, self.rules, 0)?;
@@ -411,6 +483,13 @@ impl Kernel for Probe {
             self.guard.insert(GuardKey { addr, port: ep.port(), family, _pad: 0 }, 1, 0)?;
         }
         Ok(())
+    }
+
+    fn mark_pids(&mut self, id: u32, pids: &[u32]) {
+        for pid in pids {
+            // A full map leaves the process unblocked (fail-open).
+            let _ = self.block_tgid.insert(pid, id, 0);
+        }
     }
 
     fn listeners(&self) -> Vec<(u8, SocketAddr, SockOwner)> {
@@ -438,4 +517,23 @@ mod tests {
             assert!(n * cpus * size_of::<FlowStats>() <= FLOW_VALUE_BUDGET || n == MIN_FLOWS as usize);
         }
     }
+
+    #[test]
+    fn tracefs_field_offsets() {
+        let exec = "name: sched_process_exec\nID: 312\nformat:\n\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;\n\n\tfield:__data_loc char[] filename;\toffset:8;\tsize:4;\tsigned:0;\n\tfield:pid_t pid;\toffset:12;\tsize:4;\tsigned:1;\n\tfield:pid_t old_pid;\toffset:16;\tsize:4;\tsigned:1;\n";
+        assert_eq!(field_offset(exec, "filename"), Some(8));
+        assert_eq!(field_offset(exec, "pid"), Some(12), "not old_pid");
+        assert_eq!(field_offset(exec, "comm"), None);
+        let fork = "\tfield:char parent_comm[16];\toffset:8;\tsize:16;\tsigned:0;\n\tfield:pid_t parent_pid;\toffset:24;\tsize:4;\tsigned:1;\n\tfield:char child_comm[16];\toffset:28;\tsize:16;\tsigned:0;\n\tfield:pid_t child_pid;\toffset:44;\tsize:4;\tsigned:1;\n";
+        assert_eq!(field_offset(fork, "child_pid"), Some(44));
+    }
+
+    #[test]
+    fn exe_keys_are_nul_padded() {
+        let k = exe_key("/usr/bin/curl").unwrap();
+        assert_eq!(&k[..13], b"/usr/bin/curl");
+        assert!(k[13..].iter().all(|b| *b == 0));
+        assert!(exe_key(&"a".repeat(MAX_EXE_PATH)).is_err());
+    }
 }
+

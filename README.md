@@ -100,7 +100,9 @@ its own scale (shown on the y axis).
 ## Blocking
 
 In **Connections**, `b` blocks the selected row's remote address and `B` its
-remote port (TCP or UDP). Press the key again to unblock. Blocked rows turn
+remote port (TCP or UDP). In **Processes**, `b` blocks every process running
+the selected process's exe, including ones started later. Press the key
+again to unblock. Blocked rows turn
 red. The **Rules** tab (`5`) lists every block with its drop count; `d`
 removes the selected one.
 
@@ -108,6 +110,10 @@ removes the selected one.
   `Operation not permitted` (cgroup `connect`/`sendmsg` hooks). Packets of
   existing connections and traffic without a local socket are dropped in
   TC on every interface.
+- Exe blocks follow `exec` and `fork` through kernel tracepoints. A program
+  started through a symlink (`python3` -> `python3.13`) is caught by the
+  `/proc` scan at the next refresh instead, so it can connect for up to one
+  refresh interval.
 - Blocks end when netmon exits or crashes (fail-open). Packets netmon
   cannot parse pass.
 - Never blocked (lockout guard): loopback, the SSH session netmon runs in,

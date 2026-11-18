@@ -190,6 +190,8 @@ pub enum Action {
     ToggleBlockRemote,
     /// Block (or unblock) the remote port of the selected connection.
     ToggleBlockPort,
+    /// Block (or unblock) the exe of the selected process.
+    ToggleBlockProcess,
     /// Remove the selected rule in the Rules tab.
     RemoveRule,
 }
@@ -242,6 +244,7 @@ impl App {
             Key::Char('5') => self.set_tab(Tab::Rules),
             Key::Char('b') if self.tab == Tab::Connections => return Some(Action::ToggleBlockRemote),
             Key::Char('B') if self.tab == Tab::Connections => return Some(Action::ToggleBlockPort),
+            Key::Char('b') if self.tab == Tab::Processes => return Some(Action::ToggleBlockProcess),
             Key::Char('d') if self.tab == Tab::Rules => return Some(Action::RemoveRule),
             Key::Enter if matches!(self.tab, Tab::Connections | Tab::Processes | Tab::Interfaces) => {
                 return Some(Action::StartCapture(self.tab));

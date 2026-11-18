@@ -7,17 +7,19 @@ use aya_ebpf::{
     cty::c_void,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_get_current_uid_gid, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_skb_load_bytes,
+        bpf_get_current_uid_gid, bpf_get_socket_cookie, bpf_ktime_get_ns,
+        bpf_probe_read_kernel_str_bytes, bpf_skb_load_bytes,
     },
-    macros::{cgroup_sock, cgroup_sock_addr, classifier, map},
+    macros::{cgroup_sock, cgroup_sock_addr, classifier, map, tracepoint},
     maps::{Array, HashMap, LpmTrie, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf, lpm_trie::Key},
-    programs::{SockAddrContext, SockContext, TcContext},
+    programs::{SockAddrContext, SockContext, TcContext, TracePointContext},
 };
 use netmon_common::{
     CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES, CaptureConfig, FlowKey,
     FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey, ListenOwner,
-    MAX_CAPTURE_FLOWS, MAX_FLOWS, MAX_GUARD, MAX_IFACES, MAX_LISTENERS, MAX_RULES,
-    MAX_SOCK_OWNERS, PacketEvent, PacketSource, PortKey, SockOwner, is_loopback, parse_packet,
+    MAX_BLOCKED_TGIDS, MAX_CAPTURE_FLOWS, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
+    MAX_LISTENERS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource, PortKey, SockOwner,
+    TraceCfg, is_loopback, parse_packet,
 };
 
 /// Byte counters per flow and interface.
@@ -83,14 +85,27 @@ static RULE_COUNT: Array<u32> = Array::with_max_entries(1, 0);
 #[map]
 static GUARD: HashMap<GuardKey, u8> = HashMap::with_max_entries(MAX_GUARD, 0);
 
+/// Exe paths to block (NUL-padded) -> rule id.
+#[map]
+static BLOCK_EXE: HashMap<[u8; MAX_EXE_PATH], u32> = HashMap::with_max_entries(MAX_RULES, 0);
+
+/// Blocked processes (tgid) -> rule id. Set by the exec and fork
+/// tracepoints and by userspace for processes that already run.
+#[map]
+static BLOCK_TGID: HashMap<u32, u32> = HashMap::with_max_entries(MAX_BLOCKED_TGIDS, 0);
+
+/// Tracepoint field offsets from userspace. Index 0 only.
+#[map]
+static TRACE_CFG: Array<TraceCfg> = Array::with_max_entries(1, 0);
+
 /// Packets and socket calls stopped, per rule id.
 #[map]
 static RULE_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(MAX_RULES, 0);
 
-/// The rule that blocks traffic to `addr`:`port`, if any. Loopback and
-/// guarded endpoints always pass.
+/// The rule that blocks traffic of process `tgid` (0: unknown) to
+/// `addr`:`port`, if any. Loopback and guarded endpoints always pass.
 #[inline(always)]
-fn verdict(family: u8, addr: &[u8; 16], proto: u8, port: u16) -> Option<u32> {
+fn verdict(family: u8, addr: &[u8; 16], proto: u8, port: u16, tgid: u32) -> Option<u32> {
     if RULE_COUNT.get(0).copied().unwrap_or(0) == 0 || is_loopback(family, addr) {
         return None;
     }
@@ -106,10 +121,29 @@ fn verdict(family: u8, addr: &[u8; 16], proto: u8, port: u16) -> Option<u32> {
     if let Some(id) = net {
         return Some(*id);
     }
-    if port != 0 && (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
-        return unsafe { BLOCK_PORT.get(&PortKey { port, proto, _pad: 0 }) }.copied();
+    if port != 0
+        && (proto == IPPROTO_TCP || proto == IPPROTO_UDP)
+        && let Some(id) = unsafe { BLOCK_PORT.get(&PortKey { port, proto, _pad: 0 }) }
+    {
+        return Some(*id);
+    }
+    if tgid != 0 {
+        return unsafe { BLOCK_TGID.get(&tgid) }.copied();
     }
     None
+}
+
+/// Process of the socket that sent an egress packet, from its cookie.
+#[inline(always)]
+fn packet_tgid(ctx: &TcContext, egress: bool) -> u32 {
+    if !egress || RULE_COUNT.get(0).copied().unwrap_or(0) == 0 {
+        return 0;
+    }
+    let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
+    if cookie == 0 {
+        return 0;
+    }
+    unsafe { SOCK_OWNER.get(&cookie) }.map_or(0, |o| o.tgid)
 }
 
 #[inline(always)]
@@ -157,7 +191,8 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
         count(ctx, key, egress);
         // Unparsed packets have no key and pass (fail-open).
         if ifindex != LOOPBACK_IFINDEX
-            && let Some(rule) = verdict(key.family, &key.remote_addr, key.proto, key.remote_port)
+            && let Some(rule) =
+                verdict(key.family, &key.remote_addr, key.proto, key.remote_port, packet_tgid(ctx, egress))
         {
             count_drop(rule);
             action = TC_ACT_SHOT;
@@ -296,7 +331,8 @@ fn addr_verdict(ctx: &SockAddrContext, family: u8) -> i32 {
             i += 1;
         }
     }
-    match verdict(family, &addr, proto, port) {
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    match verdict(family, &addr, proto, port, tgid) {
         Some(rule) => {
             count_drop(rule);
             DENY
@@ -419,6 +455,58 @@ pub fn sendmsg4(ctx: SockAddrContext) -> i32 {
 pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
     record_owner(ctx.as_ptr());
     addr_verdict(&ctx, 6)
+}
+
+// Process tracking for exe blocks. Both programs run in the context of the
+// task that execs or forks, so the current tgid is the right process.
+
+/// After exec: the process is blocked if its new exe is, and unblocked
+/// otherwise. That also clears a stale entry when a pid is reused.
+#[tracepoint]
+pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
+    let Some(cfg) = TRACE_CFG.get(0) else { return 0 };
+    if cfg.exec_filename == 0 {
+        return 0;
+    }
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // __data_loc: low 16 bits offset of the string in the record.
+    let Ok(loc) = (unsafe { ctx.read_at::<u32>(cfg.exec_filename as usize) }) else { return 0 };
+    let mut path = [0u8; MAX_EXE_PATH];
+    let src = unsafe { (ctx.as_ptr() as *const u8).add((loc & 0xffff) as usize) };
+    if unsafe { bpf_probe_read_kernel_str_bytes(src, &mut path) }.is_err() {
+        return 0;
+    }
+    match unsafe { BLOCK_EXE.get(&path) } {
+        Some(id) => {
+            let _ = BLOCK_TGID.insert(&tgid, id, 0);
+        }
+        None => {
+            let _ = BLOCK_TGID.remove(&tgid);
+        }
+    }
+    0
+}
+
+/// After fork: the child has its parent's block state. Clearing it for an
+/// unblocked parent removes stale entries of a reused pid.
+#[tracepoint]
+pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
+    let Some(cfg) = TRACE_CFG.get(0) else { return 0 };
+    if cfg.fork_child_pid == 0 {
+        return 0;
+    }
+    let Ok(child) = (unsafe { ctx.read_at::<u32>(cfg.fork_child_pid as usize) }) else { return 0 };
+    let parent = (bpf_get_current_pid_tgid() >> 32) as u32;
+    match unsafe { BLOCK_TGID.get(&parent) } {
+        Some(id) => {
+            let id = *id;
+            let _ = BLOCK_TGID.insert(&child, &id, 0);
+        }
+        None => {
+            let _ = BLOCK_TGID.remove(&child);
+        }
+    }
+    0
 }
 
 #[cfg(not(test))]

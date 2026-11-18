@@ -53,6 +53,22 @@ pub const MAX_RULES: u32 = 1_024;
 /// Lockout guard entries.
 pub const MAX_GUARD: u32 = 64;
 
+/// Exe paths in the process block map are NUL-padded to this length.
+pub const MAX_EXE_PATH: usize = 256;
+/// Processes (tgids) marked as blocked.
+pub const MAX_BLOCKED_TGIDS: u32 = 8_192;
+
+/// Field offsets in the sched tracepoint records, read by userspace from
+/// tracefs. 0 means unknown: the tracepoint program then does nothing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TraceCfg {
+    /// sched_process_exec: offset of the `__data_loc char[] filename` word.
+    pub exec_filename: u32,
+    /// sched_process_fork: offset of `pid_t child_pid`.
+    pub fork_child_pid: u32,
+}
+
 /// A remote port to block for one transport protocol.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -187,6 +203,8 @@ unsafe impl aya::Pod for SockOwner {}
 unsafe impl aya::Pod for ListenKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for PortKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for TraceCfg {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for GuardKey {}
 #[cfg(feature = "user")]
