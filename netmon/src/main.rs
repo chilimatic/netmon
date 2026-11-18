@@ -5,6 +5,7 @@ mod decode;
 mod ifaces;
 mod probe;
 mod procmap;
+mod text;
 mod ui;
 
 use std::{

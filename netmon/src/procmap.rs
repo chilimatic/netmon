@@ -140,7 +140,7 @@ fn read_owners() -> HashMap<u64, Owner> {
         for fd in fds.flatten() {
             if let FDTarget::Socket(inode) = fd.target {
                 let comm = comm.get_or_insert_with(|| {
-                    p.stat().map(|s| s.comm).unwrap_or_else(|_| "?".into())
+                    p.stat().map(|s| crate::text::sanitize(&s.comm)).unwrap_or_else(|_| "?".into())
                 });
                 owners.entry(inode).or_insert_with(|| Owner {
                     pid: p.pid as u32,

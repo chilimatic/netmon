@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     EbpfContext,
-    bindings::{TC_ACT_OK, __sk_buff},
+    bindings::{TC_ACT_UNSPEC, __sk_buff},
     cty::c_void,
     helpers::{bpf_ktime_get_ns, bpf_skb_load_bytes},
     macros::{classifier, map},
@@ -51,16 +51,20 @@ impl PacketSource for Skb<'_> {
     }
 }
 
+// The programs only observe. They return TC_ACT_UNSPEC (TCX_NEXT), which
+// lets the next program on the hook run. TC_ACT_OK would be TCX_PASS and
+// would skip every tcx program attached after netmon.
+
 #[classifier]
 pub fn tc_egress(ctx: TcContext) -> i32 {
     handle(&ctx, true);
-    TC_ACT_OK as i32
+    TC_ACT_UNSPEC
 }
 
 #[classifier]
 pub fn tc_ingress(ctx: TcContext) -> i32 {
     handle(&ctx, false);
-    TC_ACT_OK as i32
+    TC_ACT_UNSPEC
 }
 
 #[inline(always)]

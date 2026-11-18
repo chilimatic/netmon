@@ -116,13 +116,15 @@ fn ipv4(p: &[u8], d: &mut Decoded) {
         flags.join(","),
         u16_at(p, 10).unwrap_or(0)
     ));
-    let end = (total as usize).clamp(ihl, p.len());
+    // IHL and total length come from the sender: never trust them to fit the
+    // captured bytes.
+    let end = (total as usize).max(ihl).min(p.len());
     if frag != 0 {
         d.summary.proto = "IPv4".into();
         d.summary.info = format!("fragment offset {frag}");
         return;
     }
-    l4(proto, &p[ihl.min(p.len())..end], d);
+    l4(proto, &p[ihl.min(end)..end], d);
 }
 
 fn ipv6(p: &[u8], d: &mut Decoded) {
@@ -278,7 +280,7 @@ fn qname(p: &[u8], mut off: usize) -> Option<(String, usize)> {
         if !name.is_empty() {
             name.push('.');
         }
-        name.push_str(&String::from_utf8_lossy(p.get(off..off + len)?));
+        name.push_str(&crate::text::sanitize(&String::from_utf8_lossy(p.get(off..off + len)?)));
         off += len;
     }
     None
@@ -394,6 +396,53 @@ pub mod tests {
         for n in 0..full.len() {
             let _ = decode(&full[..n]);
         }
+    }
+
+    #[test]
+    fn ipv4_header_longer_than_capture_does_not_panic() {
+        // IHL 15 (60-byte header) but only 40 bytes of L3 data.
+        let mut b = tcp_syn();
+        b[14] = 0x4f;
+        let d = decode(&b);
+        assert_eq!(d.summary.src, "10.0.0.2");
+    }
+
+    /// Deterministic fuzz: random bytes behind valid-looking Ethernet, IPv4,
+    /// IPv6 and VLAN headers. The decoder must never panic.
+    #[test]
+    fn fuzz_random_frames_never_panic() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for i in 0..200_000 {
+            let len = (next() % 200) as usize;
+            let mut b: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            if b.len() >= 15 {
+                let (ty, ver): (&[u8], u8) = match i % 4 {
+                    0 => (&[0x08, 0x00], 0x40),
+                    1 => (&[0x86, 0xdd], 0x60),
+                    2 => (&[0x81, 0x00], 0x40),
+                    _ => (&[0x08, 0x06], 0x00),
+                };
+                b[12..14].copy_from_slice(ty);
+                b[14] = ver | (b[14] & 0x0f);
+            }
+            let _ = decode(&b);
+            let _ = hexdump(&b);
+        }
+    }
+
+    #[test]
+    fn dns_names_are_sanitized() {
+        let mut p = vec![0u8; 12];
+        p[5] = 1; // one question
+        p.extend_from_slice(&[4, b'a', 0x1b, b'[', b'm', 0, 0, 1, 0, 1]);
+        let (name, _) = qname(&p, 12).unwrap();
+        assert_eq!(name, "a?[m");
     }
 
     #[test]

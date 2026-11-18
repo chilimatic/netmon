@@ -2,8 +2,9 @@
 
 use std::{
     collections::VecDeque,
-    fs::File,
+    fs::OpenOptions,
     io::{BufWriter, Write},
+    os::unix::fs::{OpenOptionsExt, fchown},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -156,19 +157,36 @@ pub fn write_pcap<'a>(w: &mut impl Write, packets: impl IntoIterator<Item = &'a 
     Ok(())
 }
 
-/// Saves the capture to `dir/netmon-<unix time>.pcap`. Under sudo the file
-/// is handed to the invoking user so it does not stay owned by root.
+/// Saves the capture to `dir/netmon-<unix time>.pcap`.
+///
+/// netmon usually runs as root, and the directory may be writable by other
+/// users. So the file is created new (never overwritten), symlinks are not
+/// followed, and the mode is 0600 because captures hold payloads. Under sudo
+/// the open file is handed to the invoking user.
 pub fn save(cap: &Capture, dir: &Path) -> std::io::Result<PathBuf> {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let path = dir.join(format!("netmon-{secs}.pcap"));
-    let mut w = BufWriter::new(File::create(&path)?);
-    write_pcap(&mut w, &cap.packets)?;
-    w.flush()?;
-    drop(w);
+    let open = |path: &Path| {
+        OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)
+    };
+    // A name can be taken (two saves in one second, or a planted file).
+    let (path, file) = (0..100)
+        .map(|n| match n {
+            0 => dir.join(format!("netmon-{secs}.pcap")),
+            n => dir.join(format!("netmon-{secs}-{n}.pcap")),
+        })
+        .find_map(|p| match open(&p) {
+            Ok(f) => Some(Ok((p, f))),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+            Err(e) => Some(Err(e)),
+        })
+        .unwrap_or_else(|| Err(std::io::Error::other("no free file name")))?;
     let id = |var: &str| std::env::var(var).ok().and_then(|v| v.parse::<u32>().ok());
     if let (Some(uid), Some(gid)) = (id("SUDO_UID"), id("SUDO_GID")) {
-        let _ = std::os::unix::fs::chown(&path, Some(uid), Some(gid));
+        fchown(&file, Some(uid), Some(gid))?;
     }
+    let mut w = BufWriter::new(file);
+    write_pcap(&mut w, &cap.packets)?;
+    w.flush()?;
     Ok(path)
 }
 
@@ -215,6 +233,48 @@ mod tests {
         assert_eq!(u32::from_le_bytes(out[24..28].try_into().unwrap()), 3); // ts sec
         assert_eq!(u32::from_le_bytes(out[32..36].try_into().unwrap()), 54); // incl_len
         assert_eq!(&out[40..], &tcp_syn()[..]);
+    }
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("netmon-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn one_packet() -> Capture {
+        let mut c = Capture::new(Target::Interface { index: 1, name: "lo".into() });
+        c.push(Captured::from_event(&event(&tcp_syn(), true), 0));
+        c
+    }
+
+    #[test]
+    fn save_is_private_and_never_overwrites() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("save");
+        let c = one_packet();
+        let a = save(&c, &dir).unwrap();
+        let b = save(&c, &dir).unwrap();
+        assert_ne!(a, b, "second save in the same second gets a new name");
+        let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&a).unwrap().len(), 24 + 16 + 54);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_does_not_follow_planted_symlink() {
+        let dir = tmpdir("symlink");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep me").unwrap();
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        for s in [secs, secs + 1] {
+            std::os::unix::fs::symlink(&victim, dir.join(format!("netmon-{s}.pcap"))).unwrap();
+        }
+        let path = save(&one_packet(), &dir).unwrap();
+        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
