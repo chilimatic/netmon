@@ -23,7 +23,7 @@ use crate::{
     collector::Collector,
     ifaces::Names,
     probe::Probe,
-    procmap::SocketTable,
+    procmap::{OwnerCache, SocketTable},
 };
 
 /// Live view of network connections: owning process, interface and traffic.
@@ -69,6 +69,7 @@ struct Monitor {
     /// Copy of the collector shown while paused. Counting goes on behind it,
     /// so rates are right again after resume.
     frozen: Option<Collector>,
+    owners: OwnerCache,
 }
 
 impl Monitor {
@@ -82,7 +83,7 @@ impl Monitor {
         let mut names = Names::default();
         names.update(&ifs);
         let collector = Collector::new(args.expire_ticks());
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default() };
         Ok((mon, errors))
     }
 
@@ -112,7 +113,7 @@ impl Monitor {
         self.last = now;
         let expired = self.collector.ingest(self.probe.snapshot(), dt);
         self.probe.forget(&expired);
-        self.collector.resolve(&SocketTable::read());
+        self.collector.resolve(&SocketTable::read(&mut self.owners));
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {
             errors.push(format!("capture: {e:#}"));
@@ -165,24 +166,26 @@ impl Monitor {
 
     /// Turns the selected row of a tab into a capture target.
     fn target_for(&self, app: &App, tab: Tab) -> Result<Target, String> {
-        let pick = |len: usize| if len == 0 { None } else { Some(app.selected.min(len - 1)) };
         // Rows as the user sees them, so a paused view picks the shown row.
         let c = self.view();
         match tab {
             Tab::Interfaces => {
                 let rows = app.iface_rows(c, &self.names);
-                let r = pick(rows.len()).map(|i| &rows[i]).ok_or("no interface selected")?;
+                let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
+                let r = app.selected_in(&ids).map(|i| &rows[i]).ok_or("no interface selected")?;
                 Ok(Target::Interface { index: r.index, name: r.name.clone() })
             }
             Tab::Processes => {
                 let rows = app.proc_rows(c);
-                let r = pick(rows.len()).map(|i| &rows[i]).ok_or("no process selected")?;
+                let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
+                let r = app.selected_in(&ids).map(|i| &rows[i]).ok_or("no process selected")?;
                 let pid = r.pid_num.ok_or("owner unknown: capture its connections instead")?;
                 Ok(Target::Process { pid, comm: r.process.clone() })
             }
             Tab::Connections => {
                 let rows = app.conn_rows(c, &self.names);
-                let r = pick(rows.len()).map(|i| &rows[i]).ok_or("no connection selected")?;
+                let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
+                let r = app.selected_in(&ids).map(|i| &rows[i]).ok_or("no connection selected")?;
                 Ok(Target::Connection {
                     key: r.key,
                     label: format!("{} {} → {} on {}", r.proto, r.local, r.remote, r.iface),

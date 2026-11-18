@@ -4,8 +4,9 @@
 //! Only sockets in this process's network namespace are visible.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
+    path::Path,
 };
 
 use netmon_common::{IPPROTO_TCP, IPPROTO_UDP};
@@ -106,9 +107,60 @@ impl SocketTable {
             .map(|(_, i)| i)
     }
 
-    /// Reads the current socket table and owners from /proc.
-    pub fn read() -> Self {
-        Self::build(read_sockets(), &read_owners())
+    /// Reads the current socket table from /proc. Owners come from the
+    /// cache, which scans /proc/*/fd only for sockets it has not seen.
+    pub fn read(cache: &mut OwnerCache) -> Self {
+        let socks = read_sockets();
+        let inodes: HashSet<u64> = socks.iter().map(|s| s.inode).collect();
+        cache.refresh(&inodes, |pid| Path::new(&format!("/proc/{pid}")).exists(), read_owners);
+        Self::build(socks, &cache.owners)
+    }
+}
+
+/// Socket inode -> owner, kept across ticks. A full scan of /proc/*/fd
+/// costs one readlink per open file on the host, so it runs only when a
+/// socket inode shows up that is neither known nor already failed.
+#[derive(Default)]
+pub struct OwnerCache {
+    owners: HashMap<u64, Owner>,
+    /// Inodes a scan could not find an owner for (kernel sockets, other
+    /// namespaces). Tried again with the next scan.
+    misses: HashSet<u64>,
+    pub scans: u64,
+}
+
+impl OwnerCache {
+    /// Keeps entries for live sockets of live processes. Scans when an
+    /// inode is new. Inode 0 (TIME-WAIT, no file) never has an owner.
+    pub fn refresh(
+        &mut self,
+        inodes: &HashSet<u64>,
+        alive: impl Fn(u32) -> bool,
+        scan: impl FnOnce() -> HashMap<u64, Owner>,
+    ) {
+        // A process that exits can leave its socket to a child (fork, then
+        // exit). Drop the dead owner so the next scan finds the new one.
+        let mut live: HashMap<u32, bool> = HashMap::new();
+        self.owners
+            .retain(|i, o| inodes.contains(i) && *live.entry(o.pid).or_insert_with(|| alive(o.pid)));
+        self.misses.retain(|i| inodes.contains(i));
+        let new = inodes.iter().any(|i| *i != 0 && !self.owners.contains_key(i) && !self.misses.contains(i));
+        if !new {
+            return;
+        }
+        let found = scan();
+        self.scans += 1;
+        for &i in inodes.iter().filter(|i| **i != 0) {
+            match found.get(&i) {
+                Some(o) => {
+                    self.owners.insert(i, o.clone());
+                    self.misses.remove(&i);
+                }
+                None => {
+                    self.misses.insert(i);
+                }
+            }
+        }
     }
 }
 
@@ -278,5 +330,35 @@ mod tests {
         assert_eq!(i.owner.as_ref().unwrap().pid, 10);
         let i = t.lookup(IPPROTO_TCP, sa("10.0.0.3:80"), sa("9.9.9.9:1")).unwrap();
         assert_eq!(i.owner.as_ref().unwrap().pid, 20);
+    }
+
+    fn owner(pid: u32) -> Owner {
+        Owner { pid, comm: format!("p{pid}") }
+    }
+
+    #[test]
+    fn owner_cache_scans_only_for_new_inodes() {
+        let mut c = OwnerCache::default();
+        let all = HashMap::from([(1, owner(10)), (2, owner(20))]);
+        c.refresh(&HashSet::from([0, 1, 2]), |_| true, || all.clone());
+        assert_eq!(c.scans, 1);
+        c.refresh(&HashSet::from([0, 1, 2]), |_| true, || unreachable!("no new inode"));
+        // Inode 3 has no owner: one scan, then it is a known miss.
+        c.refresh(&HashSet::from([1, 2, 3]), |_| true, || all.clone());
+        c.refresh(&HashSet::from([1, 2, 3]), |_| true, || unreachable!("3 is a known miss"));
+        assert_eq!(c.scans, 2);
+        // Closed sockets leave the cache.
+        c.refresh(&HashSet::from([1]), |_| true, || unreachable!());
+        assert_eq!(c.owners.len(), 1);
+    }
+
+    #[test]
+    fn owner_cache_rescans_when_owner_exits() {
+        let mut c = OwnerCache::default();
+        c.refresh(&HashSet::from([1]), |_| true, || HashMap::from([(1, owner(10))]));
+        // pid 10 exited; its child 11 holds the socket now.
+        c.refresh(&HashSet::from([1]), |pid| pid != 10, || HashMap::from([(1, owner(11))]));
+        assert_eq!(c.owners[&1].pid, 11);
+        assert_eq!(c.scans, 2);
     }
 }

@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, Sort, Tab, human},
+    app::{App, RowId, Sort, Tab, human},
     capture::Capture,
     decode::hexdump,
     collector::{Collector, HISTORY},
@@ -253,9 +253,9 @@ fn header_row(cols: &[&'static str]) -> Row<'static> {
     Row::new(cols.iter().copied()).style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
 }
 
-fn render_table(f: &mut Frame, app: &mut App, table: Table, len: usize, area: Rect) {
-    app.selected = app.selected.min(len.saturating_sub(1));
-    let mut state = TableState::default().with_selected(Some(app.selected));
+fn render_table(f: &mut Frame, app: &mut App, table: Table, ids: &[RowId], area: Rect) {
+    let selected = app.sync_selection(ids);
+    let mut state = TableState::default().with_selected(Some(selected));
     f.render_stateful_widget(
         table
             .block(Block::new().borders(Borders::TOP))
@@ -267,7 +267,7 @@ fn render_table(f: &mut Frame, app: &mut App, table: Table, len: usize, area: Re
 
 fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area: Rect) {
     let rows = app.conn_rows(c, names);
-    let len = rows.len();
+    let ids: Vec<RowId> = rows.iter().map(|r| r.id()).collect();
     let table = Table::new(
         rows.into_iter().map(|r| {
             Row::new(vec![
@@ -297,12 +297,12 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area: 
         ],
     )
     .header(header_row(&["Process", "PID", "Proto", "Local", "Remote", "Iface", "State", "↑", "↓", "Total"]));
-    render_table(f, app, table, len, area);
+    render_table(f, app, table, &ids, area);
 }
 
 fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, area: Rect) {
     let rows = app.proc_rows(c);
-    let len = rows.len();
+    let ids: Vec<RowId> = rows.iter().map(|r| r.id()).collect();
     let table = Table::new(
         rows.into_iter().map(|r| {
             Row::new(vec![
@@ -324,14 +324,14 @@ fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, area: Rect) {
         ],
     )
     .header(header_row(&["Process", "PID", "Flows", "↑", "↓", "Total"]));
-    render_table(f, app, table, len, area);
+    render_table(f, app, table, &ids, area);
 }
 
 fn draw_ifaces(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area: Rect) {
     let rows = app.iface_rows(c, names);
     let [list, spark] = Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).areas(area);
-    let selected = rows.get(app.selected.min(rows.len().saturating_sub(1))).map(|r| (r.index, r.name.clone()));
-    let len = rows.len();
+    let ids: Vec<RowId> = rows.iter().map(|r| r.id()).collect();
+    let selected = app.selected_in(&ids).map(|i| (rows[i].index, rows[i].name.clone()));
     let table = Table::new(
         rows.into_iter().map(|r| {
             Row::new(vec![
@@ -344,7 +344,7 @@ fn draw_ifaces(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area:
         [Constraint::Fill(1), Constraint::Length(12), Constraint::Length(12), Constraint::Length(10)],
     )
     .header(header_row(&["Interface", "↑", "↓", "Total"]));
-    render_table(f, app, table, len, list);
+    render_table(f, app, table, &ids, list);
 
     if let Some((idx, name)) = selected {
         let data: Vec<u64> = c.ifaces.get(&idx).map(|s| s.history.iter().copied().collect()).unwrap_or_default();

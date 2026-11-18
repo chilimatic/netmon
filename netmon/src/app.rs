@@ -55,6 +55,14 @@ pub enum Sort {
     Process,
 }
 
+/// Identity of a table row. The selection follows it when rows re-sort.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowId {
+    Conn(FlowKey),
+    Proc(String, String),
+    Iface(u32),
+}
+
 pub struct ConnRow {
     pub key: FlowKey,
     pub process: String,
@@ -87,6 +95,24 @@ pub struct IfaceRow {
     pub total: u64,
 }
 
+impl ConnRow {
+    pub fn id(&self) -> RowId {
+        RowId::Conn(self.key)
+    }
+}
+
+impl ProcRow {
+    pub fn id(&self) -> RowId {
+        RowId::Proc(self.process.clone(), self.pid.clone())
+    }
+}
+
+impl IfaceRow {
+    pub fn id(&self) -> RowId {
+        RowId::Iface(self.index)
+    }
+}
+
 pub struct App {
     pub tab: Tab,
     pub sort: Sort,
@@ -96,7 +122,12 @@ pub struct App {
     pub show_graph: bool,
     /// Seconds between samples, for the graph's time axis.
     pub interval_secs: f64,
+    /// Index of the selected row as last drawn.
     pub selected: usize,
+    /// The selected row. Wins over `selected` when the row still exists.
+    pub anchor: Option<RowId>,
+    /// Cursor moves not yet applied; applied relative to `anchor`.
+    pub pending: isize,
     pub quit: bool,
     pub status: String,
 }
@@ -112,6 +143,8 @@ impl Default for App {
             show_graph: true,
             interval_secs: 1.0,
             selected: 0,
+            anchor: None,
+            pending: 0,
             quit: false,
             status: String::new(),
         }
@@ -163,7 +196,7 @@ impl App {
                 }
                 _ => {}
             }
-            self.selected = 0;
+            self.reset_selection();
             return None;
         }
         if self.tab == Tab::Capture {
@@ -185,20 +218,14 @@ impl App {
             // Esc never quits: it only clears an active filter.
             Key::Esc => {
                 self.filter.clear();
-                self.selected = 0;
+                self.reset_selection();
             }
-            Key::Tab | Key::Right => {
-                self.tab = self.tab.next();
-                self.selected = 0;
-            }
-            Key::Left => {
-                self.tab = self.tab.prev();
-                self.selected = 0;
-            }
-            Key::Char('1') => self.tab = Tab::Connections,
-            Key::Char('2') => self.tab = Tab::Processes,
-            Key::Char('3') => self.tab = Tab::Interfaces,
-            Key::Char('4') => self.tab = Tab::Capture,
+            Key::Tab | Key::Right => self.set_tab(self.tab.next()),
+            Key::Left => self.set_tab(self.tab.prev()),
+            Key::Char('1') => self.set_tab(Tab::Connections),
+            Key::Char('2') => self.set_tab(Tab::Processes),
+            Key::Char('3') => self.set_tab(Tab::Interfaces),
+            Key::Char('4') => self.set_tab(Tab::Capture),
             Key::Enter if self.tab != Tab::Capture => return Some(Action::StartCapture(self.tab)),
             Key::Char('r') => self.sort = Sort::Rate,
             Key::Char('t') => self.sort = Sort::Total,
@@ -206,14 +233,49 @@ impl App {
             Key::Char('p') | Key::Char(' ') => self.paused = !self.paused,
             Key::Char('/') => self.editing_filter = true,
             Key::Char('g') => self.show_graph = !self.show_graph,
-            Key::Up | Key::Char('k') => self.selected = self.selected.saturating_sub(1),
-            Key::Down | Key::Char('j') => self.selected += 1,
-            Key::PageUp => self.selected = self.selected.saturating_sub(20),
-            Key::PageDown => self.selected += 20,
-            Key::Home => self.selected = 0,
+            Key::Up | Key::Char('k') => self.pending -= 1,
+            Key::Down | Key::Char('j') => self.pending += 1,
+            Key::PageUp => self.pending -= 20,
+            Key::PageDown => self.pending += 20,
+            Key::Home => self.reset_selection(),
             _ => {}
         }
         None
+    }
+
+    fn set_tab(&mut self, tab: Tab) {
+        if tab != self.tab {
+            self.tab = tab;
+            self.reset_selection();
+        }
+    }
+
+    fn reset_selection(&mut self) {
+        self.selected = 0;
+        self.anchor = None;
+        self.pending = 0;
+    }
+
+    /// Index of the selected row in `ids` without changing state.
+    pub fn selected_in(&self, ids: &[RowId]) -> Option<usize> {
+        if ids.is_empty() {
+            return None;
+        }
+        let base = self.anchor.as_ref().and_then(|a| ids.iter().position(|i| i == a)).unwrap_or(self.selected);
+        Some(base.saturating_add_signed(self.pending).min(ids.len() - 1))
+    }
+
+    /// Applies pending moves to the rows about to be drawn and anchors the
+    /// selection to the row it lands on.
+    pub fn sync_selection(&mut self, ids: &[RowId]) -> usize {
+        if let Some(i) = self.selected_in(ids) {
+            self.selected = i;
+            self.anchor = Some(ids[i].clone());
+        } else {
+            self.selected = 0;
+        }
+        self.pending = 0;
+        self.selected
     }
 
     fn matches(&self, fields: &[&str]) -> bool {
@@ -426,5 +488,25 @@ mod tests {
         assert_eq!(human(512.0), "512B");
         assert_eq!(human(1536.0), "1.5K");
         assert_eq!(human(3.0 * 1024.0 * 1024.0), "3.0M");
+    }
+
+    #[test]
+    fn selection_follows_row_when_order_changes() {
+        let ids = |ports: &[u32]| ports.iter().map(|p| RowId::Iface(*p)).collect::<Vec<_>>();
+        let mut app = App::default();
+        app.sync_selection(&ids(&[1, 2, 3]));
+        app.on_key(Key::Down);
+        assert_eq!(app.sync_selection(&ids(&[1, 2, 3])), 1);
+        // Row 2 moves to the top: the cursor goes with it.
+        assert_eq!(app.sync_selection(&ids(&[2, 3, 1])), 0);
+        // A move applies relative to the anchored row, even after a re-sort.
+        app.on_key(Key::Down);
+        assert_eq!(app.selected_in(&ids(&[3, 1, 2])), Some(2));
+        assert_eq!(app.sync_selection(&ids(&[3, 2, 1])), 2);
+        // The row is gone: keep the index, clamped.
+        assert_eq!(app.sync_selection(&ids(&[3, 2])), 1);
+        app.on_key(Key::Home);
+        assert_eq!(app.sync_selection(&ids(&[3, 2])), 0);
+        assert_eq!(app.sync_selection(&[]), 0);
     }
 }
