@@ -25,6 +25,9 @@ pub struct Flow {
     pub rx_rate: f64,
     pub idle_ticks: u32,
     pub owner: Option<Owner>,
+    /// Socket cookie the owner came from (kernel hooks). 0: owner is from
+    /// /proc or unknown.
+    pub owner_cookie: u64,
     pub state: &'static str,
 }
 
@@ -90,6 +93,7 @@ impl Collector {
                 rx_rate: 0.0,
                 idle_ticks: 0,
                 owner: None,
+                owner_cookie: 0,
                 state: "",
             });
             // A counter that went down means the LRU map evicted and
@@ -143,13 +147,23 @@ impl Collector {
         push(&mut self.total_history, total);
     }
 
-    /// Fills owner and state from the socket table. Keeps the last known
-    /// owner when the socket is already gone.
-    pub fn resolve(&mut self, table: &SocketTable) {
+    /// Fills owner and state. The owner recorded by the kernel hooks for the
+    /// flow's socket cookie wins; it is looked up once per cookie. Otherwise
+    /// the owner comes from the /proc socket table. The last known owner is
+    /// kept when the socket is already gone.
+    pub fn resolve(&mut self, table: &SocketTable, kernel: impl Fn(u64) -> Option<Owner>) {
         for f in self.flows.values_mut() {
+            let cookie = f.total.cookie;
+            if cookie != 0
+                && cookie != f.owner_cookie
+                && let Some(o) = kernel(cookie)
+            {
+                f.owner = Some(o);
+                f.owner_cookie = cookie;
+            }
             match table.lookup(f.key.proto, f.local, f.remote) {
                 Some(info) => {
-                    if info.owner.is_some() {
+                    if f.owner_cookie == 0 && info.owner.is_some() {
                         f.owner = info.owner.clone();
                     }
                     f.state = info.state;
@@ -263,4 +277,25 @@ mod tests {
         assert_eq!(c.flows[&key(1, 2)].tx_rate, 100.0);
         assert_eq!(c.total_history.back(), Some(&(100.0, 0.0)));
     }
+
+    #[test]
+    fn kernel_owner_wins_over_proc() {
+        use crate::procmap::RawSock;
+        let mut c = Collector::new(30);
+        let k = key(1, 2);
+        c.ingest([(k, FlowStats { tx_bytes: 1, ..Default::default() })], 1.0);
+        let table = SocketTable::build(
+            vec![RawSock { proto: 6, local: "10.0.0.2:1".parse().unwrap(), remote: "1.1.1.1:443".parse().unwrap(), state: "ESTAB", inode: 9 }],
+            &HashMap::from([(9, Owner { pid: 7, comm: "proc".into() })]),
+        );
+        let kernel = |cookie: u64| (cookie == 77).then(|| Owner { pid: 8, comm: "hook".into() });
+        c.resolve(&table, kernel);
+        assert_eq!(c.flows[&k].owner.as_ref().unwrap().pid, 7, "no cookie yet: /proc");
+        c.ingest([(k, FlowStats { tx_bytes: 2, cookie: 77, ..Default::default() })], 1.0);
+        c.resolve(&table, kernel);
+        assert_eq!(c.flows[&k].owner.as_ref().unwrap().pid, 8, "cookie: kernel owner");
+        assert_eq!(c.flows[&k].state, "ESTAB", "state still from /proc");
+        c.resolve(&table, |_| unreachable!("looked up once per cookie"));
+    }
 }
+

@@ -1,17 +1,20 @@
-//! Loads the eBPF object, attaches the TC programs and reads the flow map.
+//! Loads the eBPF object, attaches the TC programs and the socket owner
+//! hooks, and reads the maps.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, fs::File};
 
 use anyhow::{Context as _, bail};
 use aya::{
     Ebpf, EbpfLoader, include_bytes_aligned,
     maps::{Array, HashMap, MapData, PerCpuArray, PerCpuHashMap, RingBuf},
-    programs::{SchedClassifier, TcAttachType, tc},
+    programs::{
+        CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType, tc,
+    },
     util::{KernelVersion, nr_cpus},
 };
 use netmon_common::{
     CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, CaptureConfig, FlowKey, FlowStats, MAX_CAPTURE_FLOWS, MAX_FLOWS,
-    PacketEvent,
+    PacketEvent, SockOwner,
 };
 
 use crate::ifaces::Iface;
@@ -23,8 +26,8 @@ const FLOW_VALUE_BUDGET: usize = 64 * 1024 * 1024;
 const MIN_FLOWS: u32 = 4_096;
 
 /// Flow map size. Every entry holds one FlowStats per possible CPU, so the
-/// size shrinks on hosts with many CPUs: 65 536 entries on up to 32 CPUs,
-/// 16 384 on 128 CPUs.
+/// size shrinks on hosts with many CPUs: 65 536 entries on up to 25 CPUs,
+/// 13 107 on 128 CPUs.
 pub fn flow_map_entries(cpus: usize) -> u32 {
     let per_entry = size_of::<FlowStats>() * cpus.max(1);
     let n = (FLOW_VALUE_BUDGET / per_entry).min(MAX_FLOWS as usize) as u32;
@@ -47,9 +50,17 @@ pub struct Probe {
     capture_full: bool,
     packets: RingBuf<MapData>,
     drops: PerCpuArray<MapData, u64>,
+    sock_owner: HashMap<MapData, u64, SockOwner>,
     attached: HashSet<u32>,
     failed: HashSet<u32>,
+    /// Socket owner hooks that did not load or attach.
+    pub hook_errors: Vec<String>,
 }
+
+/// Root of the cgroup v2 tree. Hooks here see every process on the host.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+const SOCK_HOOKS: [&str; 1] = ["sock_create"];
+const SOCK_ADDR_HOOKS: [&str; 4] = ["connect4", "connect6", "sendmsg4", "sendmsg6"];
 
 impl Probe {
     pub fn load() -> anyhow::Result<Self> {
@@ -75,6 +86,8 @@ impl Probe {
         let capture_keys = HashMap::try_from(take("CAPTURE_KEYS")?)?;
         let packets = RingBuf::try_from(take("PACKETS")?)?;
         let drops = PerCpuArray::try_from(take("CAPTURE_DROPS")?)?;
+        let sock_owner = HashMap::try_from(take("SOCK_OWNER")?)?;
+        let hook_errors = attach_owner_hooks(&mut ebpf);
         Ok(Probe {
             ebpf,
             flows,
@@ -85,8 +98,10 @@ impl Probe {
             capture_full: false,
             packets,
             drops,
+            sock_owner,
             attached: HashSet::new(),
             failed: HashSet::new(),
+            hook_errors,
         })
     }
 
@@ -148,6 +163,46 @@ impl Probe {
     }
 }
 
+/// Loads and attaches the socket owner hooks to the root cgroup. They are
+/// optional: without them owners come from /proc only.
+///
+/// aya attaches with bpf_link on kernels >= 5.7. Cgroup links reject the
+/// BPF_F_ALLOW_* flags (EINVAL) and always join the cgroup's program list
+/// next to others (systemd, container runtimes), so the mode must be
+/// `Single`, which sends flags 0. On older kernels aya falls back to
+/// BPF_PROG_ATTACH, where `Single` would fail if another program is there:
+/// that case shows up as a hook warning.
+fn attach_owner_hooks(ebpf: &mut Ebpf) -> Vec<String> {
+    let cgroup = match File::open(CGROUP_ROOT) {
+        Ok(f) => f,
+        Err(e) => return vec![format!("owner hooks off: open {CGROUP_ROOT}: {e}")],
+    };
+    let mut errors = Vec::new();
+    for name in SOCK_HOOKS {
+        let r = (|| -> anyhow::Result<()> {
+            let prog: &mut CgroupSock = ebpf.program_mut(name).context("missing")?.try_into()?;
+            prog.load()?;
+            prog.attach(&cgroup, CgroupAttachMode::Single)?;
+            Ok(())
+        })();
+        if let Err(e) = r {
+            errors.push(format!("owner hook {name}: {e:#}"));
+        }
+    }
+    for name in SOCK_ADDR_HOOKS {
+        let r = (|| -> anyhow::Result<()> {
+            let prog: &mut CgroupSockAddr = ebpf.program_mut(name).context("missing")?.try_into()?;
+            prog.load()?;
+            prog.attach(&cgroup, CgroupAttachMode::Single)?;
+            Ok(())
+        })();
+        if let Err(e) = r {
+            errors.push(format!("owner hook {name}: {e:#}"));
+        }
+    }
+    errors
+}
+
 /// What the main loop needs from the kernel side. `Probe` is the real one;
 /// tests use a fake.
 pub trait Kernel {
@@ -171,6 +226,8 @@ pub trait Kernel {
     /// subtract the value at capture start.
     fn capture_drops(&self) -> u64;
     fn forget(&mut self, keys: &[FlowKey]);
+    /// Owner recorded by the cgroup hooks for a socket cookie.
+    fn sock_owner(&self, cookie: u64) -> Option<SockOwner>;
 }
 
 impl Kernel for Probe {
@@ -194,7 +251,7 @@ impl Kernel for Probe {
                 }
                 Err(e) => {
                     self.failed.insert(iface.index);
-                    errors.push(format!("{}: {e:#}", iface.name));
+                    errors.push(format!("attach {}: {e:#}", iface.name));
                 }
             }
         }
@@ -216,6 +273,8 @@ impl Kernel for Probe {
                     sum.rx_bytes += s.rx_bytes;
                     sum.tx_pkts += s.tx_pkts;
                     sum.rx_pkts += s.rx_pkts;
+                    // Every CPU that sent a packet stored the same cookie.
+                    sum.cookie = sum.cookie.max(s.cookie);
                 }
                 (k, sum)
             })
@@ -263,6 +322,10 @@ impl Kernel for Probe {
             let _ = self.flows.remove(k);
         }
     }
+
+    fn sock_owner(&self, cookie: u64) -> Option<SockOwner> {
+        self.sock_owner.get(&cookie, 0).ok()
+    }
 }
 
 #[cfg(test)]
@@ -272,8 +335,8 @@ mod tests {
     #[test]
     fn flow_map_shrinks_with_cpus() {
         assert_eq!(flow_map_entries(1), MAX_FLOWS);
-        assert_eq!(flow_map_entries(32), 65_536);
-        assert_eq!(flow_map_entries(128), 16_384);
+        assert_eq!(flow_map_entries(25), 65_536);
+        assert_eq!(flow_map_entries(128), 13_107);
         assert_eq!(flow_map_entries(100_000), MIN_FLOWS);
         // Values never exceed the budget, except at the minimum size.
         for cpus in [1, 8, 64, 256, 1024] {

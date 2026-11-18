@@ -412,7 +412,7 @@ mod tests {
             vec![RawSock { proto: IPPROTO_TCP, local: "10.0.0.2:1".parse().unwrap(), remote: "1.1.1.1:443".parse().unwrap(), state: "ESTAB", inode: 9 }],
             &HashMap::from([(9, Owner { pid: 7, comm: "curl".into() })]),
         );
-        c.resolve(&table);
+        c.resolve(&table, |_| None);
         c
     }
 

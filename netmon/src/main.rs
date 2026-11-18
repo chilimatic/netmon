@@ -23,7 +23,7 @@ use crate::{
     collector::Collector,
     ifaces::Names,
     probe::{Kernel, Probe},
-    procmap::{OwnerCache, SocketTable},
+    procmap::{Owner, OwnerCache, SocketTable},
 };
 
 /// Live view of network connections: owning process, interface and traffic.
@@ -76,7 +76,11 @@ struct Monitor<K: Kernel = Probe> {
 
 impl Monitor {
     fn new(args: &Args) -> anyhow::Result<(Self, Vec<String>)> {
-        Monitor::with_kernel(Probe::load()?, args)
+        let probe = Probe::load()?;
+        let hook_errors = probe.hook_errors.clone();
+        let (mon, mut errors) = Monitor::with_kernel(probe, args)?;
+        errors.extend(hook_errors);
+        Ok((mon, errors))
     }
 }
 
@@ -123,7 +127,9 @@ impl<K: Kernel> Monitor<K> {
         self.last = now;
         let expired = self.collector.ingest(self.probe.snapshot(), dt);
         self.probe.forget(&expired);
-        self.collector.resolve(&SocketTable::read(&mut self.owners));
+        let probe = &self.probe;
+        let kernel = |cookie| probe.sock_owner(cookie).map(|o| Owner::from_kernel(&o));
+        self.collector.resolve(&SocketTable::read(&mut self.owners), kernel);
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {
             errors.push(format!("capture: {e:#}"));
@@ -263,11 +269,11 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let (mut mon, errors) = Monitor::new(&args)?;
     for e in &errors {
-        eprintln!("warning: attach {e}");
+        eprintln!("warning: {e}");
     }
     match args.once {
         Some(secs) => print_once(&mut mon, secs),
-        None => run_tui(&mut mon, &args),
+        None => run_tui(&mut mon, &args, errors.join("; ")),
     }
 }
 
@@ -290,9 +296,9 @@ fn print_once(mon: &mut Monitor, secs: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_tui(mon: &mut Monitor, args: &Args) -> anyhow::Result<()> {
+fn run_tui(mon: &mut Monitor, args: &Args, status: String) -> anyhow::Result<()> {
     let interval = args.interval();
-    let mut app = App { interval_secs: interval.as_secs_f64(), ..App::default() };
+    let mut app = App { interval_secs: interval.as_secs_f64(), status, ..App::default() };
     let mut terminal = ratatui::init();
     let result = (|| -> anyhow::Result<()> {
         mon.tick();
@@ -371,7 +377,7 @@ mod tests {
 
     use netmon_common::{CAPTURE_LEN, FlowStats, IPPROTO_TCP, PacketEvent};
 
-    use crate::{ifaces::Iface, procmap::Owner};
+    use crate::ifaces::Iface;
 
     #[derive(Debug, PartialEq)]
     enum Mode {
@@ -424,6 +430,9 @@ mod tests {
         }
         fn forget(&mut self, keys: &[netmon_common::FlowKey]) {
             self.flows.retain(|(k, _)| !keys.contains(k));
+        }
+        fn sock_owner(&self, _: u64) -> Option<netmon_common::SockOwner> {
+            None
         }
     }
 

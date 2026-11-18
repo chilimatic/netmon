@@ -40,6 +40,26 @@ pub struct FlowStats {
     pub rx_bytes: u64,
     pub tx_pkts: u64,
     pub rx_pkts: u64,
+    /// Socket cookie of the local socket, set by egress packets. 0 when
+    /// unknown (only ingress so far, or forwarded traffic).
+    pub cookie: u64,
+}
+
+/// Entries in the socket owner map.
+pub const MAX_SOCK_OWNERS: u32 = 16_384;
+
+/// Length of a task name (`comm`), with the trailing NUL.
+pub const COMM_LEN: usize = 16;
+
+/// The process that created or last used a socket, from the cgroup hooks.
+/// Keyed by socket cookie, which the kernel never reuses until reboot.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SockOwner {
+    pub tgid: u32,
+    pub uid: u32,
+    pub cgroup_id: u64,
+    pub comm: [u8; COMM_LEN],
 }
 
 /// Bytes copied per captured packet. Longer packets (and GSO super-packets)
@@ -90,6 +110,8 @@ unsafe impl aya::Pod for CaptureConfig {}
 unsafe impl aya::Pod for FlowKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FlowStats {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for SockOwner {}
 
 /// Network and transport header fields of one packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -5,15 +5,18 @@ use aya_ebpf::{
     EbpfContext,
     bindings::{BPF_NOEXIST, TC_ACT_UNSPEC, __sk_buff},
     cty::c_void,
-    helpers::{bpf_ktime_get_ns, bpf_skb_load_bytes},
-    macros::{classifier, map},
-    maps::{Array, HashMap, LruPerCpuHashMap, PerCpuArray, RingBuf},
-    programs::TcContext,
+    helpers::{
+        bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
+        bpf_get_current_uid_gid, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_skb_load_bytes,
+    },
+    macros::{cgroup_sock, cgroup_sock_addr, classifier, map},
+    maps::{Array, HashMap, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf},
+    programs::{SockAddrContext, SockContext, TcContext},
 };
 use netmon_common::{
     CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES, CaptureConfig, FlowKey,
-    FlowStats, LOOPBACK_IFINDEX, MAX_CAPTURE_FLOWS, MAX_FLOWS, MAX_IFACES, PacketEvent, PacketSource,
-    parse_packet,
+    FlowStats, LOOPBACK_IFINDEX, MAX_CAPTURE_FLOWS, MAX_FLOWS, MAX_IFACES, MAX_SOCK_OWNERS,
+    PacketEvent, PacketSource, SockOwner, parse_packet,
 };
 
 /// Byte counters per flow and interface.
@@ -41,6 +44,11 @@ static PACKETS: RingBuf = RingBuf::with_byte_size(CAPTURE_RING_BYTES, 0);
 /// Packets lost because the ring buffer was full. Index 0 only.
 #[map]
 static CAPTURE_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+/// Socket cookie -> process that created or last used the socket.
+/// Monitoring only, so LRU is fine: an evicted entry falls back to /proc.
+#[map]
+static SOCK_OWNER: LruHashMap<u64, SockOwner> = LruHashMap::with_max_entries(MAX_SOCK_OWNERS, 0);
 
 struct Skb<'a>(&'a TcContext);
 
@@ -106,19 +114,24 @@ fn handle(ctx: &TcContext, egress: bool) {
 #[inline(always)]
 fn count(ctx: &TcContext, key: &FlowKey, egress: bool) {
     let len = ctx.len() as u64;
+    // Locally sent packets carry their socket. 0 for forwarded traffic.
+    let cookie = if egress { unsafe { bpf_get_socket_cookie(ctx.as_ptr()) } } else { 0 };
     // Per-CPU values: no other CPU writes this slot, so plain adds are safe.
     if let Some(s) = FLOWS.get_ptr_mut(key) {
         let s = unsafe { &mut *s };
         if egress {
             s.tx_bytes += len;
             s.tx_pkts += 1;
+            if cookie != 0 {
+                s.cookie = cookie;
+            }
         } else {
             s.rx_bytes += len;
             s.rx_pkts += 1;
         }
     } else {
         let s = if egress {
-            FlowStats { tx_bytes: len, tx_pkts: 1, ..Default::default() }
+            FlowStats { tx_bytes: len, tx_pkts: 1, cookie, ..Default::default() }
         } else {
             FlowStats { rx_bytes: len, rx_pkts: 1, ..Default::default() }
         };
@@ -133,6 +146,9 @@ fn count(ctx: &TcContext, key: &FlowKey, egress: bool) {
             p.tx_pkts += s.tx_pkts;
             p.rx_bytes += s.rx_bytes;
             p.rx_pkts += s.rx_pkts;
+            if cookie != 0 {
+                p.cookie = cookie;
+            }
         }
     }
 }
@@ -174,6 +190,66 @@ fn capture(ctx: &TcContext, ifindex: u32, ethertype: u16, has_l2: bool, egress: 
         (*ev).has_l2 = has_l2 as u8;
     }
     entry.submit(0);
+}
+
+// Socket owner hooks on the root cgroup. They run in the context of the
+// process that creates or uses the socket. They only record and must always
+// return 1: 0 would deny the socket call with EPERM.
+
+const ALLOW: i32 = 1;
+
+/// Writes the current process as owner of the socket behind `ctx`. Skips the
+/// write when the entry already names this process, so busy UDP senders do
+/// not rewrite it on every datagram.
+#[inline(always)]
+fn record_owner(ctx: *mut c_void) {
+    let cookie = unsafe { bpf_get_socket_cookie(ctx) };
+    if cookie == 0 {
+        return;
+    }
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if let Some(o) = unsafe { SOCK_OWNER.get(&cookie) }
+        && o.tgid == tgid
+    {
+        return;
+    }
+    let owner = SockOwner {
+        tgid,
+        uid: bpf_get_current_uid_gid() as u32,
+        cgroup_id: unsafe { bpf_get_current_cgroup_id() },
+        comm: bpf_get_current_comm().unwrap_or([0; 16]),
+    };
+    let _ = SOCK_OWNER.insert(&cookie, &owner, 0);
+}
+
+#[cgroup_sock(sock_create)]
+pub fn sock_create(ctx: SockContext) -> i32 {
+    record_owner(ctx.as_ptr());
+    ALLOW
+}
+
+#[cgroup_sock_addr(connect4)]
+pub fn connect4(ctx: SockAddrContext) -> i32 {
+    record_owner(ctx.as_ptr());
+    ALLOW
+}
+
+#[cgroup_sock_addr(connect6)]
+pub fn connect6(ctx: SockAddrContext) -> i32 {
+    record_owner(ctx.as_ptr());
+    ALLOW
+}
+
+#[cgroup_sock_addr(sendmsg4)]
+pub fn sendmsg4(ctx: SockAddrContext) -> i32 {
+    record_owner(ctx.as_ptr());
+    ALLOW
+}
+
+#[cgroup_sock_addr(sendmsg6)]
+pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
+    record_owner(ctx.as_ptr());
+    ALLOW
 }
 
 #[cfg(not(test))]

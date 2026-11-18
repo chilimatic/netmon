@@ -69,6 +69,23 @@ stable kernel API):
 - `/proc` scanning stays only as a fallback for sockets that existed before
   netmon started.
 
+**Steps.**
+1. **Cookie owners.** `cgroup/sock_create`, `connect4/6` and `sendmsg4/6`
+   write `cookie -> {tgid, uid, cgroup_id, comm}` into `SOCK_OWNER` (LRU,
+   16 384 entries). The hooks always return 1 (allow) and only observe. TC
+   egress stores the skb's socket cookie in the flow counters. Userspace
+   prefers the kernel owner and falls back to `/proc`. If a cgroup hook does
+   not load or attach (old kernel, no cgroup v2), netmon warns and runs as
+   before.
+2. **Exe path and cgroup.** Userspace resolves `tgid` to the exe path
+   (`/proc/<pid>/exe`) and the cgroup path (`/proc/<pid>/cgroup`) once per
+   process and caches it. Processes tab shows the exe; a detail line shows
+   uid and systemd unit.
+3. **Servers and receive-only flows.** Accepted sockets have no connect
+   hook: `post_bind4/6` records listener owners by port, and a flow whose
+   first packets are ingress gets the owner as soon as one egress packet
+   carries the cookie.
+
 **Acceptance.**
 - `dig example.com` and `curl https://…` show their process on the first
   refresh, including DNS over `sdwan0`.

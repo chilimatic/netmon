@@ -21,6 +21,14 @@ pub struct Owner {
     pub comm: String,
 }
 
+impl Owner {
+    /// Owner recorded by the kernel hooks.
+    pub fn from_kernel(o: &netmon_common::SockOwner) -> Self {
+        let end = o.comm.iter().position(|b| *b == 0).unwrap_or(o.comm.len());
+        Owner { pid: o.tgid, comm: crate::text::sanitize(&String::from_utf8_lossy(&o.comm[..end])) }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SockInfo {
     pub owner: Option<Owner>,
