@@ -357,7 +357,7 @@ for its traffic on the host. Rules by address and port still apply.
 
 ## Phase 7 – Privileged daemon and unprivileged TUI
 
-**Status (2026-11-19): in progress.** Step 1 done (`532fed9`), step 2 done. Step 3 next.
+**Status (2026-11-19): in progress.** Step 1 done (`532fed9`), step 2 done (`43eda25`), step 3 done. Step 4 next.
 
 **Why.** Rules must hold when the UI is closed, and the UI should not run as
 root.

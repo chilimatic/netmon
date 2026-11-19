@@ -26,3 +26,7 @@ aya-build = { workspace = true }
 [[bin]]
 name = "netmon"
 path = "src/main.rs"
+
+[[bin]]
+name = "netmond"
+path = "src/bin/netmond.rs"

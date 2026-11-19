@@ -13,6 +13,53 @@ use crate::{
     rules::{BlockTarget, Rules},
 };
 
+/// Version of this protocol. Client and daemon must have the same.
+pub const VERSION: u32 = 1;
+
+/// Where `netmond` listens.
+pub const DEFAULT_SOCKET: &str = "/run/netmon.sock";
+
+/// Longest line a client may send. Requests are small; a longer line ends
+/// the connection.
+pub const MAX_REQUEST_LINE: u64 = 64 * 1024;
+
+/// One line from a UI to the daemon. The first must be `Hello`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum ToDaemon {
+    Hello { version: u32 },
+    Request(Request),
+}
+
+/// One line from the monitor to a UI.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub enum ToClient {
+    /// First line after the client's hello.
+    Hello {
+        version: u32,
+        /// Refresh interval, for the graph's time axis.
+        interval_ms: u64,
+        /// Problems found at start (interfaces, rules file).
+        warnings: Vec<String>,
+    },
+    /// The connection ends: wrong version or not allowed.
+    Error(String),
+    Snapshot(Box<Snapshot>),
+    Packets(Vec<RawPacket>),
+    /// Result of this client's request.
+    Reply { req: Request, msg: String },
+    /// A problem while running, for every client.
+    Status(String),
+}
+
+/// One JSON line with its newline.
+pub fn line<T: serde::Serialize>(msg: &T) -> String {
+    // These types cannot fail to serialize: map keys are strings or
+    // integers, and no custom serializer returns an error.
+    let mut s = serde_json::to_string(msg).unwrap_or_default();
+    s.push('\n');
+    s
+}
+
 /// A change the UI asks for. Rows are named by what they are (address,
 /// exe, rule id, question id), never by their position on the screen: the
 /// monitor's data may have changed since the UI drew it.

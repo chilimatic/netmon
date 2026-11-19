@@ -16,11 +16,13 @@ pub struct Client {
     pub capture: Option<Capture>,
     /// Id of `capture` at the monitor.
     capture_id: u64,
+    /// Newest traffic data that arrived while paused.
+    live: Option<collector::Collector>,
 }
 
 impl Client {
     pub fn new(snap: Snapshot, app: &mut App) -> Self {
-        let mut c = Client { snap: snap.clone(), capture: None, capture_id: 0 };
+        let mut c = Client { snap: snap.clone(), capture: None, capture_id: 0, live: None };
         c.apply(snap, app);
         c
     }
@@ -30,6 +32,9 @@ impl Client {
     pub fn apply(&mut self, mut snap: Snapshot, app: &mut App) {
         if app.paused {
             std::mem::swap(&mut snap.collector, &mut self.snap.collector);
+            self.live = Some(std::mem::replace(&mut self.snap.collector, collector::Collector::new(1)));
+        } else {
+            self.live = None;
         }
         if let Some(info) = &snap.capture {
             if info.id != self.capture_id || self.capture.is_none() {
@@ -56,6 +61,13 @@ impl Client {
             (q, snap.questions.len() - 1)
         });
         self.snap = snap;
+    }
+
+    /// Shows the newest traffic data after a pause.
+    pub fn resume(&mut self) {
+        if let Some(c) = self.live.take() {
+            self.snap.collector = c;
+        }
     }
 
     /// Decodes packets of the current capture.

@@ -56,6 +56,40 @@ root:
 sudo ./target/release/netmon
 ```
 
+### Daemon (netmond)
+
+`netmond` runs the monitor and the firewall as root. The `netmon` UI then
+runs as a normal user and connects to it:
+
+```sh
+sudo groupadd --system netmon
+sudo usermod -aG netmon "$USER"          # log in again afterwards
+sudo ./target/release/netmond             # add --rules PATH or --ask here
+./target/release/netmon                   # in another terminal, no sudo
+```
+
+- `netmond` listens on `/run/netmon.sock` (`--socket PATH`). The socket is
+  `root:netmon`, mode `0660`. The daemon also checks every client with
+  `SO_PEERCRED`: only root and members of the group can connect. Without
+  the group, only root can connect.
+- `netmon` connects when the socket exists. `netmon --local` runs the
+  monitor in its own process (root needed), as before.
+- `--rules`, `--ask`, `--interval-ms` and `--expire-secs` are options of
+  the monitor. With a daemon, give them to `netmond`.
+- Rules, questions and captures are shared by all connected UIs. The first
+  answer to a question counts. Pause, filter and sort are per UI.
+- Captured packets go to the UI as raw bytes. The UI decodes them and
+  writes the `.pcap` file, as your user, in its working directory.
+- When the last UI closes, the rules stay in force. In ask mode with no UI,
+  questions time out after 30 s and the connections are denied.
+- `netmond` stops on `SIGTERM` or `Ctrl-C` and removes the socket. When it
+  stops (also after a crash), the kernel removes its programs, so no rule
+  is in force until it starts again.
+- If `netmond` crashed, the socket file stays. `netmon` then reports that
+  the daemon does not run. The next start of `netmond` replaces the file.
+
+The wire format is one JSON object per line (`netmon/src/proto.rs`).
+
 ### Without sudo (file capabilities)
 
 | Capability | Why |

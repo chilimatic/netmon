@@ -6,8 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::Parser;
-
 use crate::{
     app::Answer,
     ask,
@@ -24,9 +22,8 @@ use crate::{
     text,
 };
 
-/// Live view of network connections: owning process, interface and traffic.
-#[derive(Parser)]
-#[command(version)]
+/// Options of the monitor itself: in `netmon` local mode and in `netmond`.
+#[derive(clap::Args)]
 pub(crate) struct Args {
     /// Refresh interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
@@ -34,9 +31,6 @@ pub(crate) struct Args {
     /// Drop flows idle for this many seconds.
     #[arg(long, default_value_t = 30)]
     pub(crate) expire_secs: u64,
-    /// Sample for N seconds, print the connections once and exit (no TUI).
-    #[arg(long, value_name = "SECONDS")]
-    pub(crate) once: Option<u64>,
     /// Rules file. Must belong to root and not be writable by group or
     /// others. [default: /etc/netmon/rules.toml, skipped if missing]
     #[arg(long, value_name = "PATH")]
@@ -733,7 +727,7 @@ mod tests {
     }
 
     fn args(interval_ms: u64, expire_secs: u64) -> Args {
-        Args { interval_ms, expire_secs, once: None, rules: None, ask: false }
+        Args { interval_ms, expire_secs, rules: None, ask: false }
     }
 
     #[test]
@@ -1301,5 +1295,39 @@ mod tests {
             let json = serde_json::to_string(&req).unwrap();
             assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req, "{json}");
         }
+    }
+
+    #[test]
+    fn engine_orders_messages_and_ticks_on_time() {
+        use crate::{engine::Engine, proto::ToClient};
+        let (mut m, _) = monitor();
+        m.probe.flows = vec![(key(50001), tx(10))];
+        let mut e = Engine::new(m, Duration::from_secs(1));
+        assert_eq!(e.mon.collector.flows.len(), 1, "first sample at start");
+        let kinds = |msgs: &[ToClient]| {
+            msgs.iter()
+                .map(|m| match m {
+                    ToClient::Snapshot(_) => "snapshot",
+                    ToClient::Packets(_) => "packets",
+                    ToClient::Reply { .. } => "reply",
+                    ToClient::Status(_) => "status",
+                    _ => "other",
+                })
+                .collect::<Vec<_>>()
+        };
+        let req = Request::ToggleBlock(BlockTarget::Port(6, 25));
+        let out = e.request(req.clone());
+        assert_eq!(kinds(&out), ["snapshot", "reply"]);
+        match &out[1] {
+            ToClient::Reply { req: r, msg } => assert_eq!((r, msg.starts_with("blocked")), (&req, true), "{msg}"),
+            _ => unreachable!(),
+        }
+        let now = Instant::now();
+        assert!(e.step(now).is_empty(), "nothing due");
+        assert!(e.wait() <= Duration::from_secs(1));
+        assert_eq!(kinds(&e.step(now + Duration::from_secs(1))), ["snapshot"], "tick due");
+        // Far behind: one tick, not a burst to catch up.
+        assert_eq!(kinds(&e.step(now + Duration::from_secs(60))), ["snapshot"]);
+        assert!(e.step(now + Duration::from_millis(60_500)).is_empty());
     }
 }
