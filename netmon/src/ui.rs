@@ -287,15 +287,16 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, rules:
     let [area, detail] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
     let line = match app.selected_in(&ids).map(|i| &rows[i]) {
         Some(r) if !r.source.is_empty() => format!(
-            " {}   exe {}   user {}   unit {}   owner from {}{}",
+            " {}{}   exe {}   user {}   unit {}   owner from {}{}",
             r.remote_addr,
+            name_source(r),
             or_dash(&r.exe),
             or_dash(&r.user),
             or_dash(&r.unit),
             r.source,
             verdict(r)
         ),
-        Some(r) => format!(" {}   owner unknown{}", r.remote_addr, verdict(r)),
+        Some(r) => format!(" {}{}   owner unknown{}", r.remote_addr, name_source(r), verdict(r)),
         None => String::new(),
     };
     f.render_widget(Paragraph::new(line).style(Style::new().fg(Color::Cyan)), detail);
@@ -371,6 +372,11 @@ fn draw_rules(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
     )
     .header(header_row(&["#", "Action", "Match", "Comment", "Hits"]));
     render_table(f, app, table, &ids, area);
+}
+
+/// " (name from tls)" when the row has a hostname.
+fn name_source(r: &ConnRow) -> String {
+    if r.host.is_some() { format!(" (name from {})", r.host_source) } else { String::new() }
 }
 
 /// "   opened out, allowed" from the kernel's connection state.

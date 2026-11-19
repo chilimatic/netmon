@@ -97,17 +97,27 @@ its own scale (shown on the y axis).
 
 ## Hostnames
 
-The Remote column shows the hostname when netmon saw a DNS answer for the
-address: `example.com:443`. `h` switches between names and addresses; the
-detail line under the table always shows the address, and `/` also finds
-hostnames.
+The Remote column shows a hostname where netmon knows one:
+`example.com:443`. `h` switches between names and addresses; the detail
+line under the table always shows the address and where the name came
+from, and `/` also finds hostnames.
+
+- TLS (`name from tls`): the server name (SNI) the client sent in its
+  ClientHello on this connection. It wins over DNS: one address can serve
+  many names, SNI says which one this connection asked for. Works with
+  encrypted DNS too.
 
 - The kernel passes DNS answers (UDP from port 53, every interface) to
   netmon. Each A/AAAA address gets the name that was asked, not the CDN
   name behind a CNAME. Names stay 1 hour after the last answer; up to 4096.
 - Only answers seen while netmon runs count: connections opened before it
   started show addresses until the next lookup of that name.
-- Encrypted DNS (DNS over TLS/HTTPS, e.g. in browsers) gives no names.
+- Encrypted DNS (DNS over TLS/HTTPS, e.g. in browsers) gives no DNS
+  names; SNI still names their TLS connections.
+- No SNI for QUIC (HTTP/3, encrypted ClientHello) and ECH. A ClientHello
+  longer than one segment (large post-quantum key shares) is read only
+  as far as the first segment goes; if SNI comes later, the DNS name is
+  shown.
 - DNS packets are untrusted input: the parser bounds every read and gives
   up on malformed answers.
 

@@ -81,8 +81,9 @@ pub struct ConnRow {
     pub total: u64,
     /// Direction and verdict from the kernel's connection state.
     pub conn: Option<netmon_common::ConnState>,
-    /// Hostname of the remote end, if known.
+    /// Hostname of the remote end, if known, and where it came from.
     pub host: Option<String>,
+    pub host_source: &'static str,
     /// Remote address and port, also when `remote` shows the hostname.
     pub remote_addr: String,
 }
@@ -430,6 +431,7 @@ fn conn_row(f: &Flow, names: &Names, show_hosts: bool) -> ConnRow {
         },
         remote_addr: f.remote.to_string(),
         host: f.host.clone(),
+        host_source: f.host_source,
         iface: names.get(f.key.ifindex),
         state: f.state,
         tx_rate: f.tx_rate,

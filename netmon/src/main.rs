@@ -13,7 +13,7 @@ mod text;
 mod ui;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -94,6 +94,8 @@ struct Monitor<K: Kernel = Probe> {
     rules_path: std::path::PathBuf,
     /// Hostnames from DNS answers.
     hosts: names::HostNames,
+    /// TLS server name per connection, from its ClientHello.
+    sni: HashMap<netmon_common::FlowKey, String>,
 }
 
 impl Monitor {
@@ -125,7 +127,7 @@ impl<K: Kernel> Monitor<K> {
         let mut names = Names::default();
         names.update(&ifs);
         let collector = Collector::new(args.expire_ticks());
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), sni: HashMap::new() };
         Ok((mon, errors))
     }
 
@@ -283,21 +285,38 @@ impl<K: Kernel> Monitor<K> {
         }
     }
 
-    /// Reads new DNS answers and names every flow's remote end.
+    /// Reads new DNS answers and ClientHellos and names every flow's
+    /// remote end. The TLS server name wins: it is what the client asked
+    /// this server for, while one address can serve many DNS names.
     fn refresh_hosts(&mut self, now: Instant) {
-        let hosts = &mut self.hosts;
+        let (hosts, sni) = (&mut self.hosts, &mut self.sni);
         self.probe.drain_names(NAME_BATCH, |ev| {
             let data = &ev.data[..(ev.len as usize).min(ev.data.len())];
-            if ev.kind == netmon_common::NAME_DNS {
-                for (ip, name, _ttl) in names::dns_answers(data) {
-                    hosts.insert(ip, name, now);
+            match ev.kind {
+                netmon_common::NAME_DNS => {
+                    for (ip, name, _ttl) in names::dns_answers(data) {
+                        hosts.insert(ip, name, now);
+                    }
                 }
+                netmon_common::NAME_TLS => {
+                    if let Some(name) = names::client_hello_sni(data) {
+                        sni.insert(ev.key, name);
+                    }
+                }
+                _ => {}
             }
         });
-        for f in self.collector.flows.values_mut() {
+        // Names of connections that are gone.
+        let flows = &self.collector.flows;
+        self.sni.retain(|k, _| flows.contains_key(k));
+        for (k, f) in self.collector.flows.iter_mut() {
             // Dual-stack sockets show IPv4 peers as ::ffff:a.b.c.d.
             let ip = procmap::normalize(f.remote).ip();
-            f.host = self.hosts.get(ip, now).map(str::to_string);
+            (f.host, f.host_source) = match (self.sni.get(k), self.hosts.get(ip, now)) {
+                (Some(n), _) => (Some(n.clone()), "tls"),
+                (None, Some(n)) => (Some(n.to_string()), "dns"),
+                (None, None) => (None, ""),
+            };
         }
     }
 
@@ -623,7 +642,7 @@ mod tests {
         assert_eq!(args(0, 30).interval(), Duration::from_millis(100));
     }
 
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::VecDeque;
 
     use netmon_common::{CAPTURE_LEN, FlowStats, IPPROTO_TCP, PacketEvent, RULE_EXE, RULE_NET, RULE_PORT, RULE_PROTO, RuleEntry};
 
@@ -944,12 +963,45 @@ mod tests {
         m.probe.names.push_back(ev);
         m.tick_at(secs(t0, 1));
         assert_eq!(m.collector.flows[&key(50001)].host.as_deref(), Some("example.com"));
+        assert_eq!(m.collector.flows[&key(50001)].host_source, "dns");
         let mut app = App::default();
         let rows = app.conn_rows(&m.collector, &m.names);
         assert_eq!(rows[0].remote, "example.com:443");
         assert_eq!(rows[0].remote_addr, "198.51.100.9:443");
         app.on_key(crate::app::Key::Char('h'));
         assert_eq!(app.conn_rows(&m.collector, &m.names)[0].remote, "198.51.100.9:443", "h shows addresses");
+
+        // A ClientHello on this connection names it by SNI, over DNS.
+        let mut hello = vec![0x16, 0x03, 0x01, 0, 0, 0x01, 0, 0, 0, 3, 3];
+        hello.extend_from_slice(&[0; 32]);
+        hello.extend_from_slice(&[0, 0, 2, 0x13, 0x01, 1, 0]);
+        let sni = b"cdn.example.net";
+        let ext_len = (9 + sni.len()) as u16;
+        hello.extend_from_slice(&ext_len.to_be_bytes());
+        hello.extend_from_slice(&[0, 0]);
+        hello.extend_from_slice(&((5 + sni.len()) as u16).to_be_bytes());
+        hello.extend_from_slice(&((3 + sni.len()) as u16).to_be_bytes());
+        hello.push(0);
+        hello.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+        hello.extend_from_slice(sni);
+        let mut ev = netmon_common::NameEvent {
+            key: key(50001),
+            len: hello.len() as u16,
+            kind: netmon_common::NAME_TLS,
+            _pad: 0,
+            data: [0; netmon_common::NAME_DATA],
+        };
+        ev.data[..hello.len()].copy_from_slice(&hello);
+        m.probe.names.push_back(ev);
+        m.tick_at(secs(t0, 2));
+        let f = &m.collector.flows[&key(50001)];
+        assert_eq!((f.host.as_deref(), f.host_source), (Some("cdn.example.net"), "tls"));
+        // The connection expires: its name goes with it.
+        m.probe.flows.clear();
+        for s in 3..40 {
+            m.tick_at(secs(t0, s));
+        }
+        assert!(m.sni.is_empty());
     }
 
     #[test]

@@ -222,7 +222,8 @@ conditions ("curl may only reach port 443").
 ## Phase 4 – Hostnames: DNS answers and TLS SNI
 
 **Status (2026-11-19): in progress.** Step 1 (DNS names) done and tested
-live. Step 2 next.
+live. Step 2 (TLS SNI) done and tested live with curl; browsers often
+put SNI in a second segment (see Limits).
 
 **Why.** `151.101.1.91` says little; `reddit.com` says a lot. Also needed for
 rules by hostname later.

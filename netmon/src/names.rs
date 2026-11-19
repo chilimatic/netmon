@@ -1,4 +1,5 @@
-//! Hostnames for remote addresses, from DNS answers the host receives.
+//! Hostnames for remote addresses, from DNS answers the host receives and
+//! from the server name (SNI) in TLS ClientHellos it sends.
 //! The bytes come from the network and are untrusted: every read is
 //! bounds-checked, name decoding follows at most a few compression
 //! pointers, and a malformed packet yields what was parsed before the
@@ -103,6 +104,60 @@ pub fn dns_answers(p: &[u8]) -> Vec<(IpAddr, String, u32)> {
         off = data + rdlen as usize;
     }
     out
+}
+
+/// The server name (SNI) of a TLS ClientHello that starts at `p[0]`. None
+/// if the bytes are not a ClientHello, have no SNI, or the SNI is cut off
+/// (it is past the first segment) or is not a plausible hostname.
+pub fn client_hello_sni(p: &[u8]) -> Option<String> {
+    // Record header: type 22 (handshake), version 3.x, length.
+    if *p.first()? != 0x16 || *p.get(1)? != 0x03 {
+        return None;
+    }
+    // Handshake header: type 1 (ClientHello), 24-bit length.
+    if *p.get(5)? != 0x01 {
+        return None;
+    }
+    // client_version (2) + random (32).
+    let mut off = 9 + 2 + 32;
+    let sid = *p.get(off)? as usize;
+    off += 1 + sid;
+    let suites = u16_at(p, off)? as usize;
+    off += 2 + suites;
+    let comp = *p.get(off)? as usize;
+    off += 1 + comp;
+    let ext_len = u16_at(p, off)? as usize;
+    off += 2;
+    let end = off.checked_add(ext_len)?;
+    while off + 4 <= end {
+        let ty = u16_at(p, off)?;
+        let len = u16_at(p, off + 2)? as usize;
+        let data = off + 4;
+        if ty == 0 {
+            // server_name: list length, then entries of type, length, name.
+            let list = p.get(data..data + len)?;
+            let mut i = 2;
+            while i + 3 <= list.len() {
+                let name_len = u16_at(list, i + 1)? as usize;
+                let name = list.get(i + 3..i + 3 + name_len)?;
+                if list[i] == 0 {
+                    return hostname(name);
+                }
+                i += 3 + name_len;
+            }
+            return None;
+        }
+        off = data + len;
+    }
+    None
+}
+
+/// The bytes as a lowercase hostname, if they are one.
+fn hostname(b: &[u8]) -> Option<String> {
+    let ok = !b.is_empty()
+        && b.len() <= MAX_NAME
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'.' || *c == b'_');
+    ok.then(|| String::from_utf8_lossy(b).to_ascii_lowercase())
 }
 
 /// Names kept at most.
@@ -233,6 +288,68 @@ mod tests {
         p.extend_from_slice(b"\x04a\x1bb.\x03com\x00\x00\x01\x00\x01");
         p.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 1, 2, 3, 4]);
         assert_eq!(dns_answers(&p)[0].1, "a\\027b\\046.com", "no terminal escapes in names");
+    }
+
+    /// A ClientHello for Example.COM as curl sends it, cut to the parts the
+    /// parser reads.
+    fn client_hello(exts_before_sni: &[u8]) -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[7; 32]); // random
+        body.push(32);
+        body.extend_from_slice(&[9; 32]); // session id
+        body.extend_from_slice(&[0, 4, 0x13, 0x01, 0x13, 0x02]); // 2 cipher suites
+        body.extend_from_slice(&[1, 0]); // compression: null
+        let name = b"Example.COM";
+        let mut sni = vec![0, 0];
+        let list_len = (3 + name.len()) as u16;
+        sni.extend_from_slice(&(list_len + 2).to_be_bytes());
+        sni.extend_from_slice(&list_len.to_be_bytes());
+        sni.push(0);
+        sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni.extend_from_slice(name);
+        let mut exts = exts_before_sni.to_vec();
+        exts.extend_from_slice(&sni);
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        let mut hs = vec![0x01, 0, (body.len() >> 8) as u8, body.len() as u8];
+        hs.extend_from_slice(&body);
+        let mut rec = vec![0x16, 0x03, 0x01, (hs.len() >> 8) as u8, hs.len() as u8];
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    #[test]
+    fn sni_from_client_hello() {
+        assert_eq!(client_hello_sni(&client_hello(&[])).as_deref(), Some("example.com"));
+        // Other extensions first (supported_groups, a 300-byte padding).
+        let mut other = vec![0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d, 0x00, 0x15, 0x01, 0x2c];
+        other.extend_from_slice(&[0; 300]);
+        assert_eq!(client_hello_sni(&client_hello(&other)).as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn sni_cut_off_or_malformed() {
+        let full = client_hello(&[]);
+        for n in 0..full.len() {
+            assert_eq!(client_hello_sni(&full[..n]), None, "cut at {n}");
+        }
+        let mut wrong = full.clone();
+        wrong[5] = 0x02; // ServerHello
+        assert_eq!(client_hello_sni(&wrong), None);
+        let mut bad = full.clone();
+        let at = bad.len() - 3;
+        bad[at] = 0x1b; // escape byte in the name
+        assert_eq!(client_hello_sni(&bad), None);
+        // Random bytes behind a valid-looking header never panic.
+        let mut x: u32 = 99;
+        for _ in 0..20_000 {
+            let mut b = vec![0x16, 0x03, 0x01, 0x02, 0x00, 0x01];
+            for _ in 0..(x % 400) {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                b.push((x >> 16) as u8);
+            }
+            let _ = client_hello_sni(&b);
+        }
     }
 
     #[test]

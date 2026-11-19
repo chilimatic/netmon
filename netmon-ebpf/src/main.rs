@@ -18,7 +18,7 @@ use netmon_common::{
     ACTION_ALLOW, ACTION_DENY, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
-    ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
+    ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
     MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
     RuleEntry, SockOwner, TraceCfg, is_dhcp, is_loopback, parse_packet, rule_matches,
     unmap_v4_in_place,
@@ -325,6 +325,17 @@ fn parse_key(ctx: &TcContext, l3: u32, ethertype: u16, egress: bool, out: &mut F
     }
 }
 
+/// Does the TCP payload at `off` start like a TLS ClientHello? Record type
+/// handshake (0x16), version 3.x, handshake type ClientHello (1). Pure ACKs
+/// have no payload, so the read fails and costs nothing more.
+#[inline(never)]
+fn client_hello(ctx: &TcContext, off: u32) -> bool {
+    match ctx.load::<[u8; 6]>(off as usize) {
+        Ok(b) => b[0] == 0x16 && b[1] == 0x03 && b[5] == 0x01,
+        Err(_) => false,
+    }
+}
+
 /// Sends the payload of a packet that may carry a hostname to userspace.
 #[inline(never)]
 fn name_event(ctx: &TcContext, key: &FlowKey, off: u32, kind: u8) {
@@ -380,6 +391,9 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
         // answers of a local stub resolver).
         if !egress && key.proto == IPPROTO_UDP && key.remote_port == 53 {
             name_event(ctx, key, payload as u32, NAME_DNS);
+        }
+        if egress && key.proto == IPPROTO_TCP && payload > 0 && client_hello(ctx, payload as u32) {
+            name_event(ctx, key, payload as u32, NAME_TLS);
         }
         // Unparsed packets have no key and pass (fail-open).
         if ifindex != LOOPBACK_IFINDEX && packet_denied(key, egress, packet_tgid(ctx, egress)) {
