@@ -216,6 +216,50 @@ port = "8000-8100"         # or one number; without proto: tcp and udp
   `comment` fields are kept: other `#` comments of a hand-written file are
   lost.
 
+### Ask mode
+
+`sudo netmon --ask` (or `default = "ask"` in the rules file) asks before
+outbound TCP or UDP connections that no rule decides. There is one question
+per program; all its waiting connections are listed by destination:
+
+```
+┌ netmon asks ─────────────────────────────────────────────────────────┐
+│firefox (pid 4242, user j)   exe /usr/lib/firefox/firefox              │
+│wants 12 connections to 3 destinations:                                │
+│> example.com (93.184.215.14)  tcp 443  ×9                             │
+│  ocsp.example.net (1.2.3.4)  tcp 80  ×2                               │
+│  93.184.215.15  udp 443  ×1                                           │
+│                                                                       │
+│scope ←→ program   rule: exe /usr/lib/firefox/firefox                  │
+│a allow  A allow always  d deny  D deny always   o/x ... once  ↑↓ select│
+│no answer in 27 s: deny once                                           │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+- `←`/`→` choose how wide an answer is: **program** (any destination),
+  **port** (this protocol and port, any host) or **destination** (this
+  address and port). `↑`/`↓` select the destination the last two use.
+- `a`/`d` make an allow/deny rule for that scope until netmon exits (`tmp`
+  in the Rules tab, never saved). `A`/`D` make a lasting rule; `s` in the
+  Rules tab saves it. Every waiting connection the new rule covers is
+  decided at once, in every question.
+- `o`/`x` allow/deny only the selected destination's waiting connections.
+  These answers stay with the connections through later rule changes.
+- The kernel drops a waiting connection's packets. TCP sends its SYN again
+  after about 1, 3, 7 and 15 s, so it goes through at its next try. UDP
+  has no such retry: the first datagram is lost and the program's own
+  retry (e.g. a DNS resolver's) gets through.
+- No answer in 30 s: the waiting connections are denied once.
+- Unmatched inbound connections are denied in ask mode. The lockout guard
+  (loopback, SSH session, resolver DNS, DHCP) is never asked.
+- **Unknown process:** traffic without a local socket (forwarded from
+  containers, VMs, Docker bridges) has no program. Its question starts at
+  **port** scope, and `a`/`d`/`A`/`D` make rules without an exe, which
+  apply to every process. There is no program scope for it.
+- `--once` cannot ask: asked connections stay dropped.
+- `docs/rules.example.toml` pre-allows common system services
+  (systemd-resolved, timesyncd, NetworkManager).
+
 ## Packet capture
 
 Select a row in **Connections**, **Processes** or **Interfaces** and press

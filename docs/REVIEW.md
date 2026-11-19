@@ -74,7 +74,9 @@ Status column: `P0` = fixed in Phase 0, `Pn` = fixed in roadmap phase n,
 - **Lockout guard.** Never blocked: loopback, the SSH session netmon runs
   in (`SSH_CONNECTION`), DNS to the local system resolver (127.0.0.53 and
   the stub addresses in `/etc/resolv.conf`, port 53).
-- Prompt mechanism (Phase 5): still open.
+- **Prompt mechanism (Phase 5, decided 2026-11-19).** Drop the first
+  packet and rely on TCP retransmits; the first UDP datagram is lost.
+  NFQUEUE may come later.
 
 ## Decisions needed before the firewall phases (original list)
 

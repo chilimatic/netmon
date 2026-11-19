@@ -135,6 +135,9 @@ pub struct App {
     pub show_graph: bool,
     /// Remote column shows hostnames where known.
     pub show_hosts: bool,
+    /// The question shown in ask mode and how many more wait. Set by the
+    /// main loop; while set, a and d answer it.
+    pub ask: Option<(crate::ask::Prompt, usize)>,
     /// Seconds between samples, for the graph's time axis.
     pub interval_secs: f64,
     /// Index of the selected row as last drawn.
@@ -157,6 +160,7 @@ impl Default for App {
             paused: false,
             show_graph: true,
             show_hosts: true,
+            ask: None,
             interval_secs: 1.0,
             selected: 0,
             anchor: None,
@@ -206,6 +210,21 @@ pub enum Action {
     RemoveRule,
     /// Write all rules to the rules file.
     SaveRules,
+    /// Answer the shown ask-mode question.
+    Answer(Answer),
+    /// Select another destination of the shown question.
+    AskSelect(isize),
+    /// Switch the scope of the shown question.
+    AskScope(isize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// Only the selected destination's waiting connections.
+    Once { allow: bool },
+    /// A rule for the chosen scope; `always` keeps it (saved with `s`),
+    /// otherwise it ends when netmon exits.
+    Rule { allow: bool, always: bool },
 }
 
 impl App {
@@ -225,6 +244,22 @@ impl App {
             }
             self.reset_selection();
             return None;
+        }
+        if self.ask.is_some() {
+            let rule = |allow, always| Some(Action::Answer(Answer::Rule { allow, always }));
+            match key {
+                Key::Char('a') => return rule(true, false),
+                Key::Char('A') => return rule(true, true),
+                Key::Char('d') => return rule(false, false),
+                Key::Char('D') => return rule(false, true),
+                Key::Char('o') => return Some(Action::Answer(Answer::Once { allow: true })),
+                Key::Char('x') => return Some(Action::Answer(Answer::Once { allow: false })),
+                Key::Up | Key::Char('k') => return Some(Action::AskSelect(-1)),
+                Key::Down | Key::Char('j') => return Some(Action::AskSelect(1)),
+                Key::Left => return Some(Action::AskScope(-1)),
+                Key::Right => return Some(Action::AskScope(1)),
+                _ => {}
+            }
         }
         if self.tab == Tab::Capture {
             match key {
@@ -569,6 +604,32 @@ mod tests {
         app.on_key(Key::Home);
         assert_eq!(app.sync_selection(&ids(&[3, 2])), 0);
         assert_eq!(app.sync_selection(&[]), 0);
+    }
+
+    #[test]
+    fn answer_keys_only_while_asking() {
+        let mut app = App::default();
+        assert_eq!(app.on_key(Key::Char('a')), None);
+        app.tab = Tab::Rules;
+        assert_eq!(app.on_key(Key::Char('d')), Some(Action::RemoveRule));
+        let p = crate::ask::Prompt {
+            pid: 1,
+            comm: "x".into(),
+            exe: String::new(),
+            user: String::new(),
+            dests: Vec::new(),
+            since: std::time::Instant::now(),
+            selected: 0,
+            scope: crate::ask::Scope::Program,
+        };
+        app.ask = Some((p, 0));
+        assert_eq!(app.on_key(Key::Char('a')), Some(Action::Answer(Answer::Rule { allow: true, always: false })));
+        assert_eq!(app.on_key(Key::Char('D')), Some(Action::Answer(Answer::Rule { allow: false, always: true })));
+        assert_eq!(app.on_key(Key::Char('d')), Some(Action::Answer(Answer::Rule { allow: false, always: false })), "d answers, not remove");
+        assert_eq!(app.on_key(Key::Char('o')), Some(Action::Answer(Answer::Once { allow: true })));
+        assert_eq!(app.on_key(Key::Right), Some(Action::AskScope(1)), "arrows steer the question, not the tabs");
+        assert_eq!(app.on_key(Key::Down), Some(Action::AskSelect(1)));
+        assert_eq!(app.on_key(Key::Char('5')), None, "other keys still work");
     }
 
     #[test]

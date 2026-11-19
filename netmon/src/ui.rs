@@ -6,13 +6,16 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols::Marker,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Sparkline, Table, TableState, Tabs},
+    widgets::{
+        Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Sparkline, Table, TableState, Tabs,
+    },
 };
 
 use netmon_common::{ACTION_DENY, DIR_IN};
 
 use crate::{
-    rules::{Action, Dir, Rules},
+    ask::{ASK_TIMEOUT, Prompt},
+    rules::{Action, Dir, Rules, proto_name},
     app::{App, ConnRow, RowId, Sort, Tab, human},
     capture::Capture,
     decode::hexdump,
@@ -60,6 +63,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
                 (0, Action::Allow) => String::new(),
                 (n, Action::Allow) => format!("  RULES {n}"),
                 (n, Action::Deny) => format!("  RULES {n}  DEFAULT DENY"),
+                (n, Action::Ask) => format!("  RULES {n}  ASK"),
             },
             paused,
             capturing,
@@ -108,6 +112,66 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         )
     };
     f.render_widget(Paragraph::new(footer_text).style(Style::new().fg(Color::DarkGray)), footer);
+    if let Some((p, more)) = &app.ask {
+        draw_ask(f, p, *more, &app.status);
+    }
+}
+
+/// The oldest unanswered question, over everything.
+fn draw_ask(f: &mut Frame, p: &Prompt, more: usize, status: &str) {
+    const LIST: usize = 6;
+    let area = f.area();
+    let shown = p.dests.len().min(LIST);
+    let w = area.width.saturating_sub(4).min(110);
+    let h = (shown as u16 + 10).min(area.height);
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    let who = if p.pid == 0 {
+        "unknown process (no local socket: forwarded, container or VM traffic)".to_string()
+    } else {
+        format!("{} (pid {}, user {})   exe {}", p.comm, p.pid, or_dash(&p.user), or_dash(&p.exe))
+    };
+    let mut text = vec![
+        Line::from(Span::styled(who, Style::new().add_modifier(Modifier::BOLD))),
+        Line::from(format!("wants {} connections to {} destinations:", p.conns(), p.dests.len())),
+    ];
+    // A window of LIST destinations that keeps the selected one visible.
+    let start = p.selected.saturating_sub(LIST - 1).min(p.dests.len().saturating_sub(LIST));
+    for (i, d) in p.dests.iter().enumerate().skip(start).take(LIST) {
+        let ip = d.remote.to_string();
+        let target = match &d.host {
+            Some(h) => format!("{h} ({ip})"),
+            None => ip,
+        };
+        let line = format!("{} {target}  {} {}  ×{}", if i == p.selected { ">" } else { " " }, proto_name(d.proto), d.port, d.conns.len());
+        let style = if i == p.selected { Style::new().bg(Color::DarkGray) } else { Style::new() };
+        text.push(Line::from(Span::styled(line, style)));
+    }
+    let rule = match p.rule_match() {
+        Some(m) if p.exe.is_empty() => format!("rule: {m} (any process)"),
+        Some(m) => format!("rule: {m}"),
+        None => "process unknown: no program rule, pick port or destination".into(),
+    };
+    let left = ASK_TIMEOUT.saturating_sub(p.since.elapsed()).as_secs();
+    let more = if more > 0 { format!("   {more} more waiting") } else { String::new() };
+    text.push(Line::from(""));
+    text.push(Line::from(vec![
+        Span::raw("scope ←→ "),
+        Span::styled(p.scope.label(), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(format!("   {rule}")),
+    ]));
+    text.push(Line::from(Span::styled(
+        "a allow  A allow always  d deny  D deny always   o/x allow/deny selected once   ↑↓ select",
+        Style::new().fg(Color::Yellow),
+    )));
+    text.push(Line::from(format!("no answer in {left} s: deny once{more}")));
+    text.push(Line::from(Span::styled(status.to_string(), Style::new().fg(Color::Cyan))));
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(text).block(
+            Block::new().borders(Borders::ALL).title(" netmon asks ").border_style(Style::new().fg(Color::Yellow)),
+        ),
+        r,
+    );
 }
 
 /// Mirrored histogram of total traffic: download above the zero line,
@@ -361,7 +425,7 @@ fn draw_rules(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
             let color = if r.action == Action::Deny { Color::Red } else { Color::Green };
             Row::new(vec![
                 Cell::from((i + 1).to_string()),
-                Cell::from(r.action.to_string()),
+                Cell::from(if r.temporary { format!("{} tmp", r.action) } else { r.action.to_string() }),
                 Cell::from(r.m.to_string()),
                 Cell::from(r.comment.clone()),
                 Cell::from(Line::from(r.hits.to_string()).right_aligned()),
@@ -585,7 +649,7 @@ mod tests {
         rules.block(BlockTarget::host("1.1.1.1".parse().unwrap())).unwrap();
         rules.rules[0].hits = 42;
         let mut app = App { show_graph: false, ..App::default() };
-        let mut term = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
         term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &rules)).unwrap();
         let buf = term.backend().buffer();
         let row = (0..10).find(|y| (0..120).map(|x| buf[(x, *y)].symbol()).collect::<String>().contains("1.1.1.1:443")).unwrap();
@@ -594,6 +658,35 @@ mod tests {
         rules.default = Action::Deny;
         term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &rules)).unwrap();
         assert!(screen(&term).contains("DEFAULT DENY"));
+        let dest = |last: u8, port, n| crate::ask::Dest {
+            remote: std::net::IpAddr::from([93, 184, 215, last]),
+            port,
+            proto: 6,
+            host: (last == 14).then(|| "example.com".to_string()),
+            conns: vec![netmon_common::ConnKey::default(); n],
+        };
+        app.ask = Some((
+            crate::ask::Prompt {
+                pid: 42,
+                comm: "curl".into(),
+                exe: "/usr/bin/curl".into(),
+                user: "j".into(),
+                dests: vec![dest(14, 443, 2), dest(15, 80, 1)],
+                since: std::time::Instant::now(),
+                selected: 1,
+                scope: crate::ask::Scope::Port,
+            },
+            2,
+        ));
+        let mut big = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        big.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &rules)).unwrap();
+        let s = screen(&big);
+        println!("{s}");
+        assert!(s.contains("netmon asks") && s.contains("wants 3 connections to 2 destinations"), "{s}");
+        assert!(s.contains("example.com (93.184.215.14)  tcp 443  ×2"), "{s}");
+        assert!(s.contains("> 93.184.215.15  tcp 80"), "{s}");
+        assert!(s.contains("rule: exe /usr/bin/curl tcp port 80") && s.contains("2 more waiting"), "{s}");
+        app.ask = None;
         app.tab = Tab::Rules;
         term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &rules)).unwrap();
         let s = screen(&term);

@@ -15,7 +15,7 @@ use aya_ebpf::{
     programs::{SockAddrContext, SockContext, TcContext, TracePointContext},
 };
 use netmon_common::{
-    ACTION_ALLOW, ACTION_DENY, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
+    ACTION_ALLOW, ACTION_ASK, ACTION_DENY, ASK_RING_BYTES, AskEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
@@ -121,11 +121,29 @@ fn live_rules() -> (u32, u32) {
     (cfg(CFG_COUNT + half), half)
 }
 
-/// Is any rule or default deny in force? If not, nothing is checked and
-/// no connection state is kept.
+/// Is any rule, default deny or ask in force? If not, nothing is checked
+/// and no connection state is kept.
 #[inline(always)]
 fn rules_active() -> bool {
-    live_rules().0 != 0 || cfg(CFG_DEFAULT) == ACTION_DENY as u32
+    let d = cfg(CFG_DEFAULT);
+    live_rules().0 != 0 || d == ACTION_DENY as u32 || d == ACTION_ASK as u32
+}
+
+/// Outbound connections waiting for the user's answer (ask mode).
+#[map]
+static ASKS: RingBuf = RingBuf::with_byte_size(ASK_RING_BYTES, 0);
+
+#[inline(never)]
+fn ask_event(c: &ConnKey, tgid: u32) {
+    if let Some(mut e) = ASKS.reserve::<AskEvent>(0) {
+        let ev = e.as_mut_ptr();
+        unsafe {
+            (*ev).key = *c;
+            (*ev).tgid = tgid;
+            (*ev)._pad = 0;
+        }
+        e.submit(0);
+    }
 }
 
 /// Connection -> direction and cached verdict. LRU is fine here: an
@@ -186,7 +204,6 @@ extern "C" fn scan_rule(i: u64, ctx: *mut c_void) -> i64 {
 fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
     let (count, half) = live_rules();
     let tcp_udp = c.proto == IPPROTO_TCP || c.proto == IPPROTO_UDP;
-    let default = if tcp_udp && cfg(CFG_DEFAULT) == ACTION_DENY as u32 { ACTION_DENY } else { ACTION_ALLOW };
     if is_loopback(c.family, &c.remote_addr) || is_dhcp(c.proto, c.remote_port) || (tcp_udp && c.remote_port == 0) {
         return ACTION_ALLOW;
     }
@@ -204,7 +221,7 @@ fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
         return ACTION_ALLOW;
     }
     if scan.count == 0 {
-        return default;
+        return default_action(c.proto, dir);
     }
     if tgid != 0 {
         scan.exe = unsafe { TGID_EXE.get(&tgid) }.copied().unwrap_or(0);
@@ -212,18 +229,39 @@ fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
     unsafe {
         bpf_loop(scan.count, scan_rule as *mut c_void, &mut scan as *mut Scan as *mut c_void, 0);
     }
-    if scan.action == 0 { default } else { scan.action }
+    if scan.action == 0 { default_action(scan.proto, scan.dir) } else { scan.action }
+}
+
+/// Action when no rule matches: the configured default for TCP and UDP
+/// (ask only outbound; unmatched inbound is denied), allow otherwise.
+/// Computed after the rule walk so it takes no stack across bpf_loop.
+#[inline(always)]
+fn default_action(proto: u8, dir: u8) -> u8 {
+    if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
+        return ACTION_ALLOW;
+    }
+    let d = cfg(CFG_DEFAULT);
+    if d == ACTION_DENY as u32 {
+        ACTION_DENY
+    } else if d == ACTION_ASK as u32 {
+        if dir == DIR_OUT { ACTION_ASK } else { ACTION_DENY }
+    } else {
+        ACTION_ALLOW
+    }
 }
 
 /// TC verdict for a packet of flow `key`. TCP and UDP use the connection
 /// state: the first packet sets the direction (egress: out, ingress: in)
-/// and the verdict, later packets reuse it until the rules change.
+/// and the verdict, later packets reuse it until the rules change. An
+/// `ask` verdict drops packets until userspace writes the answer into the
+/// state; only the packet that decides sends an ask event.
 #[inline(never)]
 fn packet_denied(key: &FlowKey, egress: bool, tgid: u32) -> bool {
     if !rules_active() {
         return false;
     }
-    let c = ConnKey::from_flow(key);
+    let mut c = ConnKey::default();
+    conn_key(key, &mut c);
     let mut dir = if egress { DIR_OUT } else { DIR_IN };
     if c.proto != IPPROTO_TCP && c.proto != IPPROTO_UDP {
         return decide(&c, tgid, dir) == ACTION_DENY;
@@ -232,8 +270,8 @@ fn packet_denied(key: &FlowKey, egress: bool, tgid: u32) -> bool {
     if let Some(st) = unsafe { CONNS.get(&c) } {
         // Decide again after a rule change, or when the process is known
         // now but was not then (exe rules could not match).
-        if st.generation == generation && (st.exe_known != 0 || tgid == 0) {
-            return st.action == ACTION_DENY;
+        if st.answered != 0 || (st.generation == generation && (st.exe_known != 0 || tgid == 0)) {
+            return st.action != ACTION_ALLOW;
         }
         dir = st.dir;
     }
@@ -242,9 +280,19 @@ fn packet_denied(key: &FlowKey, egress: bool, tgid: u32) -> bool {
         tgid = listener_tgid(key);
     }
     let action = decide(&c, tgid, dir);
-    let st = ConnState { generation, dir, action, exe_known: (tgid != 0) as u8, _pad: 0 };
+    let st = ConnState { generation, dir, action, exe_known: (tgid != 0) as u8, answered: 0 };
     let _ = CONNS.insert(&c, &st, 0);
-    action == ACTION_DENY
+    if action == ACTION_ASK {
+        ask_event(&c, tgid);
+    }
+    action != ACTION_ALLOW
+}
+
+/// ConnKey::from_flow in its own BPF function: unmapping the address takes
+/// stack that would otherwise sit under the rule walk.
+#[inline(never)]
+fn conn_key(key: &FlowKey, out: &mut ConnKey) {
+    *out = ConnKey::from_flow(key);
 }
 
 /// The process that bound the local end of an inbound flow (a server),
@@ -261,7 +309,8 @@ fn listener_tgid(key: &FlowKey) -> u32 {
 
 /// Verdict for connect/sendmsg. Usually a new outbound connection; a UDP
 /// reply a server sends with sendto() belongs to an inbound one, found by
-/// the socket's local port.
+/// the socket's local port. `ask` allows the call: TC then drops the
+/// packet and asks.
 #[inline(never)]
 fn sock_denied(c: &ConnKey, tgid: u32) -> bool {
     if !rules_active() {
@@ -271,7 +320,7 @@ fn sock_denied(c: &ConnKey, tgid: u32) -> bool {
     if c.local_port != 0
         && let Some(st) = unsafe { CONNS.get(c) }
     {
-        if st.generation == cfg(CFG_GEN) && st.exe_known != 0 {
+        if st.answered != 0 || (st.generation == cfg(CFG_GEN) && st.exe_known != 0) {
             return st.action == ACTION_DENY;
         }
         dir = st.dir;

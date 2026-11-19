@@ -67,6 +67,22 @@ pub const RULE_DIR: u8 = 16;
 
 pub const ACTION_ALLOW: u8 = 1;
 pub const ACTION_DENY: u8 = 2;
+/// Default action only: drop the first packet of an outbound connection
+/// and ask the user; the answer is written into the connection state.
+pub const ACTION_ASK: u8 = 3;
+
+/// Size of the ring buffer for ask events.
+pub const ASK_RING_BYTES: u32 = 256 * 1024;
+
+/// An outbound connection that no rule decides, in ask mode.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AskEvent {
+    pub key: ConnKey,
+    /// Process that sent the packet, 0 if unknown.
+    pub tgid: u32,
+    pub _pad: u32,
+}
 
 /// This host opened the connection (or sends the datagram).
 pub const DIR_OUT: u8 = 1;
@@ -132,7 +148,9 @@ pub struct ConnState {
     pub action: u8,
     /// 1 if the process was known when deciding, so exe rules could match.
     pub exe_known: u8,
-    pub _pad: u8,
+    /// 1 if the user answered for this connection (ask mode, "once"): the
+    /// verdict then stays through rule changes.
+    pub answered: u8,
 }
 
 /// DHCP and DHCPv6 (client and server ports). Never blocked, so a host

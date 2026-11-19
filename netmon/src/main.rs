@@ -1,4 +1,5 @@
 mod app;
+mod ask;
 mod capture;
 mod collector;
 mod decode;
@@ -49,6 +50,10 @@ struct Args {
     /// others. [default: /etc/netmon/rules.toml, skipped if missing]
     #[arg(long, value_name = "PATH")]
     rules: Option<std::path::PathBuf>,
+    /// Ask about outbound connections no rule decides (default action
+    /// "ask"); unmatched inbound connections are denied.
+    #[arg(long)]
+    ask: bool,
 }
 
 impl Args {
@@ -68,6 +73,8 @@ impl Args {
 const CAPTURE_POLL: Duration = Duration::from_millis(50);
 /// Max packets taken from the ring buffer per poll, so the UI stays responsive.
 const DRAIN_BATCH: usize = 4_096;
+/// Most ask events read per poll.
+const ASK_BATCH: usize = 256;
 /// ClientHello first segments waiting for their second one.
 const MAX_HELLO_PARTS: usize = 256;
 /// Most name events read per refresh; the rest wait in the ring.
@@ -96,6 +103,8 @@ struct Monitor<K: Kernel = Probe> {
     rules_path: std::path::PathBuf,
     /// Hostnames from DNS answers.
     hosts: names::HostNames,
+    /// Ask mode: questions waiting for the user.
+    asks: ask::Asks,
     /// TLS server name per connection, from its ClientHello.
     sni: HashMap<netmon_common::FlowKey, String>,
     /// First segments of ClientHellos that continue in the next segment.
@@ -112,6 +121,15 @@ impl Monitor {
         errors.extend(hook_errors);
         if let Some(msg) = mon.load_rules_file(args) {
             errors.push(msg);
+        }
+        if args.ask {
+            let msg = mon.change_rules(|r| {
+                r.default = rules::Action::Ask;
+                Ok(String::new())
+            });
+            if !msg.is_empty() {
+                errors.push(msg);
+            }
         }
         match LinkWatch::open() {
             Ok(w) => mon.links = Some(w),
@@ -131,7 +149,7 @@ impl<K: Kernel> Monitor<K> {
         let mut names = Names::default();
         names.update(&ifs);
         let collector = Collector::new(args.expire_ticks());
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), sni: HashMap::new(), hello_parts: HashMap::new() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), sni: HashMap::new(), hello_parts: HashMap::new() };
         Ok((mon, errors))
     }
 
@@ -289,6 +307,116 @@ impl<K: Kernel> Monitor<K> {
         }
     }
 
+    /// Reads new ask events and times out old questions. Called often, so
+    /// a question shows before the first TCP retransmit (~1 s).
+    fn poll_asks(&mut self, now: Instant) {
+        let mut events = Vec::new();
+        self.probe.drain_asks(ASK_BATCH, |e| events.push(*e));
+        for ev in events {
+            let (info, host) = self.prompt_for(&ev, now);
+            // Events still in the ring when an answer made a rule: the rule
+            // decides their next retransmit, so do not ask again.
+            let dest = std::net::SocketAddr::new(ask::remote(&ev.key), ev.key.remote_port);
+            if self.rules.first_match(ev.key.proto, dest, &info.exe, rules::Dir::Out).is_some() {
+                continue;
+            }
+            if self.asks.add(ev.key, info, host) == ask::Added::Full {
+                let _ = self.probe.set_verdict(&ev.key, netmon_common::ACTION_DENY);
+            }
+        }
+        for p in self.asks.expired(now) {
+            for d in &p.dests {
+                self.answer_conns(&d.conns, netmon_common::ACTION_DENY);
+            }
+        }
+    }
+
+    /// The asking process and the remote end's name.
+    fn prompt_for(&mut self, ev: &netmon_common::AskEvent, now: Instant) -> (ask::Prompt, Option<String>) {
+        let pid = ev.tgid;
+        let comm = match pid {
+            0 => "unknown process".to_string(),
+            _ => std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .map(|c| text::sanitize(c.trim()))
+                .unwrap_or_else(|_| "exited process".into()),
+        };
+        let mut owner = Owner::new(pid, &comm);
+        if pid != 0 {
+            self.procs.fill(&mut owner, read_details);
+        }
+        let d = owner.details.unwrap_or_default();
+        let info = ask::Prompt {
+            pid,
+            comm,
+            exe: d.exe,
+            user: d.user,
+            dests: Vec::new(),
+            since: now,
+            selected: 0,
+            scope: ask::Scope::Program,
+        };
+        (info, self.hosts.get(ask::remote(&ev.key), now).map(str::to_string))
+    }
+
+    /// Writes the verdict of waiting connections.
+    fn answer_conns(&mut self, conns: &[netmon_common::ConnKey], action: u8) {
+        for k in conns {
+            let _ = self.probe.set_verdict(k, action);
+        }
+    }
+
+    /// Answers the shown question.
+    fn answer(&mut self, a: crate::app::Answer) -> String {
+        use crate::app::Answer;
+        let Some(p) = self.asks.pending.front_mut() else { return String::new() };
+        match a {
+            Answer::Once { allow } => {
+                let Some(d) = (p.selected < p.dests.len()).then(|| p.dests.remove(p.selected)) else {
+                    return String::new();
+                };
+                p.selected = p.selected.min(p.dests.len().saturating_sub(1));
+                let comm = p.comm.clone();
+                if p.dests.is_empty() {
+                    self.asks.pending.pop_front();
+                }
+                let action = if allow { netmon_common::ACTION_ALLOW } else { netmon_common::ACTION_DENY };
+                self.answer_conns(&d.conns, action);
+                let target = d.host.unwrap_or_else(|| d.remote.to_string());
+                format!("{} {comm} to {target}:{} once", if allow { "allowed" } else { "denied" }, d.port)
+            }
+            Answer::Rule { allow, always } => {
+                let Some(m) = p.rule_match() else {
+                    return "process unknown: pick port or destination scope with ←→, or o/x for once".into();
+                };
+                let action = if allow { rules::Action::Allow } else { rules::Action::Deny };
+                let label = format!("{action} {m}");
+                let msg = self.change_rules(|r| {
+                    let id = r.insert(0, action, m, "asked")?;
+                    if !always {
+                        r.set_temporary(id);
+                    }
+                    Ok(format!("{label} ({})", if always { "always; s in Rules saves it" } else { "until netmon exits" }))
+                });
+                self.drop_decided_asks();
+                msg
+            }
+        }
+    }
+
+    /// Drops the waiting destinations a rule now decides. The rule change
+    /// made the kernel decide them again: their next retransmit follows
+    /// the rule.
+    fn drop_decided_asks(&mut self) {
+        let rules = &self.rules;
+        for p in self.asks.pending.iter_mut() {
+            let exe = p.exe.clone();
+            p.drop_decided(|d| {
+                rules.first_match(d.proto, std::net::SocketAddr::new(d.remote, d.port), &exe, rules::Dir::Out).is_some()
+            });
+        }
+        self.asks.pending.retain(|p| !p.dests.is_empty());
+    }
+
     /// Reads new DNS answers and ClientHellos and names every flow's
     /// remote end. The TLS server name wins: it is what the client asked
     /// this server for, while one address can serve many DNS names.
@@ -343,7 +471,7 @@ impl<K: Kernel> Monitor<K> {
     /// Reads the kernel's direction and verdict for every flow, while rules
     /// are in force.
     fn refresh_conns(&mut self) {
-        let active = !self.rules.rules.is_empty() || self.rules.default == rules::Action::Deny;
+        let active = !self.rules.rules.is_empty() || self.rules.default != rules::Action::Allow;
         for f in self.collector.flows.values_mut() {
             f.conn = if active { self.probe.conn(&netmon_common::ConnKey::from_flow(&f.key)) } else { None };
         }
@@ -403,7 +531,7 @@ impl<K: Kernel> Monitor<K> {
                     format!("line {}: {e}", r.line)
                 })?;
             }
-            let d = if rules.default == rules::Action::Deny { ", default deny" } else { "" };
+            let d = if rules.default == rules::Action::Allow { String::new() } else { format!(", default {}", rules.default) };
             Ok(format!("{n} rules from {}{d}", path.display()))
         });
         if failed || msg.starts_with("rule update failed") { fail(msg) } else { Some(msg) }
@@ -502,6 +630,17 @@ impl<K: Kernel> Monitor<K> {
                     None => "no process selected".into(),
                 };
             }
+            Action::Answer(a) => app.status = self.answer(a),
+            Action::AskSelect(step) => {
+                if let Some(p) = self.asks.pending.front_mut() {
+                    p.move_selection(step);
+                }
+            }
+            Action::AskScope(step) => {
+                if let Some(p) = self.asks.pending.front_mut() {
+                    p.scope = p.scope.step(step);
+                }
+            }
             Action::SaveRules => {
                 let path = &self.rules_path;
                 app.status = match rulefile::save(path, &rulefile::render(&self.rules)) {
@@ -569,7 +708,7 @@ fn run_tui(mon: &mut Monitor, args: &Args, status: String) -> anyhow::Result<()>
             if mon.capture.as_ref().is_some_and(|c| c.running) {
                 timeout = timeout.min(CAPTURE_POLL);
             }
-            if mon.links.is_some() {
+            if mon.links.is_some() || mon.rules.default == rules::Action::Ask {
                 timeout = timeout.min(LINK_POLL);
             }
             if event::poll(timeout).context("poll terminal events")?
@@ -582,6 +721,8 @@ fn run_tui(mon: &mut Monitor, args: &Args, status: String) -> anyhow::Result<()>
             }
             mon.set_paused(app.paused);
             mon.drain_capture(DRAIN_BATCH);
+            mon.poll_asks(Instant::now());
+            app.ask = mon.asks.pending.front().map(|p| (p.clone(), mon.asks.pending.len() - 1));
             if let Some(e) = mon.check_links().first() {
                 app.status = e.clone();
             }
@@ -650,7 +791,7 @@ mod tests {
     use super::*;
 
     fn args(interval_ms: u64, expire_secs: u64) -> Args {
-        Args { interval_ms, expire_secs, once: None, rules: None }
+        Args { interval_ms, expire_secs, once: None, rules: None, ask: false }
     }
 
     #[test]
@@ -686,6 +827,8 @@ mod tests {
         default: u8,
         conns: HashMap<netmon_common::ConnKey, netmon_common::ConnState>,
         names: VecDeque<netmon_common::NameEvent>,
+        asks: VecDeque<netmon_common::AskEvent>,
+        verdicts: Vec<(netmon_common::ConnKey, u8)>,
         fail_block: bool,
         marked: Vec<(u32, u32)>,
     }
@@ -750,6 +893,16 @@ mod tests {
         fn conn(&self, key: &netmon_common::ConnKey) -> Option<netmon_common::ConnState> {
             self.conns.get(key).copied()
         }
+        fn drain_asks(&mut self, max: usize, mut f: impl FnMut(&netmon_common::AskEvent)) {
+            for _ in 0..max {
+                let Some(ev) = self.asks.pop_front() else { break };
+                f(&ev);
+            }
+        }
+        fn set_verdict(&mut self, key: &netmon_common::ConnKey, action: u8) -> anyhow::Result<()> {
+            self.verdicts.push((*key, action));
+            Ok(())
+        }
         fn drain_names(&mut self, max: usize, mut f: impl FnMut(&netmon_common::NameEvent)) {
             for _ in 0..max {
                 let Some(ev) = self.names.pop_front() else { break };
@@ -801,6 +954,8 @@ mod tests {
             default: 0,
             conns: HashMap::new(),
             names: VecDeque::new(),
+            asks: VecDeque::new(),
+            verdicts: Vec::new(),
             fail_block: false,
             marked: Vec::new(),
         };
@@ -1022,6 +1177,74 @@ mod tests {
             m.tick_at(secs(t0, s));
         }
         assert!(m.sni.is_empty());
+    }
+
+    #[test]
+    fn ask_answers_once_or_by_rule() {
+        use crate::app::Answer;
+        let (mut m, t0) = monitor();
+        let me = std::process::id();
+        let conn = |port, rport| netmon_common::ConnKey {
+            local_port: port,
+            remote_port: rport,
+            ..netmon_common::ConnKey::from_flow(&key(443))
+        };
+        let ask = |k| netmon_common::AskEvent { key: k, tgid: me, _pad: 0 };
+        let (k1, k2, k3) = (conn(40000, 443), conn(40001, 443), conn(40002, 80));
+        for k in [k1, k2, k3] {
+            m.probe.asks.push_back(ask(k));
+        }
+        m.poll_asks(t0);
+        assert_eq!(m.asks.pending.len(), 1, "one question per program");
+        assert_eq!(m.asks.pending[0].dests.len(), 2);
+        assert!(!m.asks.pending[0].exe.is_empty(), "exe of this test process");
+        let mut app = App::default();
+
+        // o: only the selected destination (port 443, two connections), once.
+        m.handle(&mut app, Action::Answer(Answer::Once { allow: true }));
+        assert_eq!(m.probe.verdicts, vec![(k1, netmon_common::ACTION_ALLOW), (k2, netmon_common::ACTION_ALLOW)]);
+        assert_eq!(m.asks.pending[0].dests.len(), 1, "port 80 still waits");
+
+        // d with port scope: a temporary deny rule; the question is decided.
+        m.handle(&mut app, Action::AskScope(1));
+        m.handle(&mut app, Action::Answer(Answer::Rule { allow: false, always: false }));
+        assert!(m.asks.pending.is_empty(), "{}", app.status);
+        let r = &m.rules.rules[0];
+        assert_eq!((r.action, r.temporary, r.m.ports), (rules::Action::Deny, true, Some((80, 80))));
+        assert_eq!(m.probe.table.len(), 1, "rule in the kernel");
+        assert!(!rulefile::render(&m.rules).contains("[[rule]]"), "temporary rules are not saved");
+
+        // A with program scope: always; later connections of it are decided.
+        m.probe.asks.push_back(ask(conn(40003, 8443)));
+        m.poll_asks(t0);
+        m.handle(&mut app, Action::Answer(Answer::Rule { allow: true, always: true }));
+        assert!(m.asks.pending.is_empty());
+        // Events queued before the answer do not bring the question back.
+        m.probe.asks.push_back(ask(conn(40005, 8443)));
+        m.probe.asks.push_back(ask(conn(40006, 9000)));
+        m.poll_asks(t0);
+        assert!(m.asks.pending.is_empty(), "the program rule decides them");
+        assert!(rulefile::render(&m.rules).contains("action = \"allow\""));
+
+        // A question nobody answers is denied after the timeout.
+        // Unknown process: no program rule, but port and destination work.
+        let unknown = netmon_common::AskEvent { key: conn(40004, 22), tgid: 0, _pad: 0 };
+        m.probe.asks.push_back(unknown);
+        m.poll_asks(t0);
+        assert_eq!(m.asks.pending[0].comm, "unknown process");
+        m.handle(&mut app, Action::AskScope(-1));
+        m.handle(&mut app, Action::Answer(Answer::Rule { allow: true, always: false }));
+        assert!(app.status.contains("process unknown"), "{}", app.status);
+        m.handle(&mut app, Action::AskScope(1));
+        m.handle(&mut app, Action::Answer(Answer::Rule { allow: true, always: false }));
+        assert!(m.asks.pending.is_empty(), "{}", app.status);
+        assert_eq!(m.rules.rules[0].m.to_string(), "tcp port 22");
+        let unknown = netmon_common::AskEvent { key: conn(40007, 23), tgid: 0, _pad: 0 };
+        m.probe.asks.push_back(unknown);
+        m.poll_asks(t0);
+        m.poll_asks(t0 + ask::ASK_TIMEOUT);
+        assert_eq!(m.probe.verdicts.last(), Some(&(unknown.key, netmon_common::ACTION_DENY)));
+        assert!(m.asks.pending.is_empty());
     }
 
     #[test]

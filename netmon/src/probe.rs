@@ -17,7 +17,7 @@ use aya::{
     util::{KernelVersion, nr_cpus},
 };
 use netmon_common::{
-    CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CaptureConfig, ConnKey,
+    AskEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, DIR_OUT, CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CaptureConfig, ConnKey,
     ConnState, FlowKey, FlowStats, GuardKey,
     ListenKey, ListenOwner, MAX_CAPTURE_FLOWS, MAX_EXE_PATH, MAX_FLOWS, MAX_RULES, NameEvent, PacketEvent, RuleEntry, SockOwner,
     TraceCfg,
@@ -58,6 +58,7 @@ pub struct Probe {
     capture_full: bool,
     packets: RingBuf<MapData>,
     names: RingBuf<MapData>,
+    asks: RingBuf<MapData>,
     drops: PerCpuArray<MapData, u64>,
     sock_owner: HashMap<MapData, u64, SockOwner>,
     listeners: HashMap<MapData, ListenKey, ListenOwner>,
@@ -109,6 +110,7 @@ impl Probe {
         let capture_keys = HashMap::try_from(take("CAPTURE_KEYS")?)?;
         let packets = RingBuf::try_from(take("PACKETS")?)?;
         let names = RingBuf::try_from(take("NAMES")?)?;
+        let asks = RingBuf::try_from(take("ASKS")?)?;
         let drops = PerCpuArray::try_from(take("CAPTURE_DROPS")?)?;
         let sock_owner = HashMap::try_from(take("SOCK_OWNER")?)?;
         let listeners = HashMap::try_from(take("LISTENERS")?)?;
@@ -132,6 +134,7 @@ impl Probe {
             capture_full: false,
             packets,
             names,
+            asks,
             drops,
             sock_owner,
             listeners,
@@ -324,6 +327,11 @@ pub trait Kernel {
     fn drain_packets(&mut self, max: usize, f: impl FnMut(&PacketEvent));
     /// Takes up to `max` name events (DNS answers, TLS ClientHellos).
     fn drain_names(&mut self, max: usize, f: impl FnMut(&NameEvent));
+    /// Takes up to `max` ask events (ask mode).
+    fn drain_asks(&mut self, max: usize, f: impl FnMut(&AskEvent));
+    /// Answers an asked outbound connection: writes `action` (ACTION_*)
+    /// as its verdict for the current rules.
+    fn set_verdict(&mut self, key: &ConnKey, action: u8) -> anyhow::Result<()>;
     /// Packets lost because the ring buffer was full, since load. Callers
     /// subtract the value at capture start.
     fn capture_drops(&self) -> u64;
@@ -440,6 +448,23 @@ impl Kernel for Probe {
                 f(&ev);
             }
         }
+    }
+
+    fn drain_asks(&mut self, max: usize, mut f: impl FnMut(&AskEvent)) {
+        for _ in 0..max {
+            let Some(item) = self.asks.next() else { break };
+            if item.len() >= size_of::<AskEvent>() {
+                // SAFETY: the kernel wrote an AskEvent; the read is unaligned-safe.
+                let ev = unsafe { std::ptr::read_unaligned(item.as_ptr() as *const AskEvent) };
+                f(&ev);
+            }
+        }
+    }
+
+    fn set_verdict(&mut self, key: &ConnKey, action: u8) -> anyhow::Result<()> {
+        let st = ConnState { generation: self.generation, dir: DIR_OUT, action, exe_known: 1, answered: 1 };
+        self.conns.insert(key, st, 0)?;
+        Ok(())
     }
 
     fn capture_drops(&self) -> u64 {

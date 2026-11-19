@@ -9,7 +9,7 @@ use std::{
 };
 
 use netmon_common::{
-    ACTION_ALLOW, ACTION_DENY, DIR_IN, DIR_OUT, IPPROTO_TCP, IPPROTO_UDP, MAX_EXE_PATH, MAX_RULES, RULE_DIR,
+    ACTION_ALLOW, ACTION_ASK, ACTION_DENY, DIR_IN, DIR_OUT, IPPROTO_TCP, IPPROTO_UDP, MAX_EXE_PATH, MAX_RULES, RULE_DIR,
     RULE_EXE, RULE_NET, RULE_PORT, RULE_PROTO, RuleEntry, rule_matches,
 };
 
@@ -63,6 +63,8 @@ pub enum Action {
     #[default]
     Allow,
     Deny,
+    /// Default action only: ask the user about outbound connections.
+    Ask,
 }
 
 impl Action {
@@ -70,6 +72,7 @@ impl Action {
         match self {
             Action::Allow => ACTION_ALLOW,
             Action::Deny => ACTION_DENY,
+            Action::Ask => ACTION_ASK,
         }
     }
 }
@@ -97,6 +100,7 @@ impl fmt::Display for Action {
         f.write_str(match self {
             Action::Allow => "allow",
             Action::Deny => "deny",
+            Action::Ask => "ask",
         })
     }
 }
@@ -186,6 +190,8 @@ pub struct Rule {
     pub hits: u64,
     /// Hits before the kernel table was last rewritten.
     pub hits_base: u64,
+    /// Ends when netmon exits; never saved to the rules file.
+    pub temporary: bool,
 }
 
 impl fmt::Display for Rule {
@@ -211,6 +217,9 @@ pub struct Rules {
 impl Rules {
     /// Inserts a rule at position `at` (clamped). Returns its id.
     pub fn insert(&mut self, at: usize, action: Action, m: Match, comment: &str) -> Result<u32, String> {
+        if action == Action::Ask {
+            return Err("ask is only a default action, not a rule action".into());
+        }
         m.check()?;
         if self.rules.iter().any(|r| r.action == action && r.m == m) {
             return Err(format!("{action} {m} already exists"));
@@ -226,7 +235,7 @@ impl Rules {
         }
         let id = self.next_id;
         self.next_id += 1;
-        let rule = Rule { id, action, m, comment: comment.to_string(), hits: 0, hits_base: 0 };
+        let rule = Rule { id, action, m, comment: comment.to_string(), hits: 0, hits_base: 0, temporary: false };
         self.rules.insert(at.min(self.rules.len()), rule);
         Ok(id)
     }
@@ -240,6 +249,12 @@ impl Rules {
     pub fn find_block(&self, target: &BlockTarget) -> Option<&Rule> {
         let m = Match::from(target.clone());
         self.rules.iter().find(|r| r.action == Action::Deny && r.m == m)
+    }
+
+    pub fn set_temporary(&mut self, id: u32) {
+        if let Some(r) = self.rules.iter_mut().find(|r| r.id == id) {
+            r.temporary = true;
+        }
     }
 
     pub fn remove(&mut self, id: u32) -> Option<Rule> {
@@ -306,7 +321,7 @@ impl Rules {
     pub fn denies(&self, proto: u8, remote: SocketAddr, exe: &str, dir: Dir) -> bool {
         match self.first_match(proto, remote, exe, dir) {
             Some(r) => r.action == Action::Deny,
-            None => (proto == IPPROTO_TCP || proto == IPPROTO_UDP) && self.default == Action::Deny,
+            None => (proto == IPPROTO_TCP || proto == IPPROTO_UDP) && self.default != Action::Allow,
         }
     }
 

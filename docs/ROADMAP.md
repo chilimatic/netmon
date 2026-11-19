@@ -264,23 +264,44 @@ rules by hostname later.
 
 ## Phase 5 – Ask on first connection
 
-> **Decision needed before this phase** (see `docs/REVIEW.md`): how a
-> connection waits for the answer – deny in `cgroup/connect` and let the user
-> retry, drop the SYN and rely on TCP retransmits, or NFQUEUE. The design below
-> assumes the SYN-drop variant and will be updated.
+**Status (2026-11-19): done.** Steps 1 and 2 tested live (one commit).
+Found live: questions from processes without a local socket (forwarded,
+container, VM traffic) need port/destination rules without an exe.
 
 **Why.** The OpenSnitch / Little Snitch workflow: unknown process connects,
 user decides once.
 
+**Decision (2026-11-19).** Drop the first packet and rely on TCP
+retransmits (SYN retries after ~1, 3, 7, 15 s). The first UDP datagram is
+lost; the app's own retry gets through. NFQUEUE may come later.
+
 **Design.**
-- Mode `--ask`: a process with no matching rule gets its first outgoing packet
-  (TCP SYN / first UDP datagram) dropped and an event sent to userspace.
-- The UI shows a prompt: process, exe path, remote host/IP, port, with
-  *allow once*, *allow always*, *deny once*, *deny always*. "Always" writes a
-  rule (Phase 3). Retransmits (TCP retries after ~1 s) pass once allowed.
-- Timeout with no answer applies the default action.
-- System processes (systemd-resolved, NetworkManager, sshd) can be
-  pre-allowed in the default rules file.
+- New default action `ask` (`default = "ask"` in the rules file, or
+  `--ask`). It applies to outbound TCP/UDP that no rule matches; unmatched
+  inbound is denied. The lockout guard still wins.
+- Kernel: `decide()` returns `ACTION_ASK`. TC drops the packet, caches
+  `ask` in `CONNS` (retransmits are dropped without a new event) and sends
+  an event (connection key, tgid) on a small `ASKS` ring. The socket hooks
+  allow the call, so TC sees the SYN or datagram.
+- Userspace answers by writing the connection's verdict into `CONNS`; the
+  next retransmit passes or is dropped. A rule change re-decides asked
+  connections and may ask again; userspace merges duplicates.
+- Prompt in the TUI, one per program (exe; pid if the exe is unknown),
+  listing its waiting destinations; more connections join it. Shows process, pid, exe, user,
+  remote name and address, port. No answer in 30 s: deny once.
+- `--once` mode has no prompt: asked connections stay dropped.
+
+**Steps.**
+1. **Ask once.** `ACTION_ASK`, `ASKS` ring, verdict write, `--ask` and
+   `default = "ask"`, prompt with allow/deny once, timeout. Tested live:
+   works, but one question per connection meant ~200 questions for a
+   browser.
+2. **Scoped answers.** One question per program listing its destinations.
+   Scope program / port / destination; `a`/`d` temporary rules, `A`/`D`
+   lasting rules, `o`/`x` once for the selected destination. New rules
+   decide waiting connections in every question. "Once" answers stay with
+   their connections through rule changes (`ConnState.answered`).
+   `docs/rules.example.toml` pre-allows system services.
 
 **Acceptance.**
 - `curl https://example.com` in `--ask` mode blocks until allowed, then

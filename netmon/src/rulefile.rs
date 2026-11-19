@@ -56,6 +56,7 @@ enum RawDir {
 enum RawAction {
     Allow,
     Deny,
+    Ask,
 }
 
 #[derive(Deserialize)]
@@ -138,6 +139,7 @@ fn action(a: RawAction) -> Action {
     match a {
         RawAction::Allow => Action::Allow,
         RawAction::Deny => Action::Deny,
+        RawAction::Ask => Action::Ask,
     }
 }
 
@@ -147,6 +149,9 @@ fn line_of(text: &str, offset: usize) -> usize {
 
 fn convert(r: RawRule) -> Result<(Action, Match, String), String> {
     let action = action(r.action);
+    if action == Action::Ask {
+        return Err("action \"ask\" is only allowed as the top-level default".into());
+    }
     let dir = r.direction.map(|d| match d {
         RawDir::Out => Dir::Out,
         RawDir::In => Dir::In,
@@ -199,13 +204,14 @@ fn network(s: &str) -> Result<(IpAddr, u8), String> {
     Ok((ip, len))
 }
 
-/// The rules as a rules file, in match order. Only `comment` fields
-/// survive; other `#` comments of a hand-written file are not kept.
+/// The rules as a rules file, in match order, without temporary rules.
+/// Only `comment` fields survive; other `#` comments of a hand-written
+/// file are not kept.
 pub fn render(rules: &Rules) -> String {
     let q = |s: &str| toml::Value::String(s.to_string()).to_string();
     let mut out = String::from("# netmon rules, first match wins. Written by netmon.\n");
     let _ = writeln!(out, "default = {}", q(&rules.default.to_string()));
-    for r in &rules.rules {
+    for r in rules.rules.iter().filter(|r| !r.temporary) {
         let m = &r.m;
         let _ = write!(out, "\n[[rule]]\naction = {}\n", q(&r.action.to_string()));
         if let Some(d) = m.dir {
@@ -324,6 +330,8 @@ remote = "2001:db8::1"
         assert_eq!(parse(EXAMPLE).unwrap().default, None);
         assert!(err("[[rule]]\naction = \"deny\"\ndirection = \"both\"\n").starts_with("line 3:"));
         assert!(err("default = \"block\"\n").starts_with("line 1:"));
+        assert_eq!(parse("default = \"ask\"\n").unwrap().default, Some(Action::Ask));
+        assert!(err("[[rule]]\naction = \"ask\"\n").contains("only allowed as the top-level default"));
     }
 
     #[test]
