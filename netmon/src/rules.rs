@@ -190,7 +190,7 @@ pub struct Rule {
     pub hits: u64,
     /// Hits before the kernel table was last rewritten.
     pub hits_base: u64,
-    /// Ends when netmon exits; never saved to the rules file.
+    /// Ends when the monitor stops; never saved to the rules file.
     pub temporary: bool,
 }
 

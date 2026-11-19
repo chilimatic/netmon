@@ -228,7 +228,7 @@ pub enum Answer {
     /// Only the selected destination's waiting connections.
     Once { allow: bool },
     /// A rule for the chosen scope; `always` keeps it (saved with `s`),
-    /// otherwise it ends when netmon exits.
+    /// otherwise it ends when the monitor stops.
     Rule { allow: bool, always: bool },
 }
 

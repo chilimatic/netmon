@@ -99,7 +99,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     } else if app.tab == Tab::Capture {
         " q quit  ←→/1-5 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
     } else if app.tab == Tab::Rules {
-        " q quit  ←→/1-5 view  ↑↓ select  d remove rule  s save to rules file   blocks end when netmon exits".to_string()
+        " q quit  ←→/1-5 view  ↑↓ select  d remove rule  s save to rules file   tmp rules end when the monitor stops".to_string()
     } else {
         let block = match app.tab {
             Tab::Connections => "  b/B block ip/port",
@@ -411,7 +411,7 @@ fn draw_rules(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
         f.render_widget(
             Paragraph::new(
                 "\n  No rules.\n\n  In Connections, b blocks the selected row's remote address and B its\n  \
-                 remote port; in Processes, b blocks the process's exe. Blocks end when netmon exits.\n  \
+                 remote port; in Processes, b blocks the process's exe. Blocks end when the monitor stops, unless saved with s.\n  \
                  Rules that load at start go in /etc/netmon/rules.toml (see README). Loopback, this SSH\n  \
                  session and DNS to the resolvers in /etc/resolv.conf are never blocked.",
             )

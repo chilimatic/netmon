@@ -454,7 +454,7 @@ impl<K: Kernel> Monitor<K> {
         if let Some(rule) = self.rules.find_block(&target) {
             return self.remove_rule(rule.id);
         }
-        let msg = format!("blocked {target} (until netmon exits; b again or Rules tab to undo)");
+        let msg = format!("blocked {target} (until the monitor stops; b again or Rules tab to undo)");
         self.change_rules(|r| r.block(target).map(|_| msg))
     }
 
@@ -627,7 +627,7 @@ impl<K: Kernel> Monitor<K> {
                     if !always {
                         r.set_temporary(id);
                     }
-                    Ok(format!("{label} ({})", if always { "always; s in Rules saves it" } else { "until netmon exits" }))
+                    Ok(format!("{label} ({})", if always { "always; s in Rules saves it" } else { "until the monitor stops" }))
                 });
                 self.drop_decided_asks();
                 msg
