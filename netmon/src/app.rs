@@ -196,6 +196,8 @@ pub enum Action {
     ToggleBlockProcess,
     /// Remove the selected rule in the Rules tab.
     RemoveRule,
+    /// Write all rules to the rules file.
+    SaveRules,
 }
 
 impl App {
@@ -248,6 +250,7 @@ impl App {
             Key::Char('B') if self.tab == Tab::Connections => return Some(Action::ToggleBlockPort),
             Key::Char('b') if self.tab == Tab::Processes => return Some(Action::ToggleBlockProcess),
             Key::Char('d') if self.tab == Tab::Rules => return Some(Action::RemoveRule),
+            Key::Char('s') if self.tab == Tab::Rules => return Some(Action::SaveRules),
             Key::Enter if matches!(self.tab, Tab::Connections | Tab::Processes | Tab::Interfaces) => {
                 return Some(Action::StartCapture(self.tab));
             }
@@ -561,6 +564,7 @@ mod tests {
         app.on_key(Key::Char('5'));
         assert_eq!(app.tab, Tab::Rules);
         assert_eq!(app.on_key(Key::Char('d')), Some(Action::RemoveRule));
+        assert_eq!(app.on_key(Key::Char('s')), Some(Action::SaveRules));
         assert_eq!(app.on_key(Key::Char('b')), None);
         assert_eq!(app.on_key(Key::Enter), None);
         app.on_key(Key::Right);

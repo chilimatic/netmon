@@ -182,6 +182,11 @@ port = "8000-8100"         # or one number; without proto: tcp and udp
 - On any error (unsafe owner or mode, bad TOML, bad field) netmon names the
   line and the reason in the status line and starts without the file's
   rules.
+- `s` in the Rules tab writes every rule (file and UI) and the default back
+  to the file, in match order. It creates `/etc/netmon` (0755) if missing,
+  writes a temp file (0644) and renames it over the old one. Only the
+  `comment` fields are kept: other `#` comments of a hand-written file are
+  lost.
 
 ## Packet capture
 

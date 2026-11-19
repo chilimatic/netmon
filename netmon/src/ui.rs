@@ -95,7 +95,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     } else if app.tab == Tab::Capture {
         " q quit  ←→/1-5 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
     } else if app.tab == Tab::Rules {
-        " q quit  ←→/1-5 view  ↑↓ select  d remove rule   blocks end when netmon exits".to_string()
+        " q quit  ←→/1-5 view  ↑↓ select  d remove rule  s save to rules file   blocks end when netmon exits".to_string()
     } else {
         let block = match app.tab {
             Tab::Connections => "  b/B block ip/port",

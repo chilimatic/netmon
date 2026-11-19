@@ -87,6 +87,8 @@ struct Monitor<K: Kernel = Probe> {
     rules: Rules,
     /// Interface events. None: fall back to a rescan every 2 ticks.
     links: Option<LinkWatch>,
+    /// Where `s` in the Rules tab saves.
+    rules_path: std::path::PathBuf,
 }
 
 impl Monitor {
@@ -118,7 +120,7 @@ impl<K: Kernel> Monitor<K> {
         let mut names = Names::default();
         names.update(&ifs);
         let collector = Collector::new(args.expire_ticks());
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into() };
         Ok((mon, errors))
     }
 
@@ -314,6 +316,7 @@ impl<K: Kernel> Monitor<K> {
     /// of the file.
     fn load_rules_file(&mut self, args: &Args) -> Option<String> {
         let path = args.rules.clone().unwrap_or_else(|| rulefile::DEFAULT_PATH.into());
+        self.rules_path = path.clone();
         let fail = |e: String| Some(format!("rules file {}: {e}; no file rules loaded", path.display()));
         let text = match rulefile::read(&path, args.rules.is_some()) {
             Ok(Some(t)) => t,
@@ -434,6 +437,13 @@ impl<K: Kernel> Monitor<K> {
                     Some(r) if !r.exe.is_empty() => self.toggle_block(BlockTarget::Exe(r.exe.clone())),
                     Some(_) => "exe unknown for this process: block its remote address instead".into(),
                     None => "no process selected".into(),
+                };
+            }
+            Action::SaveRules => {
+                let path = &self.rules_path;
+                app.status = match rulefile::save(path, &rulefile::render(&self.rules)) {
+                    Ok(()) => format!("saved {} rules to {}", self.rules.rules.len(), path.display()),
+                    Err(e) => format!("save {} failed: {e}", path.display()),
                 };
             }
             Action::RemoveRule => {

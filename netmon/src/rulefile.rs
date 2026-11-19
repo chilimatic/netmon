@@ -4,16 +4,18 @@
 //! its directory.
 
 use std::{
-    io,
+    fmt::Write as _,
+    fs::{DirBuilder, OpenOptions},
+    io::{self, Write as _},
     net::IpAddr,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::Path,
 };
 
 use netmon_common::{IPPROTO_TCP, IPPROTO_UDP};
 use serde::Deserialize;
 
-use crate::rules::{Action, Dir, Match};
+use crate::rules::{Action, Dir, Match, Rules, proto_name};
 
 pub const DEFAULT_PATH: &str = "/etc/netmon/rules.toml";
 
@@ -197,6 +199,83 @@ fn network(s: &str) -> Result<(IpAddr, u8), String> {
     Ok((ip, len))
 }
 
+/// The rules as a rules file, in match order. Only `comment` fields
+/// survive; other `#` comments of a hand-written file are not kept.
+pub fn render(rules: &Rules) -> String {
+    let q = |s: &str| toml::Value::String(s.to_string()).to_string();
+    let mut out = String::from("# netmon rules, first match wins. Written by netmon.\n");
+    let _ = writeln!(out, "default = {}", q(&rules.default.to_string()));
+    for r in &rules.rules {
+        let m = &r.m;
+        let _ = write!(out, "\n[[rule]]\naction = {}\n", q(&r.action.to_string()));
+        if let Some(d) = m.dir {
+            let _ = writeln!(out, "direction = {}", q(if d == Dir::In { "in" } else { "out" }));
+        }
+        if let Some(p) = &m.exe {
+            let _ = writeln!(out, "process = {}", q(p));
+        }
+        if let Some((ip, len)) = m.net {
+            let max = if ip.is_ipv4() { 32 } else { 128 };
+            let net = if len == max { ip.to_string() } else { format!("{ip}/{len}") };
+            let _ = writeln!(out, "remote = {}", q(&net));
+        }
+        if let Some(p) = m.proto {
+            let _ = writeln!(out, "proto = {}", q(proto_name(p)));
+        }
+        match m.ports {
+            Some((lo, hi)) if lo == hi => {
+                let _ = writeln!(out, "port = {lo}");
+            }
+            Some((lo, hi)) => {
+                let _ = writeln!(out, "port = {}", q(&format!("{lo}-{hi}")));
+            }
+            None => {}
+        }
+        if !r.comment.is_empty() {
+            let _ = writeln!(out, "comment = {}", q(&r.comment));
+        }
+    }
+    out
+}
+
+/// Writes `text` to `path`: the directory is created (0755) if missing and
+/// must pass the same owner check as on load. The text goes to a new temp
+/// file (mode 0644, never through a symlink), is synced, then renamed over
+/// the file, so a crash leaves the old or the new file, never half of one.
+pub fn save(path: &Path, text: &str) -> Result<(), String> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if !dir.exists() {
+        DirBuilder::new().mode(0o755).create(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let meta = std::fs::metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if let Some(why) = unsafe_owner(meta.uid(), meta.mode()) {
+        return Err(format!("directory {} {why}", dir.display()));
+    }
+    write_atomic(dir, path, text)
+}
+
+fn write_atomic(dir: &Path, path: &Path, text: &str) -> Result<(), String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let r = (|| -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        // The umask may have narrowed the mode.
+        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r.map_err(|e| e.to_string())
+}
+
 fn mask(ip: IpAddr, len: u8) -> IpAddr {
     match ip {
         IpAddr::V4(a) => {
@@ -281,6 +360,41 @@ remote = "2001:db8::1"
         assert!(err("[[rule]]\naction = \"deny\"\nremote = \"1.2.3.4/33\"\n").contains("prefix"));
         assert!(err("[[rule]]\nremote = \"1.2.3.4\"\n").starts_with("line 1:"), "missing action");
         assert!(err("defaults = \"deny\"\n").starts_with("line 1:"), "unknown top-level key");
+    }
+
+    #[test]
+    fn render_round_trips() {
+        let mut rules = Rules::default();
+        rules.default = Action::Deny;
+        for f in parse(EXAMPLE).unwrap().rules {
+            rules.insert(usize::MAX, f.action, f.m, &f.comment).unwrap();
+        }
+        let m = Match { dir: Some(Dir::In), ports: Some((22, 22)), proto: Some(IPPROTO_TCP), ..Match::default() };
+        rules.insert(0, Action::Allow, m, "say \"hi\"\nnext line").unwrap();
+        let text = render(&rules);
+        let back = parse(&text).unwrap();
+        assert_eq!(back.default, Some(Action::Deny));
+        assert_eq!(back.rules.len(), rules.rules.len());
+        for (a, b) in back.rules.iter().zip(&rules.rules) {
+            assert_eq!((a.action, &a.m, &a.comment), (b.action, &b.m, &b.comment), "{text}");
+        }
+    }
+
+    #[test]
+    fn atomic_write_replaces_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("netmon-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules.toml");
+        write_atomic(&dir, &path, "a").unwrap();
+        write_atomic(&dir, &path, "b").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "b");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+        // Tests run as a normal user: save() refuses the user-owned dir.
+        assert!(save(&path, "c").unwrap_err().contains("not owned by root"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "b");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
