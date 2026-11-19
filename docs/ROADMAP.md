@@ -98,17 +98,8 @@ stable kernel API):
 
 ## Phase 2 – Block from the UI
 
-**Status (2026-11-18): in progress.** Step 1 (`77aff1e`) and step 2
-(`dba8c36`) done and tested live. Step 3 (process blocks) is committed as
-WIP and **not yet tested live**: run the step 3 checks below before
-building on it. Step 4 open.
-
-Step 3 live checks:
-1. `sudo ./target/release/netmon --once 2` prints no `exec tracking off`
-   warning.
-2. Processes tab: select `curl`, `b` turns the row red; a new
-   `curl -sI https://example.com` fails at once.
-3. Another client (`wget`) still works; `d` in Rules unblocks curl.
+**Status (2026-11-19): in progress.** Steps 1 (`77aff1e`), 2 (`dba8c36`)
+and 3 (`755c7c3`, process blocks by exe) done and tested live. Step 4 open.
 
 **Why.** The first firewall feature.
 
