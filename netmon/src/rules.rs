@@ -60,8 +60,6 @@ pub fn proto_name(p: u8) -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    // Built only by tests until the rules file (Phase 3 step 3).
-    #[allow(dead_code)]
     Allow,
     Deny,
 }
@@ -89,7 +87,7 @@ pub struct Match {
 }
 
 impl Match {
-    fn check(&self) -> Result<(), String> {
+    pub fn check(&self) -> Result<(), String> {
         if let Some(p) = &self.exe
             && (!p.starts_with('/') || p.len() >= MAX_EXE_PATH)
         {

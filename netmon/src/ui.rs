@@ -332,8 +332,9 @@ fn draw_rules(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
         f.render_widget(
             Paragraph::new(
                 "\n  No rules.\n\n  In Connections, b blocks the selected row's remote address and B its\n  \
-                 remote port; in Processes, b blocks the process's exe. Blocks end when netmon exits. Loopback, this SSH session and\n  \
-                 DNS to the resolvers in /etc/resolv.conf are never blocked.",
+                 remote port; in Processes, b blocks the process's exe. Blocks end when netmon exits.\n  \
+                 Rules that load at start go in /etc/netmon/rules.toml (see README). Loopback, this SSH\n  \
+                 session and DNS to the resolvers in /etc/resolv.conf are never blocked.",
             )
             .block(Block::new().borders(Borders::TOP)),
             area,

@@ -1,0 +1,261 @@
+//! The rules file, `/etc/netmon/rules.toml` by default. netmon runs as root,
+//! so whoever can write this file controls the firewall: it must belong to
+//! root and must not be writable by group or others, and the same holds for
+//! its directory.
+
+use std::{
+    io,
+    net::IpAddr,
+    os::unix::fs::MetadataExt,
+    path::Path,
+};
+
+use netmon_common::{IPPROTO_TCP, IPPROTO_UDP};
+use serde::Deserialize;
+
+use crate::rules::{Action, Match};
+
+pub const DEFAULT_PATH: &str = "/etc/netmon/rules.toml";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFile {
+    #[serde(default)]
+    rule: Vec<toml::Spanned<RawRule>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRule {
+    action: RawAction,
+    /// Absolute exe path.
+    process: Option<String>,
+    /// IP address or network in CIDR notation.
+    remote: Option<String>,
+    port: Option<RawPort>,
+    proto: Option<String>,
+    #[serde(default)]
+    comment: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawAction {
+    Allow,
+    Deny,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawPort {
+    One(u16),
+    /// "8000-8100" or "443".
+    Range(String),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct FileRule {
+    /// 1-based line of the rule's `[[rule]]` header.
+    pub line: usize,
+    pub action: Action,
+    pub m: Match,
+    pub comment: String,
+}
+
+/// Reads the file after checking who may write it. `Ok(None)`: the file
+/// does not exist and `required` is false.
+pub fn read(path: &Path, required: bool) -> Result<Option<String>, String> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !required => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if let Some(why) = unsafe_owner(meta.uid(), meta.mode()) {
+        return Err(format!("file {why}"));
+    }
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dmeta = std::fs::metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if let Some(why) = unsafe_owner(dmeta.uid(), dmeta.mode()) {
+        return Err(format!("directory {} {why}", dir.display()));
+    }
+    std::fs::read_to_string(path).map(Some).map_err(|e| e.to_string())
+}
+
+/// Why a file or directory with this owner and mode must not be trusted.
+fn unsafe_owner(uid: u32, mode: u32) -> Option<&'static str> {
+    if uid != 0 {
+        Some("is not owned by root")
+    } else if mode & 0o022 != 0 {
+        Some("is writable by group or others")
+    } else {
+        None
+    }
+}
+
+/// Parses the file. Errors name the line.
+pub fn parse(text: &str) -> Result<Vec<FileRule>, String> {
+    let raw: RawFile = toml::from_str(text).map_err(|e| {
+        let line = e.span().map(|s| line_of(text, s.start)).unwrap_or(0);
+        format!("line {line}: {}", e.message().trim())
+    })?;
+    raw.rule
+        .into_iter()
+        .map(|r| {
+            let line = line_of(text, r.span().start);
+            convert(r.into_inner()).map(|(action, m, comment)| FileRule { line, action, m, comment }).map_err(|e| format!("line {line}: {e}"))
+        })
+        .collect()
+}
+
+fn line_of(text: &str, offset: usize) -> usize {
+    text[..offset.min(text.len())].matches('\n').count() + 1
+}
+
+fn convert(r: RawRule) -> Result<(Action, Match, String), String> {
+    let action = match r.action {
+        RawAction::Allow => Action::Allow,
+        RawAction::Deny => Action::Deny,
+    };
+    let proto = match r.proto.as_deref() {
+        None => None,
+        Some("tcp") => Some(IPPROTO_TCP),
+        Some("udp") => Some(IPPROTO_UDP),
+        Some(p) => return Err(format!("proto {p:?}: use \"tcp\" or \"udp\"")),
+    };
+    let ports = match r.port {
+        None => None,
+        Some(RawPort::One(p)) => Some((p, p)),
+        Some(RawPort::Range(s)) => Some(port_range(&s)?),
+    };
+    let net = r.remote.as_deref().map(network).transpose()?;
+    let m = Match { net, proto, ports, exe: r.process };
+    m.check()?;
+    Ok((action, m, r.comment))
+}
+
+fn port_range(s: &str) -> Result<(u16, u16), String> {
+    let bad = || format!("port {s:?}: use a number or a range like \"8000-8100\"");
+    let (lo, hi) = s.split_once('-').unwrap_or((s, s));
+    let lo = lo.trim().parse().map_err(|_| bad())?;
+    let hi = hi.trim().parse().map_err(|_| bad())?;
+    Ok((lo, hi))
+}
+
+/// "1.2.3.4", "10.0.0.0/8", "2001:db8::/32". Host bits must be zero, so a
+/// typo like 10.1.0.0/8 is caught instead of silently widened.
+fn network(s: &str) -> Result<(IpAddr, u8), String> {
+    let (ip, len) = match s.split_once('/') {
+        Some((ip, len)) => (ip, Some(len)),
+        None => (s, None),
+    };
+    let ip: IpAddr = ip.trim().parse().map_err(|_| format!("remote {s:?}: not an IP address or network"))?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    let len = match len {
+        None => max,
+        Some(l) => match l.trim().parse::<u8>() {
+            Ok(l) if l <= max => l,
+            _ => return Err(format!("remote {s:?}: prefix must be 0-{max}")),
+        },
+    };
+    let masked = mask(ip, len);
+    if masked != ip {
+        return Err(format!("remote {s:?}: host bits set, did you mean {masked}/{len}?"));
+    }
+    Ok((ip, len))
+}
+
+fn mask(ip: IpAddr, len: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(a) => {
+            let m = u32::MAX.checked_shl(32 - len as u32).unwrap_or(0);
+            IpAddr::V4((u32::from(a) & m).into())
+        }
+        IpAddr::V6(a) => {
+            let m = u128::MAX.checked_shl(128 - len as u32).unwrap_or(0);
+            IpAddr::V6((u128::from(a) & m).into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EXAMPLE: &str = r#"
+# curl may reach HTTPS only.
+[[rule]]
+action = "allow"
+process = "/usr/bin/curl"
+proto = "tcp"
+port = 443
+comment = "web"
+
+[[rule]]
+action = "deny"
+process = "/usr/bin/curl"
+
+[[rule]]
+action = "deny"
+remote = "10.0.0.0/8"
+port = "8000-8100"
+
+[[rule]]
+action = "deny"
+remote = "2001:db8::1"
+"#;
+
+    #[test]
+    fn parses_rules_in_order() {
+        let r = parse(EXAMPLE).unwrap();
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[0].line, 3);
+        assert_eq!(r[0].action, Action::Allow);
+        assert_eq!(r[0].m.to_string(), "exe /usr/bin/curl tcp port 443");
+        assert_eq!(r[0].comment, "web");
+        assert_eq!(r[1].m.to_string(), "exe /usr/bin/curl");
+        assert_eq!(r[2].m.to_string(), "port 8000-8100 net 10.0.0.0/8");
+        assert_eq!(r[3].m.to_string(), "host 2001:db8::1");
+        assert!(parse("").unwrap().is_empty(), "empty file: no rules");
+    }
+
+    fn err(text: &str) -> String {
+        parse(text).unwrap_err()
+    }
+
+    #[test]
+    fn errors_name_the_line() {
+        assert!(err("[[rule]]\naction = \"drop\"\n").starts_with("line 2:"), "{}", err("[[rule]]\naction = \"drop\"\n"));
+        let e = err("[[rule]]\naction = \"deny\"\n\n[[rule]]\naction = \"deny\"\nremote = \"10.1.0.0/8\"\n");
+        assert!(e.starts_with("line 4:") && e.contains("10.0.0.0/8"), "{e}");
+        let e = err("[[rule]]\naction = \"deny\"\nproces = \"/bin/x\"\n");
+        assert!(e.starts_with("line 3:") && e.contains("proces"), "unknown key: {e}");
+        let e = err("[[rule]]\naction = \"deny\"\nprocess = \"curl\"\n");
+        assert!(e.starts_with("line 1:") && e.contains("absolute"), "{e}");
+        assert!(err("[[rule]]\naction = \"deny\"\nport = \"9-1\"\n").contains("port range"));
+        assert!(err("[[rule]]\naction = \"deny\"\nport = 0\n").contains("port range"));
+        assert!(err("[[rule]]\naction = \"deny\"\nport = 70000\n").starts_with("line 3:"));
+        assert!(err("[[rule]]\naction = \"deny\"\nproto = \"icmp\"\n").contains("tcp"));
+        assert!(err("[[rule]]\naction = \"deny\"\nremote = \"1.2.3.4/33\"\n").contains("prefix"));
+        assert!(err("[[rule]]\nremote = \"1.2.3.4\"\n").starts_with("line 1:"), "missing action");
+        assert!(err("default = \"deny\"\n").starts_with("line 1:"), "unknown top-level key");
+    }
+
+    #[test]
+    fn owner_and_mode_checks() {
+        assert_eq!(unsafe_owner(0, 0o100644), None);
+        assert_eq!(unsafe_owner(0, 0o040755), None);
+        assert!(unsafe_owner(1000, 0o100644).is_some());
+        assert!(unsafe_owner(0, 0o100664).is_some(), "group writable");
+        assert!(unsafe_owner(0, 0o040777).is_some(), "world writable dir");
+    }
+
+    #[test]
+    fn missing_file() {
+        let p = Path::new("/nonexistent/netmon/rules.toml");
+        assert_eq!(read(p, false), Ok(None));
+        assert!(read(p, true).is_err());
+    }
+}

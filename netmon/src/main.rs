@@ -6,6 +6,7 @@ mod ifaces;
 mod linkwatch;
 mod probe;
 mod procmap;
+mod rulefile;
 mod rules;
 mod text;
 mod ui;
@@ -43,6 +44,10 @@ struct Args {
     /// Sample for N seconds, print the connections once and exit (no TUI).
     #[arg(long, value_name = "SECONDS")]
     once: Option<u64>,
+    /// Rules file. Must belong to root and not be writable by group or
+    /// others. [default: /etc/netmon/rules.toml, skipped if missing]
+    #[arg(long, value_name = "PATH")]
+    rules: Option<std::path::PathBuf>,
 }
 
 impl Args {
@@ -92,6 +97,9 @@ impl Monitor {
         probe.set_guard(&guard_endpoints(ssh_connection().as_deref(), &resolv))?;
         let (mut mon, mut errors) = Monitor::with_kernel(probe, args)?;
         errors.extend(hook_errors);
+        if let Some(msg) = mon.load_rules_file(args) {
+            errors.push(msg);
+        }
         match LinkWatch::open() {
             Ok(w) => mon.links = Some(w),
             Err(e) => errors.push(format!("interface events off, polling instead: {e}")),
@@ -289,6 +297,35 @@ impl<K: Kernel> Monitor<K> {
                 format!("rule update failed: {e:#}")
             }
         }
+    }
+
+    /// Appends the rules of the rules file. Returns a status message, or
+    /// None when the default file does not exist. Any error loads no rule
+    /// of the file.
+    fn load_rules_file(&mut self, args: &Args) -> Option<String> {
+        let path = args.rules.clone().unwrap_or_else(|| rulefile::DEFAULT_PATH.into());
+        let fail = |e: String| Some(format!("rules file {}: {e}; no file rules loaded", path.display()));
+        let text = match rulefile::read(&path, args.rules.is_some()) {
+            Ok(Some(t)) => t,
+            Ok(None) => return None,
+            Err(e) => return fail(e),
+        };
+        let parsed = match rulefile::parse(&text) {
+            Ok(p) => p,
+            Err(e) => return fail(e),
+        };
+        let n = parsed.len();
+        let mut failed = false;
+        let msg = self.change_rules(|rules| {
+            for r in parsed {
+                rules.insert(usize::MAX, r.action, r.m, &r.comment).map_err(|e| {
+                    failed = true;
+                    format!("line {}: {e}", r.line)
+                })?;
+            }
+            Ok(format!("{n} rules from {}", path.display()))
+        });
+        if failed || msg.starts_with("rule update failed") { fail(msg) } else { Some(msg) }
     }
 
     /// Marks running processes of exes that rules name. The exec and fork
@@ -525,7 +562,7 @@ mod tests {
     use super::*;
 
     fn args(interval_ms: u64, expire_secs: u64) -> Args {
-        Args { interval_ms, expire_secs, once: None }
+        Args { interval_ms, expire_secs, once: None, rules: None }
     }
 
     #[test]
@@ -787,6 +824,23 @@ mod tests {
         app.on_key(crate::app::Key::Char('5'));
         m.handle(&mut app, Action::RemoveRule);
         assert!(m.probe.table.is_empty() && m.rules.rules.is_empty(), "{}", app.status);
+    }
+
+    #[test]
+    fn rules_file_owned_by_a_user_is_refused() {
+        let (mut m, _) = monitor();
+        let dir = std::env::temp_dir().join(format!("netmon-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rules.toml");
+        std::fs::write(&path, "[[rule]]\naction = \"deny\"\nport = 25\n").unwrap();
+        let a = Args { rules: Some(path.clone()), ..args(1000, 30) };
+        let msg = m.load_rules_file(&a).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Tests run as a normal user, so the file is not root's.
+        assert!(msg.contains("not owned by root") && msg.contains("no file rules loaded"), "{msg}");
+        assert!(m.rules.rules.is_empty());
+        let missing = Args { rules: Some(dir.join("gone.toml")), ..args(1000, 30) };
+        assert!(m.load_rules_file(&missing).unwrap().contains("no file rules loaded"), "explicit path must exist");
     }
 
     #[test]

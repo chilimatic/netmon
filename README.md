@@ -121,6 +121,49 @@ the kernel checks them in order for every packet.
 - Never blocked (lockout guard): loopback, the SSH session netmon runs in,
   and DNS (port 53) to the nameservers in `/etc/resolv.conf`.
 
+### Rules file
+
+At start netmon loads `/etc/netmon/rules.toml` (another file with
+`--rules PATH`). A missing default file is fine; a missing `--rules` file
+is an error. Rules keep their file order; blocks made in the UI go on top.
+
+```toml
+# curl may reach HTTPS only.
+[[rule]]
+action = "allow"
+process = "/usr/bin/curl"
+proto = "tcp"
+port = 443
+comment = "web"
+
+[[rule]]
+action = "deny"
+process = "/usr/bin/curl"
+
+[[rule]]
+action = "deny"
+remote = "10.0.0.0/8"      # or one address, IPv6 too
+port = "8000-8100"         # or one number; without proto: tcp and udp
+```
+
+- `action` is required. Every other field is optional and narrows the
+  match; a rule with only `action` matches all traffic.
+- `process` is an absolute exe path. Process names (`comm`) are not
+  accepted: any process can choose its own.
+- `remote` must not have host bits set (`10.1.0.0/8` is refused).
+- netmon runs as root, so whoever can write the file controls the
+  firewall. The file and its directory must belong to root and must not
+  be writable by group or others:
+
+  ```sh
+  sudo install -d -o root -g root -m 0755 /etc/netmon
+  sudo install -o root -g root -m 0644 rules.toml /etc/netmon/rules.toml
+  ```
+
+- On any error (unsafe owner or mode, bad TOML, bad field) netmon names the
+  line and the reason in the status line and starts without the file's
+  rules.
+
 ## Packet capture
 
 Select a row in **Connections**, **Processes** or **Interfaces** and press

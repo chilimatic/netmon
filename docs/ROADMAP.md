@@ -151,7 +151,7 @@ loopback, the SSH session and DNS to the local resolver.
 ## Phase 3 – Rule engine and rules file
 
 **Status (2026-11-19): in progress.** Step 1 (kernel rule table) done and
-tested live. Step 2 next.
+tested live. Step 2 (rules file) done and tested live. Step 3 next.
 
 **Why.** Blocks should survive a restart, be editable as text, and combine
 conditions ("curl may only reach port 443").
@@ -198,11 +198,13 @@ conditions ("curl may only reach port 443").
 1. **Kernel rule table.** Ordered table, matcher in common, hit counters,
    exe ids. UI blocks become one-field deny rules at the top. Behaviour of
    Phase 2 unchanged (same live checks).
-2. **Direction and default action.** `CONNS` state map, direction field,
-   default action, header shows `DEFAULT DENY`.
-3. **Rules file.** Load and validate `/etc/netmon/rules.toml` at startup:
+2. **Rules file.** Load and validate `/etc/netmon/rules.toml` at startup:
    ownership and mode check, TOML errors with line and reason, then netmon
    starts with no file rules. Rules tab shows action, fields, comment, hits.
+   (Swapped with direction: allow rules can only come from the file, and
+   default deny cannot be tested without them.)
+3. **Direction and default action.** `CONNS` state map, `direction` field
+   and top-level `default` in the file, header shows `DEFAULT DENY`.
 4. **Save.** `s` in the Rules tab writes the current rules (UI and file) to
    the file, atomically (temp file + rename), mode 0644 root.
 
