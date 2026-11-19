@@ -357,14 +357,15 @@ for its traffic on the host. Rules by address and port still apply.
 
 ## Phase 7 – Privileged daemon and unprivileged TUI
 
-**Status (2026-11-19): in progress.** Step 1 done (`532fed9`), step 2 done (`43eda25`), step 3 done. Step 4 next.
+**Status (2026-11-19): in progress.** Step 1 done (`532fed9`), step 2 done (`43eda25`), step 3 done (`fbdf6d1`), step 4 done. Step 5 next.
 
 **Why.** Rules must hold when the UI is closed, and the UI should not run as
 root.
 
 **Decisions (2026-11-19).**
-- **Rules survive a daemon crash.** Programs, links and maps are pinned
-  under `/sys/fs/bpf/netmon`. A crash or `kill -9` leaves the last rules
+- **Rules survive a daemon crash.** The links are pinned under
+  `/sys/fs/bpf/netmon`; a pinned link keeps its program and maps alive, so
+  programs and maps need no pins of their own. A crash or `kill -9` leaves the last rules
   enforced (including default deny/ask, with nobody to answer: asked
   connections stay dropped). Only `systemctl stop netmond` (clean exit)
   unpins and removes them. This replaces fail-open for the daemon; the
@@ -403,8 +404,9 @@ root.
    the same path in one process.
 3. **Daemon and socket.** `netmond`, JSON lines protocol, peer check,
    `netmon` client mode, capture stream and pcap in the client.
-4. **Pinning.** Pin programs/links/maps, crash survival, clean stop,
-   stale pins on start.
+4. **Pinning.** Pin the links, crash survival, clean stop, stale pins on
+   start. Before tcx (kernel < 6.6) TC filters are netlink filters, not
+   links: they stay on the interface after a crash by themselves.
 5. **systemd and install.** Unit file, group `netmon`, docs.
 
 **Acceptance.**

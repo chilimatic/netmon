@@ -82,11 +82,38 @@ sudo ./target/release/netmond             # add --rules PATH or --ask here
   writes the `.pcap` file, as your user, in its working directory.
 - When the last UI closes, the rules stay in force. In ask mode with no UI,
   questions time out after 30 s and the connections are denied.
-- `netmond` stops on `SIGTERM` or `Ctrl-C` and removes the socket. When it
-  stops (also after a crash), the kernel removes its programs, so no rule
-  is in force until it starts again.
-- If `netmond` crashed, the socket file stays. `netmon` then reports that
-  the daemon does not run. The next start of `netmond` replaces the file.
+- `netmond` stops on `SIGTERM` or `Ctrl-C`. Then it removes the socket and
+  all its programs: no rule is in force after a clean stop.
+
+#### Rules survive a crash
+
+`netmond` pins its links under `/sys/fs/bpf/netmon` (TC per interface,
+cgroup hooks, exec tracepoints). A pinned link stays attached when the
+process ends, and keeps its program and maps. So if `netmond` crashes or
+gets `kill -9`, **the last rules stay in force**:
+
+- Blocks and the default action stay. In ask mode, nobody answers: new
+  outbound connections that no rule decides are dropped until `netmond`
+  runs again.
+- Temporary rules (from `b`, or `a`/`d` in ask mode) stay too, until the
+  restart. The restart loads only the rules file.
+- Counting and hostnames stop: nothing reads the maps.
+
+To recover, start `netmond` again: it removes the old pins and attaches new
+programs, then loads the rules file. For a short time during that start no
+rule is in force. To remove the old rules without a start:
+
+```sh
+sudo rm -r /sys/fs/bpf/netmon
+```
+
+Check what is pinned with `sudo ls /sys/fs/bpf/netmon` and
+`sudo bpftool link list`. The local mode (`netmon --local`) pins nothing:
+when it ends, its rules end too.
+
+If the socket file stays after a crash, `netmon` reports that the daemon
+does not run. The next start of `netmond` replaces the file. A second
+`netmond` refuses to start while one runs.
 
 The wire format is one JSON object per line (`netmon/src/proto.rs`).
 

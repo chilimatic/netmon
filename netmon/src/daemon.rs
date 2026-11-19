@@ -30,6 +30,7 @@ use clap::Parser;
 use crate::{
     engine::Engine,
     monitor::{self, Monitor},
+    probe::PIN_DIR,
     proto::{self, Request, ToClient, ToDaemon},
 };
 
@@ -77,15 +78,23 @@ pub fn run() -> anyhow::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("netmond must run as root");
     }
-    let (mon, warnings) = Monitor::new(&args.monitor)?;
-    for w in &warnings {
-        eprintln!("warning: {w}");
-    }
     let gid = group_id(&args.group);
     if gid.is_none() {
         eprintln!("warning: group {} does not exist: only root can connect", args.group);
     }
+    // First the socket: it also makes sure no other netmond runs, whose
+    // pins the load below would remove.
     let listener = bind(&args.socket, gid)?;
+    let (mon, warnings) = match Monitor::new(&args.monitor, Some(Path::new(PIN_DIR))) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_file(&args.socket);
+            return Err(e);
+        }
+    };
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
     eprintln!("netmond: listening on {}", args.socket.display());
     for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         // SAFETY: the handler only stores to an atomic.
@@ -94,14 +103,17 @@ pub fn run() -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel();
     let count = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || accept(listener, gid, tx, count));
-    let engine = Engine::new(mon, args.monitor.interval());
-    let result = serve(engine, &rx, &warnings);
+    let mut engine = Engine::new(mon, args.monitor.interval());
+    let result = serve(&mut engine, &rx, &warnings);
+    // A clean stop: the kernel side goes with the process. Only a crash
+    // leaves the pins, and with them the rules.
+    engine.mon.probe.unpin();
     let _ = std::fs::remove_file(&args.socket);
-    eprintln!("netmond: stopped");
+    eprintln!("netmond: stopped, rules removed");
     result
 }
 
-fn serve(mut engine: Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> anyhow::Result<()> {
+fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> anyhow::Result<()> {
     let mut clients: HashMap<u64, SyncSender<Arc<str>>> = HashMap::new();
     while !STOP.load(Ordering::Relaxed) {
         match rx.recv_timeout(engine.wait().min(MAX_WAIT)) {

@@ -86,7 +86,7 @@ pub fn run() -> anyhow::Result<()> {
     let args = TuiArgs::parse();
     let remote = !args.local && std::fs::symlink_metadata(&args.socket).is_ok();
     if !remote {
-        let (mut mon, errors) = Monitor::new(&args.monitor)?;
+        let (mut mon, errors) = Monitor::new(&args.monitor, None)?;
         for e in &errors {
             eprintln!("warning: {e}");
         }

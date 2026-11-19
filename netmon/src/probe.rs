@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs::File,
     net::SocketAddr,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context as _, bail};
@@ -12,7 +13,9 @@ use aya::{
     Ebpf, EbpfLoader, include_bytes_aligned,
     maps::{Array, HashMap, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues, RingBuf},
     programs::{
-        CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType, TracePoint, tc,
+        CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType, TracePoint,
+        links::{FdLink, LinkError},
+        tc,
     },
     util::{KernelVersion, nr_cpus},
 };
@@ -79,6 +82,52 @@ pub struct Probe {
     failed: HashSet<u32>,
     /// Socket owner hooks that did not load or attach.
     pub hook_errors: Vec<String>,
+    /// Where the links are pinned, if they are (netmond).
+    pins: Option<PathBuf>,
+}
+
+/// Where netmond pins its links. A pinned link stays attached when the
+/// process ends, with its program and the maps the program uses: the
+/// rules stay in force after a crash. Removing the files detaches them.
+pub const PIN_DIR: &str = "/sys/fs/bpf/netmon";
+
+/// Magic number of the BPF file system (statfs f_type).
+const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
+
+fn is_bpffs(dir: &Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else { return false };
+    // SAFETY: valid C string and a zeroed statfs buffer.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as i64 == BPF_FS_MAGIC }
+}
+
+/// Removes pins left by an earlier run (a crash): their links detach.
+/// Then creates the empty pin directory. None if pins cannot be used.
+fn prepare_pins(dir: &Path) -> Result<PathBuf, String> {
+    let parent = dir.parent().unwrap_or(Path::new("/"));
+    if !is_bpffs(parent) {
+        return Err(format!("{} is not a BPF file system (mount -t bpf bpf {})", parent.display(), parent.display()));
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("remove old pins {}: {e}", dir.display())),
+    }
+    std::fs::create_dir(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    Ok(dir.to_path_buf())
+}
+
+/// Pins a link so it outlives the process. On failure the link is gone
+/// (detached): the caller reports the attach as failed.
+fn pin<L>(dir: &Path, name: &str, link: L) -> anyhow::Result<()>
+where
+    FdLink: TryFrom<L, Error = LinkError>,
+{
+    let path = dir.join(name);
+    // A stale file (reused interface index) would make the pin fail.
+    let _ = std::fs::remove_file(&path);
+    FdLink::try_from(link).context("link cannot be pinned")?.pin(&path).with_context(|| format!("pin {}", path.display()))?;
+    Ok(())
 }
 
 /// Root of the cgroup v2 tree. Hooks here see every process on the host.
@@ -87,7 +136,9 @@ const SOCK_HOOKS: [&str; 4] = ["sock_create", "post_bind4", "post_bind6", "sock_
 const SOCK_ADDR_HOOKS: [&str; 4] = ["connect4", "connect6", "sendmsg4", "sendmsg6"];
 
 impl Probe {
-    pub fn load() -> anyhow::Result<Self> {
+    /// Loads the programs. With `pin_dir`, every link is pinned there and
+    /// stays attached after the process ends, until `unpin`.
+    pub fn load(pin_dir: Option<&Path>) -> anyhow::Result<Self> {
         if EBPF_OBJ.is_empty() {
             bail!("binary was built with AYA_BUILD_SKIP=1 and has no eBPF object; rebuild without it");
         }
@@ -122,8 +173,17 @@ impl Probe {
         let exe_id_map = HashMap::try_from(take("EXE_IDS")?)?;
         let tgid_exe = HashMap::try_from(take("TGID_EXE")?)?;
         let trace_cfg = Array::try_from(take("TRACE_CFG")?)?;
-        let mut hook_errors = attach_owner_hooks(&mut ebpf);
-        hook_errors.extend(attach_exec_tracking(&mut ebpf, trace_cfg));
+        let mut hook_errors = Vec::new();
+        let pins = match pin_dir.map(prepare_pins) {
+            Some(Ok(d)) => Some(d),
+            Some(Err(e)) => {
+                hook_errors.push(format!("rules will not survive a crash: {e}"));
+                None
+            }
+            None => None,
+        };
+        hook_errors.extend(attach_owner_hooks(&mut ebpf, pins.as_deref()));
+        hook_errors.extend(attach_exec_tracking(&mut ebpf, trace_cfg, pins.as_deref()));
         Ok(Probe {
             ebpf,
             flows,
@@ -152,7 +212,21 @@ impl Probe {
             attached: HashSet::new(),
             failed: HashSet::new(),
             hook_errors,
+            pins,
         })
+    }
+
+    /// Removes the pins: every link detaches when this process ends (at
+    /// once for those it no longer holds). For a clean stop.
+    pub fn unpin(&mut self) {
+        if let Some(dir) = self.pins.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    fn tc_pin_name(ifindex: u32, ty: TcAttachType) -> String {
+        let side = if ty == TcAttachType::Ingress { "ingress" } else { "egress" };
+        format!("tc_{ifindex}_{side}")
     }
 
     fn attach(&mut self, iface: &Iface) -> anyhow::Result<()> {
@@ -170,7 +244,15 @@ impl Probe {
         }
         for (name, ty) in [("tc_ingress", TcAttachType::Ingress), ("tc_egress", TcAttachType::Egress)] {
             let prog: &mut SchedClassifier = self.ebpf.program_mut(name).context("program missing")?.try_into()?;
-            prog.attach(&iface.name, ty)?;
+            let id = prog.attach(&iface.name, ty)?;
+            // Before tcx (kernel 6.6) the attachment is a netlink filter:
+            // no link to pin, but it stays on the interface after a crash
+            // by itself.
+            if let Some(dir) = &self.pins
+                && !needs_clsact()
+            {
+                pin(dir, &Self::tc_pin_name(iface.index, ty), prog.take_link(id)?)?;
+            }
         }
         Ok(())
     }
@@ -222,7 +304,7 @@ impl Probe {
 /// `Single`, which sends flags 0. On older kernels aya falls back to
 /// BPF_PROG_ATTACH, where `Single` would fail if another program is there:
 /// that case shows up as a hook warning.
-fn attach_owner_hooks(ebpf: &mut Ebpf) -> Vec<String> {
+fn attach_owner_hooks(ebpf: &mut Ebpf, pins: Option<&Path>) -> Vec<String> {
     let cgroup = match File::open(CGROUP_ROOT) {
         Ok(f) => f,
         Err(e) => return vec![format!("owner hooks off: open {CGROUP_ROOT}: {e}")],
@@ -232,7 +314,10 @@ fn attach_owner_hooks(ebpf: &mut Ebpf) -> Vec<String> {
         let r = (|| -> anyhow::Result<()> {
             let prog: &mut CgroupSock = ebpf.program_mut(name).context("missing")?.try_into()?;
             prog.load()?;
-            prog.attach(&cgroup, CgroupAttachMode::Single)?;
+            let id = prog.attach(&cgroup, CgroupAttachMode::Single)?;
+            if let Some(dir) = pins {
+                pin(dir, name, prog.take_link(id)?)?;
+            }
             Ok(())
         })();
         if let Err(e) = r {
@@ -243,7 +328,10 @@ fn attach_owner_hooks(ebpf: &mut Ebpf) -> Vec<String> {
         let r = (|| -> anyhow::Result<()> {
             let prog: &mut CgroupSockAddr = ebpf.program_mut(name).context("missing")?.try_into()?;
             prog.load()?;
-            prog.attach(&cgroup, CgroupAttachMode::Single)?;
+            let id = prog.attach(&cgroup, CgroupAttachMode::Single)?;
+            if let Some(dir) = pins {
+                pin(dir, name, prog.take_link(id)?)?;
+            }
             Ok(())
         })();
         if let Err(e) = r {
@@ -274,7 +362,7 @@ fn event_format(event: &str) -> std::io::Result<String> {
 /// Attaches the exec and fork tracepoints that keep TGID_EXE current.
 /// Without them exe rules still work through the /proc scan, but a new
 /// process can connect before the next refresh.
-fn attach_exec_tracking(ebpf: &mut Ebpf, mut cfg_map: Array<MapData, TraceCfg>) -> Vec<String> {
+fn attach_exec_tracking(ebpf: &mut Ebpf, mut cfg_map: Array<MapData, TraceCfg>, pins: Option<&Path>) -> Vec<String> {
     let r = (|| -> anyhow::Result<()> {
         let exec = event_format("sched_process_exec").context("read sched_process_exec format")?;
         let fork = event_format("sched_process_fork").context("read sched_process_fork format")?;
@@ -286,7 +374,10 @@ fn attach_exec_tracking(ebpf: &mut Ebpf, mut cfg_map: Array<MapData, TraceCfg>) 
         for name in ["sched_process_exec", "sched_process_fork"] {
             let prog: &mut TracePoint = ebpf.program_mut(name).context("missing")?.try_into()?;
             prog.load()?;
-            prog.attach("sched", name)?;
+            let id = prog.attach("sched", name)?;
+            if let Some(dir) = pins {
+                pin(dir, name, prog.take_link(id)?)?;
+            }
         }
         Ok(())
     })();
@@ -364,6 +455,12 @@ impl Kernel for Probe {
         // with their L3 offset.
         for gone in self.attached.iter().chain(&self.failed).filter(|i| !live.contains(i)) {
             let _ = self.l3_offset.remove(gone);
+            // The kernel detached the links with the device.
+            if let Some(dir) = &self.pins {
+                for ty in [TcAttachType::Ingress, TcAttachType::Egress] {
+                    let _ = std::fs::remove_file(dir.join(Self::tc_pin_name(*gone, ty)));
+                }
+            }
         }
         self.attached.retain(|i| live.contains(i));
         self.failed.retain(|i| live.contains(i));
@@ -561,6 +658,15 @@ impl Kernel for Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pins_only_on_bpffs() {
+        let dir = std::env::temp_dir().join(format!("netmon-pins-{}", std::process::id()));
+        let e = prepare_pins(&dir.join("netmon")).unwrap_err();
+        assert!(e.contains("is not a BPF file system"), "{e}");
+        assert!(!dir.join("netmon").exists(), "nothing created");
+        assert!(!is_bpffs(Path::new("/proc")));
+    }
 
     #[test]
     fn flow_map_shrinks_with_cpus() {

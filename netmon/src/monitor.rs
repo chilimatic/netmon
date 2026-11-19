@@ -150,12 +150,23 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
 }
 
 impl Monitor {
-    pub(crate) fn new(args: &Args) -> anyhow::Result<(Self, Vec<String>)> {
-        let mut probe = Probe::load()?;
+    /// With `pin_dir` (netmond) the kernel side stays in force after the
+    /// process ends, until `Probe::unpin`.
+    pub(crate) fn new(args: &Args, pin_dir: Option<&std::path::Path>) -> anyhow::Result<(Self, Vec<String>)> {
+        let mut probe = Probe::load(pin_dir)?;
         let hook_errors = probe.hook_errors.clone();
         let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-        probe.set_guard(&guard_endpoints(ssh_connection().as_deref(), &resolv))?;
-        let (mut mon, mut errors) = Monitor::with_kernel(probe, args)?;
+        if let Err(e) = probe.set_guard(&guard_endpoints(ssh_connection().as_deref(), &resolv)) {
+            probe.unpin();
+            return Err(e);
+        }
+        let (mut mon, mut errors) = match Monitor::with_kernel(probe, args) {
+            Ok(m) => m,
+            Err((mut probe, e)) => {
+                probe.unpin();
+                return Err(e);
+            }
+        };
         errors.extend(hook_errors);
         if let Some(msg) = mon.load_rules_file(args) {
             errors.push(msg);
@@ -178,11 +189,12 @@ impl Monitor {
 }
 
 impl<K: Kernel> Monitor<K> {
-    pub(crate) fn with_kernel(mut probe: K, args: &Args) -> anyhow::Result<(Self, Vec<String>)> {
+    /// Gives the kernel side back on error, so the caller can clean up.
+    pub(crate) fn with_kernel(mut probe: K, args: &Args) -> Result<(Self, Vec<String>), (K, anyhow::Error)> {
         let ifs = ifaces::list();
         let errors = probe.attach_new(&ifs);
         if probe.attached_count() == 0 {
-            anyhow::bail!("could not attach to any interface: {}", errors.join("; "));
+            return Err((probe, anyhow::anyhow!("could not attach to any interface: {}", errors.join("; "))));
         }
         let mut names = Names::default();
         names.update(&ifs);
@@ -895,7 +907,7 @@ mod tests {
             fail_block: false,
             marked: Vec::new(),
         };
-        let (mut m, _) = Monitor::with_kernel(fake, &args(1000, 30)).unwrap();
+        let (mut m, _) = Monitor::with_kernel(fake, &args(1000, 30)).unwrap_or_else(|(_, e)| panic!("{e}"));
         let t0 = Instant::now();
         m.last = t0;
         (m, t0)
