@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 use crate::{
-    rules::Rules,
+    rules::{Action, Rules},
     app::{App, RowId, Sort, Tab, human},
     capture::Capture,
     decode::hexdump,
@@ -54,7 +54,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             rate(tx),
             rate(rx),
             c.flows.len(),
-            if rules.rules.is_empty() { String::new() } else { format!("  BLOCKING {} rules", rules.rules.len()) },
+            if rules.rules.is_empty() { String::new() } else { format!("  RULES {}", rules.rules.len()) },
             paused,
             capturing,
             app.status
@@ -294,7 +294,7 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, rules:
     let table = Table::new(
         rows.into_iter().map(|r| {
             let remote = addr(r.key.family, &r.key.remote_addr, r.key.remote_port);
-            let blocked = rules.matching(r.key.proto, remote, &r.exe).is_some();
+            let blocked = rules.denies(r.key.proto, remote, &r.exe);
             let style = if blocked { Style::new().fg(Color::Red) } else { Style::new() };
             Row::new(vec![
                 Cell::from(r.process),
@@ -331,7 +331,7 @@ fn draw_rules(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
     if rules.rules.is_empty() {
         f.render_widget(
             Paragraph::new(
-                "\n  No blocks.\n\n  In Connections, b blocks the selected row's remote address and B its\n  \
+                "\n  No rules.\n\n  In Connections, b blocks the selected row's remote address and B its\n  \
                  remote port; in Processes, b blocks the process's exe. Blocks end when netmon exits. Loopback, this SSH session and\n  \
                  DNS to the resolvers in /etc/resolv.conf are never blocked.",
             )
@@ -342,17 +342,20 @@ fn draw_rules(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
     }
     let ids: Vec<RowId> = rules.rules.iter().map(|r| RowId::Rule(r.id)).collect();
     let table = Table::new(
-        rules.rules.iter().map(|r| {
+        rules.rules.iter().enumerate().map(|(i, r)| {
+            let color = if r.action == Action::Deny { Color::Red } else { Color::Green };
             Row::new(vec![
-                Cell::from(r.id.to_string()),
-                Cell::from(r.target.to_string()),
-                Cell::from(Line::from(r.drops.to_string()).right_aligned()),
+                Cell::from((i + 1).to_string()),
+                Cell::from(r.action.to_string()),
+                Cell::from(r.m.to_string()),
+                Cell::from(r.comment.clone()),
+                Cell::from(Line::from(r.hits.to_string()).right_aligned()),
             ])
-            .style(Style::new().fg(Color::Red))
+            .style(Style::new().fg(color))
         }),
-        [Constraint::Length(5), Constraint::Fill(1), Constraint::Length(12)],
+        [Constraint::Length(4), Constraint::Length(6), Constraint::Fill(2), Constraint::Fill(1), Constraint::Length(12)],
     )
-    .header(header_row(&["Rule", "Block", "Drops"]));
+    .header(header_row(&["#", "Action", "Match", "Comment", "Hits"]));
     render_table(f, app, table, &ids, area);
 }
 
@@ -365,7 +368,7 @@ fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, rules: &Rules, area: 
     let ids: Vec<RowId> = rows.iter().map(|r| r.id()).collect();
     let table = Table::new(
         rows.into_iter().map(|r| {
-            let blocked = !r.exe.is_empty() && rules.exes().any(|(p, _)| p == r.exe);
+            let blocked = rules.denies_exe(&r.exe);
             let style = if blocked { Style::new().fg(Color::Red) } else { Style::new() };
             Row::new(vec![
                 Cell::from(r.process),
@@ -547,20 +550,20 @@ mod tests {
         k.remote_addr[..4].copy_from_slice(&[1, 1, 1, 1]);
         c.ingest([(k, FlowStats { tx_bytes: 5, ..Default::default() })], 1.0);
         let mut rules = Rules::default();
-        rules.add(BlockTarget::host("1.1.1.1".parse().unwrap())).unwrap();
-        rules.rules[0].drops = 42;
+        rules.block(BlockTarget::host("1.1.1.1".parse().unwrap())).unwrap();
+        rules.rules[0].hits = 42;
         let mut app = App { show_graph: false, ..App::default() };
         let mut term = Terminal::new(TestBackend::new(120, 10)).unwrap();
         term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &rules)).unwrap();
         let buf = term.backend().buffer();
         let row = (0..10).find(|y| (0..120).map(|x| buf[(x, *y)].symbol()).collect::<String>().contains("1.1.1.1:443")).unwrap();
         assert_eq!(buf[(0, row)].fg, Color::Red, "blocked row is red");
-        assert!(screen(&term).contains("BLOCKING 1 rules"));
+        assert!(screen(&term).contains("RULES 1"));
         app.tab = Tab::Rules;
         term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &rules)).unwrap();
         let s = screen(&term);
         println!("{s}");
-        assert!(s.contains("host 1.1.1.1") && s.contains("42"));
+        assert!(s.contains("deny") && s.contains("host 1.1.1.1") && s.contains("42"));
     }
 }
 

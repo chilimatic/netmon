@@ -1,15 +1,21 @@
-//! Block rules held by netmon. They live in the kernel maps only while
-//! netmon runs (fail-open: quitting or a crash removes every block).
+//! Rules held by netmon: an ordered list, first match wins. They live in
+//! the kernel's rule table only while netmon runs (fail-open: quitting or a
+//! crash removes every rule).
 
 use std::{
+    collections::BTreeMap,
     fmt,
     net::{IpAddr, SocketAddr},
 };
 
-use netmon_common::{IPPROTO_TCP, IPPROTO_UDP, MAX_RULES};
+use netmon_common::{
+    ACTION_ALLOW, ACTION_DENY, DIR_OUT, IPPROTO_TCP, IPPROTO_UDP, MAX_EXE_PATH, MAX_RULES, RULE_EXE, RULE_NET,
+    RULE_PORT, RULE_PROTO, RuleEntry, rule_matches,
+};
 
 use crate::procmap::normalize;
 
+/// What the UI blocks with one key: a one-field deny rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockTarget {
     /// Remote network: address and prefix length.
@@ -26,27 +32,21 @@ impl BlockTarget {
         let ip = normalize(SocketAddr::new(ip, 0)).ip();
         BlockTarget::Net(ip, if ip.is_ipv4() { 32 } else { 128 })
     }
+}
 
-    /// Does traffic to `remote` with `proto` of a process running `exe`
-    /// match?
-    pub fn matches(&self, proto: u8, remote: SocketAddr, exe: &str) -> bool {
-        let remote = normalize(remote);
-        match self {
-            BlockTarget::Net(net, len) => in_net(remote.ip(), *net, *len),
-            BlockTarget::Port(p, port) => *p == proto && *port == remote.port(),
-            BlockTarget::Exe(path) => !exe.is_empty() && path == exe,
+impl From<BlockTarget> for Match {
+    fn from(t: BlockTarget) -> Match {
+        match t {
+            BlockTarget::Net(ip, len) => Match { net: Some((ip, len)), ..Match::default() },
+            BlockTarget::Port(p, port) => Match { proto: Some(p), ports: Some((port, port)), ..Match::default() },
+            BlockTarget::Exe(path) => Match { exe: Some(path), ..Match::default() },
         }
     }
 }
 
 impl fmt::Display for BlockTarget {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            BlockTarget::Net(ip, len) if *len == if ip.is_ipv4() { 32 } else { 128 } => write!(f, "host {ip}"),
-            BlockTarget::Net(ip, len) => write!(f, "net {ip}/{len}"),
-            BlockTarget::Port(p, port) => write!(f, "{} port {port}", proto_name(*p)),
-            BlockTarget::Exe(path) => write!(f, "exe {path}"),
-        }
+        Match::from(self.clone()).fmt(f)
     }
 }
 
@@ -58,88 +58,242 @@ pub fn proto_name(p: u8) -> &'static str {
     }
 }
 
-fn in_net(ip: IpAddr, net: IpAddr, len: u8) -> bool {
-    match (ip, net) {
-        (IpAddr::V4(a), IpAddr::V4(n)) => {
-            let mask = u32::MAX.checked_shl(32 - len as u32).unwrap_or(0);
-            u32::from(a) & mask == u32::from(n) & mask
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    // Built only by tests until the rules file (Phase 3 step 3).
+    #[allow(dead_code)]
+    Allow,
+    Deny,
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Action::Allow => "allow",
+            Action::Deny => "deny",
+        })
+    }
+}
+
+/// The conditions of a rule. Unset fields match anything; an empty match
+/// matches all traffic.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Match {
+    /// Remote network: address and prefix length.
+    pub net: Option<(IpAddr, u8)>,
+    pub proto: Option<u8>,
+    /// Remote port range, inclusive.
+    pub ports: Option<(u16, u16)>,
+    /// Absolute exe path of the local process.
+    pub exe: Option<String>,
+}
+
+impl Match {
+    fn check(&self) -> Result<(), String> {
+        if let Some(p) = &self.exe
+            && (!p.starts_with('/') || p.len() >= MAX_EXE_PATH)
+        {
+            return Err(format!("exe {p:?}: needs an absolute path under {MAX_EXE_PATH} bytes"));
         }
-        (IpAddr::V6(a), IpAddr::V6(n)) => {
-            let mask = u128::MAX.checked_shl(128 - len as u32).unwrap_or(0);
-            u128::from(a) & mask == u128::from(n) & mask
+        if let Some((ip, len)) = self.net {
+            let max = if ip.is_ipv4() { 32 } else { 128 };
+            if len > max {
+                return Err(format!("prefix /{len} too long for {ip}"));
+            }
         }
-        _ => false,
+        if let Some((lo, hi)) = self.ports
+            && (lo == 0 || lo > hi)
+        {
+            return Err(format!("bad port range {lo}-{hi}"));
+        }
+        if let Some(p) = self.proto
+            && p != IPPROTO_TCP
+            && p != IPPROTO_UDP
+        {
+            return Err(format!("protocol {p} not supported (tcp or udp)"));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Match {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut parts = Vec::new();
+        if let Some(p) = &self.exe {
+            parts.push(format!("exe {p}"));
+        }
+        match (self.proto, self.ports) {
+            (Some(p), Some((lo, hi))) if lo == hi => parts.push(format!("{} port {lo}", proto_name(p))),
+            (Some(p), Some((lo, hi))) => parts.push(format!("{} port {lo}-{hi}", proto_name(p))),
+            (Some(p), None) => parts.push(proto_name(p).to_string()),
+            (None, Some((lo, hi))) if lo == hi => parts.push(format!("port {lo}")),
+            (None, Some((lo, hi))) => parts.push(format!("port {lo}-{hi}")),
+            (None, None) => {}
+        }
+        match self.net {
+            Some((ip, len)) if len == if ip.is_ipv4() { 32 } else { 128 } => parts.push(format!("host {ip}")),
+            Some((ip, len)) => parts.push(format!("net {ip}/{len}")),
+            None => {}
+        }
+        if parts.is_empty() {
+            return f.write_str("all traffic");
+        }
+        f.write_str(&parts.join(" "))
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
-    /// Index into the kernel's per-rule drop counters.
+    /// Stable id for the UI. Not the kernel slot: that is the position.
     pub id: u32,
-    pub target: BlockTarget,
-    /// Packets dropped and socket calls denied.
-    pub drops: u64,
+    pub action: Action,
+    pub m: Match,
+    pub comment: String,
+    /// Packets and socket calls matched, over the whole run.
+    pub hits: u64,
+    /// Hits before the kernel table was last rewritten.
+    pub hits_base: u64,
 }
 
-#[derive(Default)]
+impl fmt::Display for Rule {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{} {}", self.action, self.m)
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct Rules {
+    /// In match order.
     pub rules: Vec<Rule>,
+    /// Exe path -> exe id in the kernel, for every exe named by a rule.
+    /// Ids are never reused, so a stale process mark can never name
+    /// another exe.
+    exe_ids: BTreeMap<String, u32>,
+    next_exe_id: u32,
+    next_id: u32,
 }
 
 impl Rules {
-    /// Adds a rule. Returns its id, or an error when it exists or the
-    /// table is full.
-    pub fn add(&mut self, target: BlockTarget) -> Result<u32, String> {
-        if let BlockTarget::Exe(p) = &target
-            && (!p.starts_with('/') || p.len() >= netmon_common::MAX_EXE_PATH)
+    /// Inserts a rule at position `at` (clamped). Returns its id.
+    pub fn insert(&mut self, at: usize, action: Action, m: Match, comment: &str) -> Result<u32, String> {
+        m.check()?;
+        if self.rules.iter().any(|r| r.action == action && r.m == m) {
+            return Err(format!("{action} {m} already exists"));
+        }
+        if self.rules.len() >= MAX_RULES as usize {
+            return Err(format!("rule limit {MAX_RULES} reached"));
+        }
+        if let Some(p) = &m.exe
+            && !self.exe_ids.contains_key(p)
         {
-            return Err(format!("cannot block exe {p:?}: needs an absolute path under 256 bytes"));
+            self.next_exe_id += 1;
+            self.exe_ids.insert(p.clone(), self.next_exe_id);
         }
-        if self.rules.iter().any(|r| r.target == target) {
-            return Err(format!("{target} is already blocked"));
-        }
-        let id = (0..MAX_RULES)
-            .find(|id| self.rules.iter().all(|r| r.id != *id))
-            .ok_or_else(|| format!("rule limit {MAX_RULES} reached"))?;
-        self.rules.push(Rule { id, target, drops: 0 });
+        let id = self.next_id;
+        self.next_id += 1;
+        let rule = Rule { id, action, m, comment: comment.to_string(), hits: 0, hits_base: 0 };
+        self.rules.insert(at.min(self.rules.len()), rule);
         Ok(id)
+    }
+
+    /// A UI block: a deny rule on top, so it wins over every other rule.
+    pub fn block(&mut self, target: BlockTarget) -> Result<u32, String> {
+        self.insert(0, Action::Deny, target.into(), "")
+    }
+
+    /// The deny rule with exactly this one-field match.
+    pub fn find_block(&self, target: &BlockTarget) -> Option<&Rule> {
+        let m = Match::from(target.clone());
+        self.rules.iter().find(|r| r.action == Action::Deny && r.m == m)
     }
 
     pub fn remove(&mut self, id: u32) -> Option<Rule> {
         let i = self.rules.iter().position(|r| r.id == id)?;
-        Some(self.rules.remove(i))
+        let rule = self.rules.remove(i);
+        if let Some(p) = &rule.m.exe
+            && !self.rules.iter().any(|r| r.m.exe.as_ref() == Some(p))
+        {
+            self.exe_ids.remove(p);
+        }
+        Some(rule)
     }
 
-    /// The first rule that blocks traffic to `remote` by a process running
-    /// `exe` ("" if unknown).
-    pub fn matching(&self, proto: u8, remote: SocketAddr, exe: &str) -> Option<&Rule> {
-        self.rules.iter().find(|r| r.target.matches(proto, remote, exe))
+    /// Exe path -> exe id of every exe named by a rule.
+    pub fn exe_ids(&self) -> &BTreeMap<String, u32> {
+        &self.exe_ids
     }
 
-    /// Exe path -> rule id of every process block.
-    pub fn exes(&self) -> impl Iterator<Item = (&str, u32)> {
-        self.rules.iter().filter_map(|r| match &r.target {
-            BlockTarget::Exe(p) => Some((p.as_str(), r.id)),
-            _ => None,
-        })
+    /// The kernel table, in match order.
+    pub fn entries(&self) -> Vec<RuleEntry> {
+        self.rules.iter().map(|r| self.entry(r)).collect()
     }
 
-    /// The rule with exactly this target.
-    pub fn find(&self, target: &BlockTarget) -> Option<&Rule> {
-        self.rules.iter().find(|r| r.target == *target)
+    fn entry(&self, r: &Rule) -> RuleEntry {
+        let mut e = RuleEntry {
+            action: if r.action == Action::Deny { ACTION_DENY } else { ACTION_ALLOW },
+            ..RuleEntry::default()
+        };
+        if let Some((ip, len)) = r.m.net {
+            e.fields |= RULE_NET;
+            (e.family, e.addr) = addr_bytes(ip);
+            e.prefix = len;
+        }
+        if let Some(p) = r.m.proto {
+            e.fields |= RULE_PROTO;
+            e.proto = p;
+        }
+        if let Some((lo, hi)) = r.m.ports {
+            e.fields |= RULE_PORT;
+            (e.port_lo, e.port_hi) = (lo, hi);
+        }
+        if let Some(p) = &r.m.exe {
+            e.fields |= RULE_EXE;
+            e.exe = self.exe_ids.get(p).copied().unwrap_or(0);
+        }
+        e
+    }
+
+    /// The first rule that matches outgoing traffic to `remote` by a process
+    /// running `exe` ("" if unknown), with the kernel's match logic.
+    pub fn first_match(&self, proto: u8, remote: SocketAddr, exe: &str) -> Option<&Rule> {
+        let remote = normalize(remote);
+        let (family, addr) = addr_bytes(remote.ip());
+        let exe = self.exe_ids.get(exe).copied().unwrap_or(0);
+        self.rules.iter().find(|r| rule_matches(&self.entry(r), family, &addr, proto, remote.port(), exe, DIR_OUT))
+    }
+
+    /// Is this traffic denied?
+    pub fn denies(&self, proto: u8, remote: SocketAddr, exe: &str) -> bool {
+        self.first_match(proto, remote, exe).is_some_and(|r| r.action == Action::Deny)
+    }
+
+    /// Does a deny rule name this exe?
+    pub fn denies_exe(&self, exe: &str) -> bool {
+        !exe.is_empty() && self.rules.iter().any(|r| r.action == Action::Deny && r.m.exe.as_deref() == Some(exe))
     }
 }
 
-/// Groups running processes by blocked exe: rule id -> pids.
-pub fn pids_by_exe(running: impl Iterator<Item = (u32, String)>, exes: &[(String, u32)]) -> Vec<(u32, Vec<u32>)> {
-    let mut out: Vec<(u32, Vec<u32>)> = exes.iter().map(|(_, id)| (*id, Vec::new())).collect();
+/// Address family (4 or 6) and the address bytes, IPv4 in the first 4.
+pub fn addr_bytes(ip: IpAddr) -> (u8, [u8; 16]) {
+    let mut b = [0u8; 16];
+    match ip {
+        IpAddr::V4(v4) => {
+            b[..4].copy_from_slice(&v4.octets());
+            (4, b)
+        }
+        IpAddr::V6(v6) => (6, v6.octets()),
+    }
+}
+
+/// Groups running processes by the exes rules name: exe id -> pids.
+pub fn pids_by_exe(running: impl Iterator<Item = (u32, String)>, exes: &BTreeMap<String, u32>) -> Vec<(u32, Vec<u32>)> {
+    let mut out: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for (pid, exe) in running {
-        if let Some(i) = exes.iter().position(|(p, _)| *p == exe) {
-            out[i].1.push(pid);
+        if let Some(id) = exes.get(&exe) {
+            out.entry(*id).or_default().push(pid);
         }
     }
-    out.retain(|(_, pids)| !pids.is_empty());
-    out
+    out.into_iter().collect()
 }
 
 /// Endpoints that are never blocked: the SSH client of the session netmon
@@ -179,22 +333,35 @@ mod tests {
     }
 
     #[test]
-    fn targets_match() {
-        let host = BlockTarget::host("1.1.1.1".parse().unwrap());
-        assert!(host.matches(IPPROTO_TCP, sa("1.1.1.1:443"), ""));
-        assert!(host.matches(IPPROTO_UDP, sa("[::ffff:1.1.1.1]:53"), ""), "mapped v4");
-        assert!(!host.matches(IPPROTO_TCP, sa("1.1.1.2:443"), ""));
-        let net = BlockTarget::Net("10.0.0.0".parse().unwrap(), 8);
-        assert!(net.matches(IPPROTO_TCP, sa("10.200.3.4:1"), ""));
-        assert!(!net.matches(IPPROTO_TCP, sa("11.0.0.1:1"), ""));
-        let v6 = BlockTarget::Net("2001:db8::".parse().unwrap(), 32);
-        assert!(v6.matches(IPPROTO_TCP, sa("[2001:db8:1::5]:80"), ""));
-        assert!(!v6.matches(IPPROTO_TCP, sa("1.1.1.1:80"), ""));
-        let all = BlockTarget::Net("0.0.0.0".parse().unwrap(), 0);
-        assert!(all.matches(IPPROTO_TCP, sa("8.8.8.8:1"), ""));
-        let port = BlockTarget::Port(IPPROTO_TCP, 25);
-        assert!(port.matches(IPPROTO_TCP, sa("9.9.9.9:25"), ""));
-        assert!(!port.matches(IPPROTO_UDP, sa("9.9.9.9:25"), ""));
+    fn blocks_match() {
+        let mut r = Rules::default();
+        r.block(BlockTarget::host("1.1.1.1".parse().unwrap())).unwrap();
+        assert!(r.denies(IPPROTO_TCP, sa("1.1.1.1:443"), ""));
+        assert!(r.denies(IPPROTO_UDP, sa("[::ffff:1.1.1.1]:53"), ""), "mapped v4");
+        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.2:443"), ""));
+        r.block(BlockTarget::Net("10.0.0.0".parse().unwrap(), 8)).unwrap();
+        assert!(r.denies(IPPROTO_TCP, sa("10.200.3.4:1"), ""));
+        assert!(!r.denies(IPPROTO_TCP, sa("11.0.0.1:1"), ""));
+        r.block(BlockTarget::Net("2001:db8::".parse().unwrap(), 32)).unwrap();
+        assert!(r.denies(IPPROTO_TCP, sa("[2001:db8:1::5]:80"), ""));
+        r.block(BlockTarget::Port(IPPROTO_TCP, 25)).unwrap();
+        assert!(r.denies(IPPROTO_TCP, sa("9.9.9.9:25"), ""));
+        assert!(!r.denies(IPPROTO_UDP, sa("9.9.9.9:25"), ""));
+    }
+
+    #[test]
+    fn first_match_wins() {
+        let mut r = Rules::default();
+        let curl = || Match { exe: Some("/usr/bin/curl".into()), ..Match::default() };
+        r.insert(9, Action::Deny, curl(), "").unwrap();
+        // Inserted above the deny: curl may reach port 443 only.
+        r.insert(0, Action::Allow, Match { ports: Some((443, 443)), proto: Some(IPPROTO_TCP), ..curl() }, "web")
+            .unwrap();
+        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.1:443"), "/usr/bin/curl"));
+        assert_eq!(r.first_match(IPPROTO_TCP, sa("1.1.1.1:443"), "/usr/bin/curl").unwrap().comment, "web");
+        assert!(r.denies(IPPROTO_TCP, sa("1.1.1.1:80"), "/usr/bin/curl"));
+        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.1:80"), "/usr/bin/wget"));
+        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.1:80"), ""), "unknown exe never matches");
     }
 
     #[test]
@@ -202,27 +369,64 @@ mod tests {
         assert_eq!(BlockTarget::host("1.1.1.1".parse().unwrap()).to_string(), "host 1.1.1.1");
         assert_eq!(BlockTarget::Net("10.0.0.0".parse().unwrap(), 8).to_string(), "net 10.0.0.0/8");
         assert_eq!(BlockTarget::Port(IPPROTO_UDP, 53).to_string(), "udp port 53");
+        assert_eq!(BlockTarget::Exe("/usr/bin/curl".into()).to_string(), "exe /usr/bin/curl");
+        let m = Match {
+            exe: Some("/usr/bin/curl".into()),
+            proto: Some(IPPROTO_TCP),
+            ports: Some((8000, 8100)),
+            net: Some(("10.0.0.0".parse().unwrap(), 8)),
+        };
+        assert_eq!(m.to_string(), "exe /usr/bin/curl tcp port 8000-8100 net 10.0.0.0/8");
+        assert_eq!(Match::default().to_string(), "all traffic");
     }
 
     #[test]
-    fn ids_are_reused_and_duplicates_refused() {
+    fn duplicates_limits_and_bad_fields_refused() {
         let mut r = Rules::default();
-        let a = r.add(BlockTarget::Port(IPPROTO_TCP, 1)).unwrap();
-        let b = r.add(BlockTarget::Port(IPPROTO_TCP, 2)).unwrap();
-        assert_eq!((a, b), (0, 1));
-        assert!(r.add(BlockTarget::Port(IPPROTO_TCP, 1)).is_err());
-        r.remove(a).unwrap();
-        assert_eq!(r.add(BlockTarget::Port(IPPROTO_TCP, 3)).unwrap(), 0, "free id reused");
-        assert_eq!(r.matching(IPPROTO_TCP, sa("1.2.3.4:2"), "").unwrap().id, 1);
-    }
-
-    #[test]
-    fn rule_limit() {
-        let mut r = Rules::default();
-        for p in 0..MAX_RULES {
-            r.add(BlockTarget::Port(IPPROTO_UDP, p as u16)).unwrap();
+        r.block(BlockTarget::Port(IPPROTO_TCP, 1)).unwrap();
+        assert!(r.block(BlockTarget::Port(IPPROTO_TCP, 1)).is_err());
+        assert!(r.insert(0, Action::Allow, BlockTarget::Port(IPPROTO_TCP, 1).into(), "").is_ok(), "other action");
+        assert!(r.block(BlockTarget::Exe("curl".into())).is_err(), "relative path");
+        assert!(r.block(BlockTarget::Exe(format!("/{}", "a".repeat(300)))).is_err(), "too long");
+        assert!(r.block(BlockTarget::Net("1.0.0.0".parse().unwrap(), 33)).is_err());
+        let zero = Match { ports: Some((0, 5)), ..Match::default() };
+        assert!(r.insert(0, Action::Deny, zero, "").is_err());
+        let mut full = Rules::default();
+        for p in 1..=MAX_RULES {
+            full.block(BlockTarget::Port(IPPROTO_UDP, p as u16)).unwrap();
         }
-        assert!(r.add(BlockTarget::Port(IPPROTO_TCP, 1)).unwrap_err().contains("limit"));
+        assert!(full.block(BlockTarget::Port(IPPROTO_TCP, 1)).unwrap_err().contains("limit"));
+    }
+
+    #[test]
+    fn exe_ids_shared_and_released() {
+        let mut r = Rules::default();
+        let a = r.block(BlockTarget::Exe("/usr/bin/curl".into())).unwrap();
+        let m = Match { exe: Some("/usr/bin/curl".into()), ports: Some((443, 443)), ..Match::default() };
+        let b = r.insert(0, Action::Allow, m, "").unwrap();
+        let w = r.block(BlockTarget::Exe("/usr/bin/wget".into())).unwrap();
+        assert_eq!(r.exe_ids().get("/usr/bin/curl"), Some(&1));
+        assert_eq!(r.exe_ids().get("/usr/bin/wget"), Some(&2));
+        r.remove(a).unwrap();
+        assert_eq!(r.exe_ids().get("/usr/bin/curl"), Some(&1), "still named by the allow rule");
+        r.remove(b).unwrap();
+        assert!(!r.exe_ids().contains_key("/usr/bin/curl"));
+        r.block(BlockTarget::Exe("/usr/bin/nc".into())).unwrap();
+        assert_eq!(r.exe_ids().get("/usr/bin/nc"), Some(&3), "ids never reused");
+        assert!(r.denies_exe("/usr/bin/wget") && !r.denies_exe("/usr/bin/curl"));
+        r.remove(w).unwrap();
+    }
+
+    #[test]
+    fn compiles_to_entries() {
+        let mut r = Rules::default();
+        r.block(BlockTarget::Exe("/usr/bin/curl".into())).unwrap();
+        r.block(BlockTarget::Net("10.0.0.0".parse().unwrap(), 8)).unwrap();
+        r.block(BlockTarget::Port(IPPROTO_UDP, 53)).unwrap();
+        let e = r.entries();
+        assert_eq!(e[0], RuleEntry { fields: RULE_PROTO | RULE_PORT, proto: IPPROTO_UDP, port_lo: 53, port_hi: 53, action: ACTION_DENY, ..Default::default() });
+        assert_eq!((e[1].fields, e[1].family, e[1].prefix, e[1].addr[0]), (RULE_NET, 4, 8, 10));
+        assert_eq!((e[2].fields, e[2].exe), (RULE_EXE, 1));
     }
 
     #[test]
@@ -236,24 +440,12 @@ mod tests {
     }
 
     #[test]
-    fn exe_targets() {
-        let mut r = Rules::default();
-        let id = r.add(BlockTarget::Exe("/usr/bin/curl".into())).unwrap();
-        assert_eq!(r.matching(IPPROTO_TCP, sa("1.1.1.1:443"), "/usr/bin/curl").unwrap().id, id);
-        assert!(r.matching(IPPROTO_TCP, sa("1.1.1.1:443"), "/usr/bin/wget").is_none());
-        assert!(r.matching(IPPROTO_TCP, sa("1.1.1.1:443"), "").is_none());
-        assert_eq!(r.exes().collect::<Vec<_>>(), vec![("/usr/bin/curl", id)]);
-        assert_eq!(r.rules[0].target.to_string(), "exe /usr/bin/curl");
-        assert!(r.add(BlockTarget::Exe("curl".into())).is_err(), "relative path");
-        assert!(r.add(BlockTarget::Exe(format!("/{}", "a".repeat(300)))).is_err(), "too long");
-    }
-
-    #[test]
     fn running_processes_grouped_by_exe() {
-        let exes = vec![("/usr/bin/curl".to_string(), 3), ("/usr/bin/wget".to_string(), 4)];
+        let mut exes = BTreeMap::new();
+        exes.insert("/usr/bin/curl".to_string(), 3);
+        exes.insert("/usr/bin/wget".to_string(), 4);
         let running = [(10, "/usr/bin/curl"), (11, "/usr/bin/bash"), (12, "/usr/bin/curl")];
         let got = pids_by_exe(running.iter().map(|(p, e)| (*p, e.to_string())), &exes);
         assert_eq!(got, vec![(3, vec![10, 12])]);
     }
 }
-

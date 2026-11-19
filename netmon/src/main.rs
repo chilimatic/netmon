@@ -152,9 +152,7 @@ impl<K: Kernel> Monitor<K> {
             self.procs.fill(o, read_details);
         }
         self.sync_exe_blocks();
-        for rule in &mut self.rules.rules {
-            rule.drops = self.probe.rule_drops(rule.id);
-        }
+        self.refresh_hits();
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {
             errors.push(format!("capture: {e:#}"));
@@ -249,49 +247,62 @@ impl<K: Kernel> Monitor<K> {
 
     /// Adds the rule, or removes it if it exists.
     fn toggle_block(&mut self, target: BlockTarget) -> String {
-        if let Some(rule) = self.rules.find(&target).cloned() {
+        if let Some(rule) = self.rules.find_block(&target) {
             return self.remove_rule(rule.id);
         }
-        let id = match self.rules.add(target.clone()) {
-            Ok(id) => id,
+        let msg = format!("blocked {target} (until netmon exits; b again or Rules tab to undo)");
+        self.change_rules(|r| r.block(target).map(|_| msg))
+    }
+
+    fn remove_rule(&mut self, id: u32) -> String {
+        self.change_rules(|r| r.remove(id).map(|rule| format!("removed {rule}")).ok_or_else(|| "no such rule".into()))
+    }
+
+    /// Hit totals: the count before the last table rewrite plus the live
+    /// table's counter. Slot = position in the list.
+    fn refresh_hits(&mut self) {
+        for (slot, r) in self.rules.rules.iter_mut().enumerate() {
+            r.hits = r.hits_base + self.probe.rule_hits(slot);
+        }
+    }
+
+    /// Edits the rules and writes the new table to the kernel. On any error
+    /// the old rules stay, in userspace and in the kernel.
+    fn change_rules(&mut self, edit: impl FnOnce(&mut Rules) -> Result<String, String>) -> String {
+        // Positions change below: keep the hits counted so far.
+        self.refresh_hits();
+        for r in &mut self.rules.rules {
+            r.hits_base = r.hits;
+        }
+        let old = self.rules.clone();
+        let msg = match edit(&mut self.rules) {
+            Ok(m) => m,
             Err(e) => return e,
         };
-        match self.probe.block(id, &target) {
+        match self.probe.set_rules(&self.rules.entries(), self.rules.exe_ids()) {
             Ok(()) => {
                 self.sync_exe_blocks();
-                format!("blocked {target} (until netmon exits; b again or Rules tab to undo)")
+                msg
             }
             Err(e) => {
-                self.rules.remove(id);
-                format!("block failed: {e:#}")
+                self.rules = old;
+                format!("rule update failed: {e:#}")
             }
         }
     }
 
-    /// Marks running processes of blocked exes. The exec and fork
+    /// Marks running processes of exes that rules name. The exec and fork
     /// tracepoints keep the marks current between refreshes; this catches
-    /// processes that ran before the block and any the tracepoints missed.
+    /// processes that ran before the rule and any the tracepoints missed.
     fn sync_exe_blocks(&mut self) {
-        let exes: Vec<(String, u32)> = self.rules.exes().map(|(p, id)| (p.to_string(), id)).collect();
+        let exes = self.rules.exe_ids();
         if exes.is_empty() {
             return;
         }
         let Ok(procs) = procfs::process::all_processes() else { return };
         let running = procs.flatten().filter_map(|p| Some((p.pid as u32, p.exe().ok()?.to_string_lossy().into_owned())));
-        for (id, pids) in rules::pids_by_exe(running, &exes) {
+        for (id, pids) in rules::pids_by_exe(running, exes) {
             self.probe.mark_pids(id, &pids);
-        }
-    }
-
-    fn remove_rule(&mut self, id: u32) -> String {
-        let Some(rule) = self.rules.remove(id) else { return "no such rule".into() };
-        match self.probe.unblock(rule.id, &rule.target) {
-            Ok(()) => format!("unblocked {}", rule.target),
-            Err(e) => {
-                // Still in the kernel: keep it listed so it can be retried.
-                self.rules.rules.push(rule);
-                format!("unblock failed: {e:#}")
-            }
         }
     }
 
@@ -528,7 +539,7 @@ mod tests {
 
     use std::collections::VecDeque;
 
-    use netmon_common::{CAPTURE_LEN, FlowStats, IPPROTO_TCP, PacketEvent};
+    use netmon_common::{CAPTURE_LEN, FlowStats, IPPROTO_TCP, PacketEvent, RULE_EXE, RULE_NET, RULE_PORT, RULE_PROTO, RuleEntry};
 
     use crate::ifaces::Iface;
 
@@ -545,7 +556,8 @@ mod tests {
         ring: VecDeque<PacketEvent>,
         mode: Mode,
         drops: u64,
-        blocked: Vec<(u32, BlockTarget)>,
+        table: Vec<RuleEntry>,
+        exe_ids: std::collections::BTreeMap<String, u32>,
         fail_block: bool,
         marked: Vec<(u32, u32)>,
     }
@@ -593,22 +605,23 @@ mod tests {
         fn listeners(&self) -> Vec<(u8, std::net::SocketAddr, netmon_common::SockOwner)> {
             Vec::new()
         }
-        fn block(&mut self, id: u32, target: &BlockTarget) -> anyhow::Result<()> {
+        fn set_rules(
+            &mut self,
+            rules: &[RuleEntry],
+            exe_ids: &std::collections::BTreeMap<String, u32>,
+        ) -> anyhow::Result<()> {
             if self.fail_block {
                 anyhow::bail!("map full");
             }
-            self.blocked.push((id, target.clone()));
-            Ok(())
-        }
-        fn unblock(&mut self, _: u32, target: &BlockTarget) -> anyhow::Result<()> {
-            self.blocked.retain(|(_, t)| t != target);
+            self.table = rules.to_vec();
+            self.exe_ids = exe_ids.clone();
             Ok(())
         }
         fn mark_pids(&mut self, id: u32, pids: &[u32]) {
             self.marked.extend(pids.iter().map(|p| (id, *p)));
         }
-        fn rule_drops(&self, id: u32) -> u64 {
-            id as u64 + 100
+        fn rule_hits(&self, slot: usize) -> u64 {
+            slot as u64 + 100
         }
         fn set_guard(&mut self, _: &[std::net::SocketAddr]) -> anyhow::Result<()> {
             Ok(())
@@ -644,7 +657,8 @@ mod tests {
             ring: VecDeque::new(),
             mode: Mode::Off,
             drops: 0,
-            blocked: Vec::new(),
+            table: Vec::new(),
+            exe_ids: Default::default(),
             fail_block: false,
             marked: Vec::new(),
         };
@@ -752,20 +766,27 @@ mod tests {
         m.tick_at(secs(t0, 1));
         let mut app = App::default();
         m.handle(&mut app, Action::ToggleBlockRemote);
-        let host = BlockTarget::host("198.51.100.9".parse().unwrap());
-        assert_eq!(m.probe.blocked, vec![(0, host)], "{}", app.status);
-        assert!(app.status.starts_with("blocked host 198.51.100.9"));
+        assert_eq!(m.probe.table.len(), 1, "{}", app.status);
+        assert_eq!((m.probe.table[0].fields, m.probe.table[0].prefix), (RULE_NET, 32));
+        assert!(app.status.starts_with("blocked host 198.51.100.9"), "{}", app.status);
         m.handle(&mut app, Action::ToggleBlockPort);
-        assert_eq!(m.probe.blocked[1], (1, BlockTarget::Port(IPPROTO_TCP, 443)));
+        // New blocks go on top.
+        let port = m.probe.table[0];
+        assert_eq!((port.fields, port.port_lo, port.port_hi), (RULE_PROTO | RULE_PORT, 443, 443));
         m.tick_at(secs(t0, 2));
-        assert_eq!(m.rules.rules[1].drops, 101, "drops read every tick");
-        // b again unblocks.
+        // The fake reports 100 + slot hits and never resets. The host rule
+        // had 100 hits before the rewrite and now sits in slot 1.
+        assert_eq!((m.rules.rules[0].hits, m.rules.rules[1].hits), (100, 201), "hits read every tick");
+        // b again unblocks; the port rule keeps its hits across the rewrite.
         m.handle(&mut app, Action::ToggleBlockRemote);
-        assert_eq!(m.probe.blocked, vec![(1, BlockTarget::Port(IPPROTO_TCP, 443))]);
+        assert_eq!(m.probe.table, vec![port]);
+        assert_eq!(m.rules.rules[0].hits_base, 100);
+        m.tick_at(secs(t0, 3));
+        assert_eq!(m.rules.rules[0].hits, 200);
         // d in the Rules tab removes the selected rule.
         app.on_key(crate::app::Key::Char('5'));
         m.handle(&mut app, Action::RemoveRule);
-        assert!(m.probe.blocked.is_empty() && m.rules.rules.is_empty(), "{}", app.status);
+        assert!(m.probe.table.is_empty() && m.rules.rules.is_empty(), "{}", app.status);
     }
 
     #[test]
@@ -776,7 +797,7 @@ mod tests {
         m.probe.fail_block = true;
         let mut app = App::default();
         m.handle(&mut app, Action::ToggleBlockRemote);
-        assert!(app.status.contains("block failed"), "{}", app.status);
+        assert!(app.status.contains("rule update failed"), "{}", app.status);
         assert!(m.rules.rules.is_empty());
     }
 
@@ -795,8 +816,9 @@ mod tests {
         });
         let mut app = App { tab: Tab::Processes, ..App::default() };
         m.handle(&mut app, Action::ToggleBlockProcess);
-        assert_eq!(m.probe.blocked, vec![(0, BlockTarget::Exe(me))], "{}", app.status);
-        assert!(m.probe.marked.contains(&(0, pid)), "running pid marked at once");
+        assert_eq!((m.probe.table[0].fields, m.probe.table[0].exe), (RULE_EXE, 1), "{}", app.status);
+        assert_eq!(m.probe.exe_ids.get(&me), Some(&1));
+        assert!(m.probe.marked.contains(&(1, pid)), "running pid marked at once");
     }
 }
 

@@ -47,16 +47,156 @@ pub struct FlowStats {
 
 /// Entries in the socket owner map.
 pub const MAX_SOCK_OWNERS: u32 = 16_384;
-/// Block rules (remote networks and ports). Rule ids are 0..MAX_RULES and
-/// index the per-rule drop counters.
-pub const MAX_RULES: u32 = 1_024;
+/// Rules in the ordered rule table. The kernel walks the table for each
+/// packet and socket call, so this stays small.
+pub const MAX_RULES: u32 = 256;
 /// Lockout guard entries.
 pub const MAX_GUARD: u32 = 64;
 
-/// Exe paths in the process block map are NUL-padded to this length.
+/// Exe paths in the exe id map are NUL-padded to this length.
 pub const MAX_EXE_PATH: usize = 256;
-/// Processes (tgids) marked as blocked.
-pub const MAX_BLOCKED_TGIDS: u32 = 8_192;
+/// Processes (tgids) marked with the exe id of a rule.
+pub const MAX_MARKED_TGIDS: u32 = 8_192;
+
+// Rule fields: a rule matches when every field in its mask matches.
+pub const RULE_NET: u8 = 1;
+pub const RULE_PROTO: u8 = 2;
+pub const RULE_PORT: u8 = 4;
+pub const RULE_EXE: u8 = 8;
+pub const RULE_DIR: u8 = 16;
+
+pub const ACTION_ALLOW: u8 = 1;
+pub const ACTION_DENY: u8 = 2;
+
+/// This host opened the connection (or sends the datagram).
+pub const DIR_OUT: u8 = 1;
+/// The remote host opened the connection.
+pub const DIR_IN: u8 = 2;
+
+// Indexes in the RULE_CFG array. Separate u32 entries, so each update is
+// one atomic write.
+/// Which table half is live: 0 or 1.
+pub const CFG_ACTIVE: u32 = 0;
+/// Rule count of half 0; half 1 follows.
+pub const CFG_COUNT: u32 = 1;
+pub const CFG_LEN: u32 = 3;
+
+/// One rule of the ordered rule table.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuleEntry {
+    /// Remote network, IPv4 in the first 4 bytes.
+    pub addr: [u8; 16],
+    /// Exe id (from the exe id map), never 0 when RULE_EXE is set.
+    pub exe: u32,
+    /// Remote port range, inclusive. port_lo is at least 1.
+    pub port_lo: u16,
+    pub port_hi: u16,
+    /// RULE_* bits.
+    pub fields: u8,
+    /// ACTION_ALLOW or ACTION_DENY.
+    pub action: u8,
+    pub family: u8,
+    pub prefix: u8,
+    pub proto: u8,
+    /// DIR_OUT or DIR_IN.
+    pub dir: u8,
+    pub _pad: [u8; 2],
+}
+
+/// Does `rule` match traffic to remote `addr`:`port` by a process with exe
+/// id `exe` (0: unknown) in direction `dir`? `addr` must be normalized
+/// (see `unmap_v4`). Port 0 (unknown, later fragments) never matches a
+/// port rule; exe 0 never matches an exe rule.
+#[inline(always)]
+pub fn rule_matches(r: &RuleEntry, family: u8, addr: &[u8; 16], proto: u8, port: u16, exe: u32, dir: u8) -> bool {
+    if r.fields & RULE_NET != 0 && (r.family != family || !in_prefix(addr, &r.addr, r.prefix)) {
+        return false;
+    }
+    if r.fields & RULE_PROTO != 0 && r.proto != proto {
+        return false;
+    }
+    if r.fields & RULE_PORT != 0 && (port < r.port_lo || port > r.port_hi) {
+        return false;
+    }
+    if r.fields & RULE_EXE != 0 && (exe == 0 || exe != r.exe) {
+        return false;
+    }
+    if r.fields & RULE_DIR != 0 && r.dir != dir {
+        return false;
+    }
+    true
+}
+
+/// Are the first `prefix` bits of `a` and `net` equal? Unrolled over four
+/// 32-bit words, so the verifier sees no loop.
+#[inline(always)]
+pub fn in_prefix(a: &[u8; 16], net: &[u8; 16], prefix: u8) -> bool {
+    word_in_prefix(a, net, 0, prefix)
+        && word_in_prefix(a, net, 1, prefix)
+        && word_in_prefix(a, net, 2, prefix)
+        && word_in_prefix(a, net, 3, prefix)
+}
+
+#[inline(always)]
+fn word_in_prefix(a: &[u8; 16], net: &[u8; 16], i: usize, prefix: u8) -> bool {
+    let start = (i * 32) as u8;
+    if prefix <= start {
+        return true;
+    }
+    let left = prefix - start;
+    let mask = if left >= 32 { u32::MAX } else { u32::MAX << (32 - left) };
+    let j = i * 4;
+    let x = u32::from_be_bytes([a[j], a[j + 1], a[j + 2], a[j + 3]]);
+    let y = u32::from_be_bytes([net[j], net[j + 1], net[j + 2], net[j + 3]]);
+    (x ^ y) & mask == 0
+}
+
+/// unmap_v4 without copies, for the eBPF stack.
+#[inline(always)]
+pub fn unmap_v4_in_place(family: &mut u8, addr: &mut [u8; 16]) {
+    let (f, a) = unmap_v4(*family, addr);
+    if f != *family {
+        *family = f;
+        addr[0] = a[0];
+        addr[1] = a[1];
+        addr[2] = a[2];
+        addr[3] = a[3];
+        let mut i = 4;
+        while i < 16 {
+            addr[i] = 0;
+            i += 1;
+        }
+    }
+}
+
+/// Turns an IPv4-mapped IPv6 address (::ffff:a.b.c.d, used by dual-stack
+/// sockets) into IPv4, so IPv4 rules match it.
+#[inline(always)]
+pub fn unmap_v4(family: u8, addr: &[u8; 16]) -> (u8, [u8; 16]) {
+    if family == 6
+        && addr[0] == 0
+        && addr[1] == 0
+        && addr[2] == 0
+        && addr[3] == 0
+        && addr[4] == 0
+        && addr[5] == 0
+        && addr[6] == 0
+        && addr[7] == 0
+        && addr[8] == 0
+        && addr[9] == 0
+        && addr[10] == 0xff
+        && addr[11] == 0xff
+    {
+        let mut v4 = [0u8; 16];
+        v4[0] = addr[12];
+        v4[1] = addr[13];
+        v4[2] = addr[14];
+        v4[3] = addr[15];
+        return (4, v4);
+    }
+    (family, *addr)
+}
 
 /// Field offsets in the sched tracepoint records, read by userspace from
 /// tracefs. 0 means unknown: the tracepoint program then does nothing.
@@ -67,15 +207,6 @@ pub struct TraceCfg {
     pub exec_filename: u32,
     /// sched_process_fork: offset of `pid_t child_pid`.
     pub fork_child_pid: u32,
-}
-
-/// A remote port to block for one transport protocol.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct PortKey {
-    pub port: u16,
-    pub proto: u8,
-    pub _pad: u8,
 }
 
 /// A remote endpoint that is never blocked (SSH session, DNS resolver).
@@ -202,7 +333,7 @@ unsafe impl aya::Pod for SockOwner {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ListenKey {}
 #[cfg(feature = "user")]
-unsafe impl aya::Pod for PortKey {}
+unsafe impl aya::Pod for RuleEntry {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TraceCfg {}
 #[cfg(feature = "user")]
@@ -398,6 +529,74 @@ impl FlowKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn v4(a: [u8; 4]) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..4].copy_from_slice(&a);
+        b
+    }
+
+    #[test]
+    fn prefixes() {
+        let net = v4([10, 1, 0, 0]);
+        assert!(in_prefix(&v4([10, 1, 200, 3]), &net, 16));
+        assert!(!in_prefix(&v4([10, 2, 0, 0]), &net, 16));
+        assert!(in_prefix(&v4([99, 9, 9, 9]), &net, 0), "/0 matches all");
+        assert!(in_prefix(&v4([10, 1, 0, 0]), &net, 32));
+        assert!(!in_prefix(&v4([10, 1, 0, 1]), &net, 32));
+        // 10.0.0.0/7 covers 10.x and 11.x, not 12.x.
+        assert!(in_prefix(&v4([11, 0, 0, 0]), &v4([10, 0, 0, 0]), 7));
+        assert!(!in_prefix(&v4([12, 0, 0, 0]), &v4([10, 0, 0, 0]), 7));
+        let mut a = [0u8; 16];
+        a[0] = 0x20;
+        a[1] = 0x01;
+        let mut b = a;
+        b[15] = 1;
+        assert!(in_prefix(&b, &a, 64));
+        assert!(in_prefix(&b, &a, 127));
+        assert!(!in_prefix(&b, &a, 128));
+    }
+
+    #[test]
+    fn rule_fields() {
+        let any = RuleEntry { action: ACTION_DENY, ..Default::default() };
+        let dst = v4([1, 1, 1, 1]);
+        assert!(rule_matches(&any, 4, &dst, IPPROTO_TCP, 443, 0, DIR_OUT), "no fields: matches all");
+        let r = RuleEntry {
+            fields: RULE_NET | RULE_PROTO | RULE_PORT | RULE_EXE | RULE_DIR,
+            addr: v4([1, 1, 1, 0]),
+            family: 4,
+            prefix: 24,
+            proto: IPPROTO_TCP,
+            port_lo: 443,
+            port_hi: 444,
+            exe: 3,
+            dir: DIR_OUT,
+            ..any
+        };
+        assert!(rule_matches(&r, 4, &dst, IPPROTO_TCP, 444, 3, DIR_OUT));
+        assert!(!rule_matches(&r, 6, &dst, IPPROTO_TCP, 443, 3, DIR_OUT), "family");
+        assert!(!rule_matches(&r, 4, &v4([1, 1, 2, 1]), IPPROTO_TCP, 443, 3, DIR_OUT), "net");
+        assert!(!rule_matches(&r, 4, &dst, IPPROTO_UDP, 443, 3, DIR_OUT), "proto");
+        assert!(!rule_matches(&r, 4, &dst, IPPROTO_TCP, 445, 3, DIR_OUT), "port");
+        assert!(!rule_matches(&r, 4, &dst, IPPROTO_TCP, 443, 4, DIR_OUT), "exe");
+        assert!(!rule_matches(&r, 4, &dst, IPPROTO_TCP, 443, 0, DIR_OUT), "unknown exe");
+        assert!(!rule_matches(&r, 4, &dst, IPPROTO_TCP, 443, 3, DIR_IN), "direction");
+        let port = RuleEntry { fields: RULE_PORT, port_lo: 1, port_hi: 65535, ..any };
+        assert!(!rule_matches(&port, 4, &dst, IPPROTO_TCP, 0, 0, DIR_OUT), "unknown port");
+    }
+
+    #[test]
+    fn mapped_v4_is_unmapped() {
+        let mut m = [0u8; 16];
+        m[10] = 0xff;
+        m[11] = 0xff;
+        m[12..].copy_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(unmap_v4(6, &m), (4, v4([1, 2, 3, 4])));
+        m[9] = 1;
+        assert_eq!(unmap_v4(6, &m), (6, m));
+        assert_eq!(unmap_v4(4, &v4([1, 2, 3, 4])), (4, v4([1, 2, 3, 4])));
+    }
 
     const TCP_V4: [u8; 54] = {
         let mut b = [0u8; 54];

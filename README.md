@@ -17,16 +17,13 @@ one, the interface it uses, and live upload/download rates. Linux only.
 
 ## Requirements
 
-- Linux 5.11 or later. Tested only on 6.18; older kernels are supported by
-  design, not yet by test.
+- Linux 5.17 or later (the rule table walk uses `bpf_loop`). Tested only
+  on 6.18; older kernels are supported by design, not yet by test.
   - 6.6 and later: programs attach with tcx and run next to other tc/tcx
     programs.
   - Before 6.6: netmon adds a `clsact` qdisc to each interface (if missing)
     and attaches with netlink. The qdisc stays after netmon exits; remove it
     with `tc qdisc del dev <iface> clsact` if nothing else uses it.
-  - 5.8 to 5.10 count eBPF memory against `RLIMIT_MEMLOCK`. Loading fails
-    unless the limit is raised first, e.g. `ulimit -l unlimited` in a root
-    shell. Older kernels have no ring buffer and are not supported.
 - No BTF needed: the programs read packet bytes only, no kernel structs.
 
 ## Build
@@ -104,8 +101,12 @@ In **Connections**, `b` blocks the selected row's remote address and `B` its
 remote port (TCP or UDP). In **Processes**, `b` blocks every process running
 the selected process's exe, including ones started later. Press the key
 again to unblock. Blocked rows turn
-red. The **Rules** tab (`5`) lists every block with its drop count; `d`
-removes the selected one.
+red. The **Rules** tab (`5`) lists every rule in match order with its hit
+count (packets and socket calls it decided); `d` removes the selected one.
+
+Rules form an ordered list: the first rule that matches decides, and
+traffic no rule matches passes. A new block goes on top. Up to 256 rules;
+the kernel checks them in order for every packet.
 
 - New connections and UDP sends to a blocked destination fail with
   `Operation not permitted` (cgroup `connect`/`sendmsg` hooks). Packets of

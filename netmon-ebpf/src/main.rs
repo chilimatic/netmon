@@ -7,19 +7,20 @@ use aya_ebpf::{
     cty::c_void,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_get_current_uid_gid, bpf_get_socket_cookie, bpf_ktime_get_ns,
+        bpf_get_current_uid_gid, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_loop,
         bpf_probe_read_kernel_str_bytes, bpf_skb_load_bytes,
     },
     macros::{cgroup_sock, cgroup_sock_addr, classifier, map, tracepoint},
-    maps::{Array, HashMap, LpmTrie, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf, lpm_trie::Key},
+    maps::{Array, HashMap, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf},
     programs::{SockAddrContext, SockContext, TcContext, TracePointContext},
 };
 use netmon_common::{
-    CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES, CaptureConfig, FlowKey,
-    FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey, ListenOwner,
-    MAX_BLOCKED_TGIDS, MAX_CAPTURE_FLOWS, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
-    MAX_LISTENERS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource, PortKey, SockOwner,
-    TraceCfg, is_loopback, parse_packet,
+    ACTION_DENY, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES, CFG_ACTIVE,
+    CFG_COUNT, CFG_LEN, CaptureConfig, DIR_IN, DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP,
+    IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey, ListenOwner, MAX_CAPTURE_FLOWS, MAX_EXE_PATH,
+    MAX_FLOWS, MAX_GUARD, MAX_IFACES, MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS,
+    PacketEvent, PacketSource, RuleEntry, SockOwner, TraceCfg, is_loopback, parse_packet,
+    rule_matches, unmap_v4_in_place,
 };
 
 /// Byte counters per flow and interface.
@@ -62,81 +63,138 @@ static LISTENERS: LruHashMap<ListenKey, ListenOwner> = LruHashMap::with_max_entr
 #[map]
 static LISTEN_BY_COOKIE: LruHashMap<u64, ListenKey> = LruHashMap::with_max_entries(MAX_LISTENERS, 0);
 
-// Block rules. Verdict maps are never LRU: an evicted rule would silently
-// stop blocking. Userspace keeps them; they end with the process (fail-open).
+// Rules. Verdict maps are never LRU: an evicted entry would silently change
+// a verdict. Userspace keeps them; they end with the process (fail-open).
 
-/// Remote IPv4 networks to block -> rule id.
+/// Ordered rule table, two halves of MAX_RULES. Userspace writes the
+/// inactive half and then flips CFG_ACTIVE, so a packet never sees a
+/// half-written table.
 #[map]
-static BLOCK_V4: LpmTrie<[u8; 4], u32> = LpmTrie::with_max_entries(MAX_RULES, 0);
+static RULES: Array<RuleEntry> = Array::with_max_entries(2 * MAX_RULES, 0);
 
-/// Remote IPv6 networks to block -> rule id.
+/// CFG_ACTIVE and the rule count of each half (CFG_COUNT + half).
 #[map]
-static BLOCK_V6: LpmTrie<[u8; 16], u32> = LpmTrie::with_max_entries(MAX_RULES, 0);
-
-/// Remote ports to block -> rule id.
-#[map]
-static BLOCK_PORT: HashMap<PortKey, u32> = HashMap::with_max_entries(MAX_RULES, 0);
-
-/// Number of rules. 0 skips every lookup. Index 0 only.
-#[map]
-static RULE_COUNT: Array<u32> = Array::with_max_entries(1, 0);
+static RULE_CFG: Array<u32> = Array::with_max_entries(CFG_LEN, 0);
 
 /// Remote endpoints that are never blocked (lockout guard).
 #[map]
 static GUARD: HashMap<GuardKey, u8> = HashMap::with_max_entries(MAX_GUARD, 0);
 
-/// Exe paths to block (NUL-padded) -> rule id.
+/// Exe paths named by rules (NUL-padded) -> exe id.
 #[map]
-static BLOCK_EXE: HashMap<[u8; MAX_EXE_PATH], u32> = HashMap::with_max_entries(MAX_RULES, 0);
+static EXE_IDS: HashMap<[u8; MAX_EXE_PATH], u32> = HashMap::with_max_entries(MAX_RULES, 0);
 
-/// Blocked processes (tgid) -> rule id. Set by the exec and fork
-/// tracepoints and by userspace for processes that already run.
+/// Processes (tgid) -> exe id, for processes running an exe named by a
+/// rule. Set by the exec and fork tracepoints and by userspace for
+/// processes that already run.
 #[map]
-static BLOCK_TGID: HashMap<u32, u32> = HashMap::with_max_entries(MAX_BLOCKED_TGIDS, 0);
+static TGID_EXE: HashMap<u32, u32> = HashMap::with_max_entries(MAX_MARKED_TGIDS, 0);
 
 /// Tracepoint field offsets from userspace. Index 0 only.
 #[map]
 static TRACE_CFG: Array<TraceCfg> = Array::with_max_entries(1, 0);
 
-/// Packets and socket calls stopped, per rule id.
+/// Packets and socket calls matched, per table slot (both halves).
 #[map]
-static RULE_DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(MAX_RULES, 0);
+static RULE_HITS: PerCpuArray<u64> = PerCpuArray::with_max_entries(2 * MAX_RULES, 0);
 
-/// The rule that blocks traffic of process `tgid` (0: unknown) to
-/// `addr`:`port`, if any. Loopback and guarded endpoints always pass.
 #[inline(always)]
-fn verdict(family: u8, addr: &[u8; 16], proto: u8, port: u16, tgid: u32) -> Option<u32> {
-    if RULE_COUNT.get(0).copied().unwrap_or(0) == 0 || is_loopback(family, addr) {
-        return None;
+fn cfg(i: u32) -> u32 {
+    RULE_CFG.get(i).copied().unwrap_or(0)
+}
+
+/// Rule count of the live half, and the half (0 or 1).
+#[inline(always)]
+fn live_rules() -> (u32, u32) {
+    let half = cfg(CFG_ACTIVE) & 1;
+    (cfg(CFG_COUNT + half), half)
+}
+
+/// State of one rule table walk, on the caller's stack. Starts with the
+/// guard key, so the address is stored once.
+#[repr(C)]
+struct Scan {
+    guard: GuardKey,
+    exe: u32,
+    base: u32,
+    count: u32,
+    proto: u8,
+    dir: u8,
+    /// Action of the first matching rule, 0 if none matched.
+    action: u8,
+    _pad: u8,
+}
+
+/// bpf_loop callback: checks rule `i`. Returns 1 to stop the walk.
+/// The verifier checks this body once, not once per rule, which keeps
+/// the programs far below the 1M instruction limit.
+#[inline(never)]
+extern "C" fn scan_rule(i: u64, ctx: *mut c_void) -> i64 {
+    let s = unsafe { &mut *(ctx as *mut Scan) };
+    let i = i as u32;
+    if i >= s.count {
+        return 1;
     }
-    let guard = GuardKey { addr: *addr, port, family, _pad: 0 };
-    if unsafe { GUARD.get(&guard) }.is_some() {
-        return None;
+    let slot = s.base + i;
+    let Some(r) = RULES.get(slot) else { return 1 };
+    let g = &s.guard;
+    if !rule_matches(r, g.family, &g.addr, s.proto, g.port, s.exe, s.dir) {
+        return 0;
     }
-    let net = if family == 4 {
-        BLOCK_V4.get(&Key::new(32, [addr[0], addr[1], addr[2], addr[3]]))
-    } else {
-        BLOCK_V6.get(&Key::new(128, *addr))
+    if let Some(h) = RULE_HITS.get_ptr_mut(slot) {
+        unsafe { *h += 1 };
+    }
+    s.action = r.action;
+    1
+}
+
+/// denied() with family, proto and dir packed into one word: BPF functions
+/// take at most 5 arguments.
+#[inline(always)]
+fn denied(family: u8, addr: &[u8; 16], proto: u8, port: u16, tgid: u32, dir: u8) -> bool {
+    denied_packed(addr, port, tgid, u32::from_le_bytes([family, proto, dir, 0]))
+}
+
+/// True if traffic of process `tgid` (0: unknown) to `addr`:`port` in
+/// direction `dir` is denied. Walks the live table; the first matching
+/// rule decides and counts a hit. Loopback and guarded endpoints always
+/// pass; no match passes. A separate BPF function: the bpf_loop callback
+/// frame adds to this small one, not to the program frame. Programs, this
+/// function and the callback share a 512-byte stack.
+#[inline(never)]
+fn denied_packed(addr: &[u8; 16], port: u16, tgid: u32, meta: u32) -> bool {
+    let [family, proto, dir, _] = meta.to_le_bytes();
+    let (count, half) = live_rules();
+    if count == 0 {
+        return false;
+    }
+    let mut scan = Scan {
+        guard: GuardKey { addr: *addr, port, family, _pad: 0 },
+        exe: 0,
+        base: half * MAX_RULES,
+        count: if count > MAX_RULES { MAX_RULES } else { count },
+        proto,
+        dir,
+        action: 0,
+        _pad: 0,
     };
-    if let Some(id) = net {
-        return Some(*id);
-    }
-    if port != 0
-        && (proto == IPPROTO_TCP || proto == IPPROTO_UDP)
-        && let Some(id) = unsafe { BLOCK_PORT.get(&PortKey { port, proto, _pad: 0 }) }
-    {
-        return Some(*id);
+    unmap_v4_in_place(&mut scan.guard.family, &mut scan.guard.addr);
+    if is_loopback(scan.guard.family, &scan.guard.addr) || unsafe { GUARD.get(&scan.guard) }.is_some() {
+        return false;
     }
     if tgid != 0 {
-        return unsafe { BLOCK_TGID.get(&tgid) }.copied();
+        scan.exe = unsafe { TGID_EXE.get(&tgid) }.copied().unwrap_or(0);
     }
-    None
+    unsafe {
+        bpf_loop(scan.count, scan_rule as *mut c_void, &mut scan as *mut Scan as *mut c_void, 0);
+    }
+    scan.action == ACTION_DENY
 }
 
 /// Process of the socket that sent an egress packet, from its cookie.
 #[inline(always)]
 fn packet_tgid(ctx: &TcContext, egress: bool) -> u32 {
-    if !egress || RULE_COUNT.get(0).copied().unwrap_or(0) == 0 {
+    if !egress || live_rules().0 == 0 {
         return 0;
     }
     let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
@@ -144,13 +202,6 @@ fn packet_tgid(ctx: &TcContext, egress: bool) -> u32 {
         return 0;
     }
     unsafe { SOCK_OWNER.get(&cookie) }.map_or(0, |o| o.tgid)
-}
-
-#[inline(always)]
-fn count_drop(rule: u32) {
-    if let Some(d) = RULE_DROPS.get_ptr_mut(rule) {
-        unsafe { *d += 1 };
-    }
 }
 
 struct Skb<'a>(&'a TcContext);
@@ -176,6 +227,20 @@ pub fn tc_ingress(ctx: TcContext) -> i32 {
     handle(&ctx, false)
 }
 
+/// Parses the packet into `out`, whose ifindex the caller sets. A separate
+/// BPF function for the same reason as count(): its stack stays off the
+/// rule walk's. BPF functions take at most 5 arguments.
+#[inline(never)]
+fn parse_key(ctx: &TcContext, l3: u32, ethertype: u16, egress: bool, out: &mut FlowKey) -> bool {
+    match parse_packet(&Skb(ctx), l3 as usize, ethertype) {
+        Some(pkt) => {
+            *out = FlowKey::from_packet(&pkt, out.ifindex, egress);
+            true
+        }
+        None => false,
+    }
+}
+
 #[inline(always)]
 fn handle(ctx: &TcContext, egress: bool) -> i32 {
     let skb = ctx.as_ptr() as *const __sk_buff;
@@ -184,17 +249,16 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
     let ethertype = u16::from_be(ctx.skb.protocol() as u16);
     let l3 = unsafe { L3_OFFSET.get(&ifindex) }.copied().unwrap_or(14);
 
-    let key = parse_packet(&Skb(ctx), l3 as usize, ethertype)
-        .map(|pkt| FlowKey::from_packet(&pkt, ifindex, egress));
+    let mut parsed = FlowKey { ifindex, ..FlowKey::default() };
+    let key = parse_key(ctx, l3, ethertype, egress, &mut parsed).then_some(parsed);
     let mut action = TC_ACT_UNSPEC;
     if let Some(key) = &key {
         count(ctx, key, egress);
         // Unparsed packets have no key and pass (fail-open).
+        let dir = if egress { DIR_OUT } else { DIR_IN };
         if ifindex != LOOPBACK_IFINDEX
-            && let Some(rule) =
-                verdict(key.family, &key.remote_addr, key.proto, key.remote_port, packet_tgid(ctx, egress))
+            && denied(key.family, &key.remote_addr, key.proto, key.remote_port, packet_tgid(ctx, egress), dir)
         {
-            count_drop(rule);
             action = TC_ACT_SHOT;
         }
     }
@@ -222,7 +286,10 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
     action
 }
 
-#[inline(always)]
+// count() and capture() are separate BPF functions, not inlined: their
+// stack then does not add to the rule walk's (bpf_loop callback frame plus
+// the program frame must stay within 512 bytes).
+#[inline(never)]
 fn count(ctx: &TcContext, key: &FlowKey, egress: bool) {
     let len = ctx.len() as u64;
     // Locally sent packets carry their socket. 0 for forwarded traffic.
@@ -265,7 +332,7 @@ fn count(ctx: &TcContext, key: &FlowKey, egress: bool) {
 }
 
 /// Copies up to CAPTURE_LEN bytes of the packet into the ring buffer.
-#[inline(always)]
+#[inline(never)]
 fn capture(ctx: &TcContext, ifindex: u32, ethertype: u16, has_l2: bool, egress: bool) {
     let Some(mut entry) = PACKETS.reserve::<PacketEvent>(0) else {
         if let Some(d) = CAPTURE_DROPS.get_ptr_mut(0) {
@@ -305,7 +372,7 @@ fn capture(ctx: &TcContext, ifindex: u32, ethertype: u16, has_l2: bool, egress: 
 
 // Socket hooks on the root cgroup. They run in the context of the process
 // that creates or uses the socket. They return 1 (allow), except connect and
-// sendmsg to a blocked destination, which return 0: the call fails with
+// sendmsg to a denied destination, which return 0: the call fails with
 // EPERM.
 
 const ALLOW: i32 = 1;
@@ -332,13 +399,7 @@ fn addr_verdict(ctx: &SockAddrContext, family: u8) -> i32 {
         }
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    match verdict(family, &addr, proto, port, tgid) {
-        Some(rule) => {
-            count_drop(rule);
-            DENY
-        }
-        None => ALLOW,
-    }
+    if denied(family, &addr, proto, port, tgid, DIR_OUT) { DENY } else { ALLOW }
 }
 
 /// Writes the current process as owner of the socket behind `ctx`. Skips the
@@ -457,11 +518,12 @@ pub fn sendmsg6(ctx: SockAddrContext) -> i32 {
     addr_verdict(&ctx, 6)
 }
 
-// Process tracking for exe blocks. Both programs run in the context of the
+// Process tracking for exe rules. Both programs run in the context of the
 // task that execs or forks, so the current tgid is the right process.
 
-/// After exec: the process is blocked if its new exe is, and unblocked
-/// otherwise. That also clears a stale entry when a pid is reused.
+/// After exec: the process gets the exe id of its new exe if a rule names
+/// it, else its entry is removed. That also clears a stale entry when a pid
+/// is reused.
 #[tracepoint]
 pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
     let Some(cfg) = TRACE_CFG.get(0) else { return 0 };
@@ -476,19 +538,19 @@ pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
     if unsafe { bpf_probe_read_kernel_str_bytes(src, &mut path) }.is_err() {
         return 0;
     }
-    match unsafe { BLOCK_EXE.get(&path) } {
+    match unsafe { EXE_IDS.get(&path) } {
         Some(id) => {
-            let _ = BLOCK_TGID.insert(&tgid, id, 0);
+            let _ = TGID_EXE.insert(&tgid, id, 0);
         }
         None => {
-            let _ = BLOCK_TGID.remove(&tgid);
+            let _ = TGID_EXE.remove(&tgid);
         }
     }
     0
 }
 
-/// After fork: the child has its parent's block state. Clearing it for an
-/// unblocked parent removes stale entries of a reused pid.
+/// After fork: the child gets its parent's exe id. Clearing it for an
+/// unmarked parent removes stale entries of a reused pid.
 #[tracepoint]
 pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
     let Some(cfg) = TRACE_CFG.get(0) else { return 0 };
@@ -497,13 +559,13 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
     }
     let Ok(child) = (unsafe { ctx.read_at::<u32>(cfg.fork_child_pid as usize) }) else { return 0 };
     let parent = (bpf_get_current_pid_tgid() >> 32) as u32;
-    match unsafe { BLOCK_TGID.get(&parent) } {
+    match unsafe { TGID_EXE.get(&parent) } {
         Some(id) => {
             let id = *id;
-            let _ = BLOCK_TGID.insert(&child, &id, 0);
+            let _ = TGID_EXE.insert(&child, &id, 0);
         }
         None => {
-            let _ = BLOCK_TGID.remove(&child);
+            let _ = TGID_EXE.remove(&child);
         }
     }
     0

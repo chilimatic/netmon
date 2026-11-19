@@ -148,24 +148,72 @@ loopback, the SSH session and DNS to the local resolver.
 - Packets with 3 IPv6 extension headers before TCP still match port rules.
 - Quitting netmon removes every block.
 
-## Phase 3 – Rules file
+## Phase 3 – Rule engine and rules file
 
-**Why.** Blocks should survive a restart and be editable as text.
+**Status (2026-11-19): in progress.** Step 1 (kernel rule table) done and
+tested live. Step 2 next.
+
+**Why.** Blocks should survive a restart, be editable as text, and combine
+conditions ("curl may only reach port 443").
+
+**Decisions (2026-11-19).**
+- Full allow/deny engine: rules combine fields, first match wins, default
+  action configurable (default `allow`).
+- File: `/etc/netmon/rules.toml`, `--rules PATH` to override. netmon refuses a
+  file (or parent directory) that is not owned by root or that group or
+  others can write: whoever edits it controls a root firewall.
+- Format: TOML.
+- `process` is an absolute exe path only. `comm` is not accepted: every
+  process can set its own comm.
 
 **Design.**
-- `~/.config/netmon/rules.toml` (under sudo: the invoking user's config dir,
-  read and validated before use; refuse files writable by other users).
-- Rule fields: `action` (`allow` | `deny`), optional `process` (comm or exe
-  path), `remote` (IP or CIDR), `port`, `proto`, `direction`, `comment`.
-  First match wins; default action configurable, default `allow`.
-- Rules compile into the Phase 2 maps. Exe-path rules resolve to tgids at
-  connect time through `SOCK_OWNER`.
-- `s` in the Rules tab saves the current blocks to the file.
+- Kernel: an ordered rule table (`Array`, `MAX_RULES` = 256) replaces the
+  LPM trie, port and exe maps. Each rule holds a field mask and the values:
+  remote network (family, prefix, address), proto, port range, exe id,
+  direction, action. `denied()` walks the table up to the rule count with
+  `bpf_loop` and returns the first match. A plain bounded loop failed: the
+  verifier checks every pass and hit its 1M instruction limit at rule 89.
+  `bpf_loop` raises the minimum kernel from 5.11 to 5.17. The rule check,
+  parsing, counting and capture are separate BPF functions, so the
+  program, the rule check and the callback stay within the 512-byte stack;
+  each BPF function takes at most 5 arguments. The same match
+  function lives in `netmon-common`, so userspace (red rows) and tests use
+  the kernel's exact logic.
+- Two table halves and an active index: userspace writes the inactive half,
+  then flips, so packets never see a half-written table.
+- Per-slot hit counters (allow and deny). Userspace keeps the running total
+  per rule across table rewrites.
+- Exe rules: `EXE_IDS` (path -> exe id) and `TGID_EXE` (tgid -> exe id),
+  kept by the exec/fork tracepoints and the `/proc` scan as in Phase 2.
+- Direction is the side that opened the connection, not the packet
+  direction. A `CONNS` LRU map (flow key -> direction, verdict) remembers
+  flows: `connect`/`sendmsg` and the first egress packet open `out`, the
+  first ingress packet opens `in`. Later packets reuse the stored verdict,
+  so replies of allowed connections pass under default deny. An evicted
+  entry is re-evaluated (an `in` reply may then be judged as new).
+- The lockout guard (loopback, SSH session, resolver DNS) runs before the
+  table and also wins over default deny.
+
+**Steps.**
+1. **Kernel rule table.** Ordered table, matcher in common, hit counters,
+   exe ids. UI blocks become one-field deny rules at the top. Behaviour of
+   Phase 2 unchanged (same live checks).
+2. **Direction and default action.** `CONNS` state map, direction field,
+   default action, header shows `DEFAULT DENY`.
+3. **Rules file.** Load and validate `/etc/netmon/rules.toml` at startup:
+   ownership and mode check, TOML errors with line and reason, then netmon
+   starts with no file rules. Rules tab shows action, fields, comment, hits.
+4. **Save.** `s` in the Rules tab writes the current rules (UI and file) to
+   the file, atomically (temp file + rename), mode 0644 root.
 
 **Acceptance.**
 - Rules load at startup and appear in the Rules tab.
 - An invalid file is rejected with the line and the reason; netmon still
   starts with no rules.
+- `allow exe /usr/bin/curl port 443` above `deny exe /usr/bin/curl`: curl to
+  443 works, curl to 80 fails.
+- Default deny with `allow direction=out`: outbound works, replies pass,
+  an inbound connection to a local server fails, SSH stays up.
 - Unit tests for parsing, matching order and compilation to map entries.
 
 ## Phase 4 – Hostnames: DNS answers and TLS SNI

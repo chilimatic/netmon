@@ -2,26 +2,27 @@
 //! hooks, and reads the maps.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::File,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
 };
 
 use anyhow::{Context as _, bail};
 use aya::{
     Ebpf, EbpfLoader, include_bytes_aligned,
-    maps::{Array, HashMap, LpmTrie, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues, RingBuf, lpm_trie::Key},
+    maps::{Array, HashMap, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues, RingBuf},
     programs::{
         CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType, TracePoint, tc,
     },
     util::{KernelVersion, nr_cpus},
 };
 use netmon_common::{
-    CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, CaptureConfig, FlowKey, FlowStats, MAX_CAPTURE_FLOWS, MAX_FLOWS,
-    GuardKey, ListenKey, ListenOwner, MAX_EXE_PATH, PacketEvent, PortKey, SockOwner, TraceCfg,
+    CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, CFG_ACTIVE, CFG_COUNT, CaptureConfig, FlowKey, FlowStats, GuardKey,
+    ListenKey, ListenOwner, MAX_CAPTURE_FLOWS, MAX_EXE_PATH, MAX_FLOWS, MAX_RULES, PacketEvent, RuleEntry, SockOwner,
+    TraceCfg,
 };
 
-use crate::rules::BlockTarget;
+use crate::rules::addr_bytes;
 
 use crate::ifaces::Iface;
 
@@ -58,15 +59,16 @@ pub struct Probe {
     drops: PerCpuArray<MapData, u64>,
     sock_owner: HashMap<MapData, u64, SockOwner>,
     listeners: HashMap<MapData, ListenKey, ListenOwner>,
-    block_v4: LpmTrie<MapData, [u8; 4], u32>,
-    block_v6: LpmTrie<MapData, [u8; 16], u32>,
-    block_port: HashMap<MapData, PortKey, u32>,
-    rule_count: Array<MapData, u32>,
-    rules: u32,
+    rule_table: Array<MapData, RuleEntry>,
+    rule_cfg: Array<MapData, u32>,
+    /// Live table half, as last written to RULE_CFG.
+    active: u32,
     guard: HashMap<MapData, GuardKey, u8>,
-    rule_drops: PerCpuArray<MapData, u64>,
-    block_exe: HashMap<MapData, [u8; MAX_EXE_PATH], u32>,
-    block_tgid: HashMap<MapData, u32, u32>,
+    rule_hits: PerCpuArray<MapData, u64>,
+    exe_id_map: HashMap<MapData, [u8; MAX_EXE_PATH], u32>,
+    tgid_exe: HashMap<MapData, u32, u32>,
+    /// Exe ids as last written to EXE_IDS.
+    exe_ids: BTreeMap<String, u32>,
     cpus: usize,
     attached: HashSet<u32>,
     failed: HashSet<u32>,
@@ -105,14 +107,12 @@ impl Probe {
         let drops = PerCpuArray::try_from(take("CAPTURE_DROPS")?)?;
         let sock_owner = HashMap::try_from(take("SOCK_OWNER")?)?;
         let listeners = HashMap::try_from(take("LISTENERS")?)?;
-        let block_v4 = LpmTrie::try_from(take("BLOCK_V4")?)?;
-        let block_v6 = LpmTrie::try_from(take("BLOCK_V6")?)?;
-        let block_port = HashMap::try_from(take("BLOCK_PORT")?)?;
-        let rule_count = Array::try_from(take("RULE_COUNT")?)?;
+        let rule_table = Array::try_from(take("RULES")?)?;
+        let rule_cfg = Array::try_from(take("RULE_CFG")?)?;
         let guard = HashMap::try_from(take("GUARD")?)?;
-        let rule_drops = PerCpuArray::try_from(take("RULE_DROPS")?)?;
-        let block_exe = HashMap::try_from(take("BLOCK_EXE")?)?;
-        let block_tgid = HashMap::try_from(take("BLOCK_TGID")?)?;
+        let rule_hits = PerCpuArray::try_from(take("RULE_HITS")?)?;
+        let exe_id_map = HashMap::try_from(take("EXE_IDS")?)?;
+        let tgid_exe = HashMap::try_from(take("TGID_EXE")?)?;
         let trace_cfg = Array::try_from(take("TRACE_CFG")?)?;
         let mut hook_errors = attach_owner_hooks(&mut ebpf);
         hook_errors.extend(attach_exec_tracking(&mut ebpf, trace_cfg));
@@ -128,15 +128,14 @@ impl Probe {
             drops,
             sock_owner,
             listeners,
-            block_v4,
-            block_v6,
-            block_port,
-            rule_count,
-            rules: 0,
+            rule_table,
+            rule_cfg,
+            active: 0,
             guard,
-            rule_drops,
-            block_exe,
-            block_tgid,
+            rule_hits,
+            exe_id_map,
+            tgid_exe,
+            exe_ids: BTreeMap::new(),
             cpus,
             attached: HashSet::new(),
             failed: HashSet::new(),
@@ -260,8 +259,8 @@ fn event_format(event: &str) -> std::io::Result<String> {
         .or_else(|_| std::fs::read_to_string(format!("/sys/kernel/debug/tracing/{rel}")))
 }
 
-/// Attaches the exec and fork tracepoints that keep BLOCK_TGID current.
-/// Without them exe blocks still work through the /proc scan, but a new
+/// Attaches the exec and fork tracepoints that keep TGID_EXE current.
+/// Without them exe rules still work through the /proc scan, but a new
 /// process can connect before the next refresh.
 fn attach_exec_tracking(ebpf: &mut Ebpf, mut cfg_map: Array<MapData, TraceCfg>) -> Vec<String> {
     let r = (|| -> anyhow::Result<()> {
@@ -322,26 +321,16 @@ pub trait Kernel {
     fn sock_owner(&self, cookie: u64) -> Option<SockOwner>;
     /// Bound sockets recorded by the post_bind hooks: proto, address, owner.
     fn listeners(&self) -> Vec<(u8, SocketAddr, SockOwner)>;
-    /// Starts blocking `target` under rule `id`, with its drop count at 0.
-    fn block(&mut self, id: u32, target: &BlockTarget) -> anyhow::Result<()>;
-    fn unblock(&mut self, id: u32, target: &BlockTarget) -> anyhow::Result<()>;
-    /// Packets dropped and socket calls denied by rule `id`.
-    fn rule_drops(&self, id: u32) -> u64;
+    /// Replaces the rule table. Hit counters of the new table start at 0.
+    /// On error the old table stays live.
+    fn set_rules(&mut self, rules: &[RuleEntry], exe_ids: &BTreeMap<String, u32>) -> anyhow::Result<()>;
+    /// Packets and socket calls matched by the rule in `slot` of the live
+    /// table, since the last `set_rules`.
+    fn rule_hits(&self, slot: usize) -> u64;
     /// Remote endpoints that are never blocked.
     fn set_guard(&mut self, endpoints: &[SocketAddr]) -> anyhow::Result<()>;
-    /// Marks running processes as blocked by exe rule `id`.
-    fn mark_pids(&mut self, id: u32, pids: &[u32]);
-}
-
-fn addr_bytes(ip: IpAddr) -> (u8, [u8; 16]) {
-    let mut b = [0u8; 16];
-    match ip {
-        IpAddr::V4(v4) => {
-            b[..4].copy_from_slice(&v4.octets());
-            (4, b)
-        }
-        IpAddr::V6(v6) => (6, v6.octets()),
-    }
+    /// Marks running processes with the exe id of their exe.
+    fn mark_pids(&mut self, exe_id: u32, pids: &[u32]);
 }
 
 impl Kernel for Probe {
@@ -441,40 +430,47 @@ impl Kernel for Probe {
         self.sock_owner.get(&cookie, 0).ok()
     }
 
-    fn block(&mut self, id: u32, target: &BlockTarget) -> anyhow::Result<()> {
-        self.rule_drops.set(id, PerCpuValues::try_from(vec![0u64; self.cpus])?, 0)?;
-        match *target {
-            BlockTarget::Net(IpAddr::V4(ip), len) => self.block_v4.insert(&Key::new(len.into(), ip.octets()), id, 0)?,
-            BlockTarget::Net(IpAddr::V6(ip), len) => self.block_v6.insert(&Key::new(len.into(), ip.octets()), id, 0)?,
-            BlockTarget::Port(proto, port) => self.block_port.insert(PortKey { port, proto, _pad: 0 }, id, 0)?,
-            BlockTarget::Exe(ref path) => self.block_exe.insert(exe_key(path)?, id, 0)?,
+    fn set_rules(&mut self, rules: &[RuleEntry], exe_ids: &BTreeMap<String, u32>) -> anyhow::Result<()> {
+        if rules.len() > MAX_RULES as usize {
+            bail!("{} rules, the limit is {MAX_RULES}", rules.len());
         }
-        self.rules += 1;
-        self.rule_count.set(0, self.rules, 0)?;
-        Ok(())
-    }
-
-    fn unblock(&mut self, id: u32, target: &BlockTarget) -> anyhow::Result<()> {
-        match *target {
-            BlockTarget::Net(IpAddr::V4(ip), len) => self.block_v4.remove(&Key::new(len.into(), ip.octets()))?,
-            BlockTarget::Net(IpAddr::V6(ip), len) => self.block_v6.remove(&Key::new(len.into(), ip.octets()))?,
-            BlockTarget::Port(proto, port) => self.block_port.remove(&PortKey { port, proto, _pad: 0 })?,
-            BlockTarget::Exe(ref path) => {
-                self.block_exe.remove(&exe_key(path)?)?;
+        // New exe ids first: the new table may name them. Ids are stable
+        // while a rule names the exe, so the old table never sees a changed
+        // id.
+        for (path, id) in exe_ids {
+            if self.exe_ids.get(path) != Some(id) {
+                self.exe_id_map.insert(exe_key(path)?, *id, 0)?;
+            }
+        }
+        let half = 1 - self.active;
+        let base = half * MAX_RULES;
+        for (i, r) in rules.iter().enumerate() {
+            self.rule_table.set(base + i as u32, r, 0)?;
+            self.rule_hits.set(base + i as u32, PerCpuValues::try_from(vec![0u64; self.cpus])?, 0)?;
+        }
+        self.rule_cfg.set(CFG_COUNT + half, rules.len() as u32, 0)?;
+        self.rule_cfg.set(CFG_ACTIVE, half, 0)?;
+        self.active = half;
+        // Then drop exe ids no rule names any more, with their marks.
+        for (path, id) in &self.exe_ids {
+            if !exe_ids.contains_key(path) {
+                let _ = self.exe_id_map.remove(&exe_key(path)?);
+            }
+            if !exe_ids.values().any(|v| v == id) {
                 let marked: Vec<u32> =
-                    self.block_tgid.iter().flatten().filter(|(_, v)| *v == id).map(|(k, _)| k).collect();
+                    self.tgid_exe.iter().flatten().filter(|(_, v)| v == id).map(|(k, _)| k).collect();
                 for tgid in marked {
-                    let _ = self.block_tgid.remove(&tgid);
+                    let _ = self.tgid_exe.remove(&tgid);
                 }
             }
         }
-        self.rules = self.rules.saturating_sub(1);
-        self.rule_count.set(0, self.rules, 0)?;
+        self.exe_ids = exe_ids.clone();
         Ok(())
     }
 
-    fn rule_drops(&self, id: u32) -> u64 {
-        self.rule_drops.get(&id, 0).map(|v| v.iter().sum()).unwrap_or(0)
+    fn rule_hits(&self, slot: usize) -> u64 {
+        let i = self.active * MAX_RULES + slot as u32;
+        self.rule_hits.get(&i, 0).map(|v| v.iter().sum()).unwrap_or(0)
     }
 
     fn set_guard(&mut self, endpoints: &[SocketAddr]) -> anyhow::Result<()> {
@@ -485,10 +481,11 @@ impl Kernel for Probe {
         Ok(())
     }
 
-    fn mark_pids(&mut self, id: u32, pids: &[u32]) {
+    fn mark_pids(&mut self, exe_id: u32, pids: &[u32]) {
         for pid in pids {
-            // A full map leaves the process unblocked (fail-open).
-            let _ = self.block_tgid.insert(pid, id, 0);
+            // A full map leaves the process unmarked: its exe rules do not
+            // match (fail-open).
+            let _ = self.tgid_exe.insert(pid, exe_id, 0);
         }
     }
 
