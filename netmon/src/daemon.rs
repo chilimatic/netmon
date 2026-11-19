@@ -49,6 +49,8 @@ struct DaemonArgs {
     group: String,
 }
 
+/// Local TCP port netmond never blocks unless --guard-port says otherwise.
+const DEFAULT_GUARD_PORT: u16 = 22;
 /// UIs connected at most; more are refused.
 const MAX_CLIENTS: usize = 16;
 /// Lines queued per client. A snapshot each tick and packets every 50 ms:
@@ -73,7 +75,12 @@ enum Incoming {
 
 /// Entry point of the `netmond` binary.
 pub fn run() -> anyhow::Result<()> {
-    let args = DaemonArgs::parse();
+    let mut args = DaemonArgs::parse();
+    // A daemon started by systemd has no SSH session to guard: guard the
+    // SSH port, so a rule can never lock the admin out.
+    if args.monitor.guard_ports.is_empty() {
+        args.monitor.guard_ports.push(DEFAULT_GUARD_PORT);
+    }
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         bail!("netmond must run as root");

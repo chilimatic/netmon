@@ -20,7 +20,7 @@ use netmon_common::{
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
     MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
-    RuleEntry, SockOwner, TraceCfg, is_dhcp, is_loopback, parse_packet, rule_matches,
+    RuleEntry, SockOwner, TraceCfg, is_dhcp, is_loopback, is_unparsed, parse_packet, rule_matches,
     unmap_v4_in_place,
 };
 
@@ -204,7 +204,13 @@ extern "C" fn scan_rule(i: u64, ctx: *mut c_void) -> i64 {
 fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
     let (count, half) = live_rules();
     let tcp_udp = c.proto == IPPROTO_TCP || c.proto == IPPROTO_UDP;
-    if is_loopback(c.family, &c.remote_addr) || is_dhcp(c.proto, c.remote_port) || (tcp_udp && c.remote_port == 0) {
+    // Later fragments carry no ports: both are 0. A packet with only a
+    // source port of 0 is checked like any other.
+    let fragment = tcp_udp && c.remote_port == 0 && c.local_port == 0;
+    if is_loopback(c.family, &c.remote_addr) || is_dhcp(c.proto, c.local_port, c.remote_port) || fragment {
+        return ACTION_ALLOW;
+    }
+    if c.proto == IPPROTO_TCP && unsafe { GUARD.get(&GuardKey::local_tcp(c.local_port)) }.is_some() {
         return ACTION_ALLOW;
     }
     let mut scan = Scan {
@@ -221,7 +227,7 @@ fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
         return ACTION_ALLOW;
     }
     if scan.count == 0 {
-        return default_action(c.proto, dir);
+        return default_action(c.family, c.proto, dir);
     }
     if tgid != 0 {
         scan.exe = unsafe { TGID_EXE.get(&tgid) }.copied().unwrap_or(0);
@@ -229,15 +235,17 @@ fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
     unsafe {
         bpf_loop(scan.count, scan_rule as *mut c_void, &mut scan as *mut Scan as *mut c_void, 0);
     }
-    if scan.action == 0 { default_action(scan.proto, scan.dir) } else { scan.action }
+    if scan.action == 0 { default_action(scan.guard.family, scan.proto, scan.dir) } else { scan.action }
 }
 
 /// Action when no rule matches: the configured default for TCP and UDP
 /// (ask only outbound; unmatched inbound is denied), allow otherwise.
 /// Computed after the rule walk so it takes no stack across bpf_loop.
 #[inline(always)]
-fn default_action(proto: u8, dir: u8) -> u8 {
-    if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
+fn default_action(family: u8, proto: u8, dir: u8) -> u8 {
+    // An IPv6 packet whose upper header the parser did not reach could be
+    // TCP or UDP: it gets their default, not a free pass.
+    if proto != IPPROTO_TCP && proto != IPPROTO_UDP && !is_unparsed(family, proto) {
         return ACTION_ALLOW;
     }
     let d = cfg(CFG_DEFAULT);
@@ -264,7 +272,9 @@ fn packet_denied(key: &FlowKey, egress: bool, tgid: u32) -> bool {
     conn_key(key, &mut c);
     let mut dir = if egress { DIR_OUT } else { DIR_IN };
     if c.proto != IPPROTO_TCP && c.proto != IPPROTO_UDP {
-        return decide(&c, tgid, dir) == ACTION_DENY;
+        // No connection state and no question: an unparsed IPv6 packet in
+        // ask mode is dropped.
+        return decide(&c, tgid, dir) != ACTION_ALLOW;
     }
     let generation = cfg(CFG_GEN);
     if let Some(st) = unsafe { CONNS.get(&c) } {

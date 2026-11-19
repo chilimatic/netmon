@@ -447,7 +447,8 @@ pub trait Kernel {
     /// table, since the last `set_rules`.
     fn rule_hits(&self, slot: usize) -> u64;
     /// Remote endpoints that are never blocked.
-    fn set_guard(&mut self, endpoints: &[SocketAddr]) -> anyhow::Result<()>;
+    /// Remote endpoints and local TCP ports that are never blocked.
+    fn set_guard(&mut self, endpoints: &[SocketAddr], local_tcp_ports: &[u16]) -> anyhow::Result<()>;
     /// Marks running processes with the exe id of their exe.
     fn mark_pids(&mut self, exe_id: u32, pids: &[u32]);
 }
@@ -635,10 +636,13 @@ impl Kernel for Probe {
         self.rule_hits.get(&i, 0).map(|v| v.iter().sum()).unwrap_or(0)
     }
 
-    fn set_guard(&mut self, endpoints: &[SocketAddr]) -> anyhow::Result<()> {
+    fn set_guard(&mut self, endpoints: &[SocketAddr], local_tcp_ports: &[u16]) -> anyhow::Result<()> {
         for ep in endpoints {
             let (family, addr) = addr_bytes(ep.ip());
             self.guard.insert(GuardKey { addr, port: ep.port(), family, _pad: 0 }, 1, 0)?;
+        }
+        for port in local_tcp_ports.iter().filter(|p| **p != 0) {
+            self.guard.insert(GuardKey::local_tcp(*port), 1, 0)?;
         }
         Ok(())
     }

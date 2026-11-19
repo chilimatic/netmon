@@ -221,6 +221,7 @@ Options of the monitor:
 | `--expire-secs N` | 30 | Remove a connection after N s without traffic |
 | `--rules PATH` | `/etc/netmon/rules.toml` | Rules file. A missing default file is not an error. |
 | `--ask` | off | Ask mode: ask before outbound connections that no rule decides |
+| `--guard-port PORT` | 22 for `netmond`, none for `--local` | Local TCP port that no rule can block. Repeat for more, `0` for none. |
 
 With a daemon, give these options to `netmond`, not to `netmon`. `netmon`
 refuses `--rules` and `--ask` when it connects to a daemon.
@@ -356,7 +357,8 @@ The section [Packet capture](#packet-capture) explains it.
 
 One row per rule, in match order: number, action (green allow, red deny),
 match, comment and hits. A hit is one connection or socket call that the
-rule decided. A rule made in the UI and not saved shows `tmp`. With no
+rule decided. A rule from an `a` or `d` answer shows `tmp`: it ends when
+the monitor stops, and `s` does not save it. With no
 rules, the tab explains how to make one.
 
 ### Question window
@@ -428,17 +430,22 @@ How a deny works:
   interface.
 - An exe rule follows `exec` and `fork` through the tracepoints. A program
   started through a symlink (`python3` to `python3.13`) is found by the
-  `/proc` scan instead, within 10 s.
+  `/proc` scan instead, within 10 ticks (10 s by default).
 
 ### Lockout guard
 
 These are never blocked, whatever the rules say:
 
 - loopback
-- the SSH session that netmon (or netmond) started from (`SSH_CONNECTION`)
+- the SSH session that `netmon --local` started from (`SSH_CONNECTION`)
+- inbound and outbound TCP on the guarded local ports: `netmond` guards
+  port 22 (sshd), so that no rule can lock out a remote admin. Change it
+  with `--guard-port PORT` (repeat for more ports, `0` for none).
 - DNS (port 53) to the name servers in `/etc/resolv.conf`
-- DHCP and DHCPv6 (UDP 67, 68, 546, 547)
-- TCP and UDP fragments without ports
+- the DHCP and DHCPv6 client: local UDP port 68 with server port 67, local
+  546 with server 547
+- later fragments of TCP and UDP packets: they carry no ports, so both
+  ports are 0
 
 With `default = "deny"`, allow what the host needs. Examples are the DNS
 upstream server of a local resolver (systemd-resolved) and NTP.
@@ -450,8 +457,8 @@ upstream server of a local resolver (systemd-resolved) and NTP.
 - In Processes, `b` blocks the exe of the selected process. This includes
   processes started later.
 - The same key again removes the block.
-- A new block goes to the top of the list. It is temporary: it ends when
-  the monitor stops, unless you save it with `s` in the Rules tab.
+- A new block goes to the top of the list. It stays until the monitor
+  stops. `s` in the Rules tab saves it to the rules file.
 
 ### Rules file
 
@@ -527,10 +534,13 @@ The question lists all waiting connections of the program by destination:
 |---|---|
 | `←` `→` | Select the scope: `program` (any destination), `port` (this protocol and port, any host) or `destination` (this address and port) |
 | `↑` `↓` | Select the destination that the `port` and `destination` scopes and `o`/`x` use |
-| `a` / `d` | Allow or deny with a temporary rule for the scope (`tmp` in the Rules tab) |
+| `a` / `d` | Allow or deny with a temporary rule for the scope (`tmp` in the Rules tab, never saved) |
 | `A` / `D` | Allow or deny with a lasting rule. `s` in the Rules tab saves it. |
 | `o` / `x` | Allow or deny only the waiting connections of the selected destination, without a rule |
 
+- A rule from an answer is for outbound connections only (`out` in the
+  rule line). It never opens inbound traffic, for example from source port
+  53, or to the listening ports of the program.
 - A new rule decides at once every waiting connection that it covers, in
   every question.
 - The kernel drops the packets of a waiting connection. TCP sends its SYN
@@ -615,8 +625,8 @@ questions and the capture itself are shared.
 - A clean stop (`systemctl stop netmond`, `SIGTERM`, `Ctrl-C`) removes the
   socket and all programs. No rule is in force after a clean stop.
 - `systemctl restart netmond` is a clean stop and a new start. For a short
-  time no rule is in force. Then the rules file loads. Temporary rules are
-  lost.
+  time no rule is in force. Then the rules file loads. Rules that were not
+  saved are lost.
 
 `netmond` pins its links under `/sys/fs/bpf/netmon`: the TC links per
 interface, the cgroup hooks and the tracepoints. A pinned link stays
@@ -625,8 +635,13 @@ attached when the process ends, and it keeps its program and maps. Thus if
 
 - Blocks and the default action stay. In ask mode, nobody answers, and new
   outbound connections that no rule decides are dropped.
-- Temporary rules also stay until the next start.
+- Rules that were not saved also stay until the next start.
 - Counting and hostnames stop, because nothing reads the maps.
+
+Known gap: when `netmond` starts again (also 2 s after a crash), it
+removes the old programs before the new rules are in force. Thus the
+rules survive a crash only until the restart. `docs/REVIEW2.md` (L1)
+describes the fix.
 
 systemd starts `netmond` again 2 s after a crash (`Restart=on-failure`). At
 start, `netmond` first makes sure that no other `netmond` runs. Then it
@@ -722,9 +737,12 @@ switches one number. The kernel therefore never sees a half-written table.
 
 ### Fail-open for errors, lockout guard always
 
-A packet that the parser cannot read passes. The lockout guard (loopback,
-the SSH session, DNS to the system resolver, DHCP) is never blocked. A wrong
-rule therefore never cuts the remote session that is needed to fix it.
+A packet that the parser cannot read passes, with one exception: an IPv6
+packet whose upper header the parser did not reach gets the default action
+of TCP and UDP. Otherwise a long chain of extension headers would pass
+every rule. The lockout guard (loopback, the SSH port and session, DNS to
+the system resolver, the DHCP client) is never blocked. A wrong rule
+therefore never cuts the remote session that is needed to fix it.
 
 ### Rules survive a daemon crash, a clean stop removes them
 
@@ -830,8 +848,9 @@ Limits of the `/proc` sources:
 - Forwarded traffic (router, bridge) shows as if the host sent it: on
   egress, the source counts as local.
 - netmon follows up to 2 VLAN tags and 6 IPv6 extension headers.
-  Fragments after the first, and packets with more headers, count with port
-  0. The lockout guard lets fragments without ports pass.
+  Fragments after the first count with port 0 and pass. An IPv6 packet
+  with more headers counts with the last header type as its protocol and
+  gets the default action of TCP and UDP.
 - Interface totals count from the start of the monitor, not from boot.
 
 ### Firewall
@@ -839,8 +858,12 @@ Limits of the `/proc` sources:
 - A connection that `CONNS` forgot while it was open (map full) is decided
   again on its next packet. It can then count as opened by the other side.
 - Only TCP and UDP get the default action. ICMP and other protocols pass.
-- An exe started through a symlink is marked by the `/proc` scan, so it
-  can connect for up to 10 s before its rule applies.
+- An exe started through a symlink or a relative path is marked by the
+  `/proc` scan, so it can connect for up to 10 ticks before its rule
+  applies.
+- Exe rules do not stop an attacker who runs with the same user id: a copy
+  of the binary, `LD_PRELOAD` or ptrace get around them. They control
+  programs that cooperate.
 
 ## Development
 

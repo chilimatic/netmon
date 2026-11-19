@@ -39,6 +39,10 @@ pub(crate) struct Args {
     /// "ask"); unmatched inbound connections are denied.
     #[arg(long)]
     pub(crate) ask: bool,
+    /// Local TCP port that is never blocked, for SSH (repeat for more).
+    /// netmond guards 22 unless given; 0 guards none.
+    #[arg(long = "guard-port", value_name = "PORT")]
+    pub(crate) guard_ports: Vec<u16>,
 }
 
 impl Args {
@@ -189,7 +193,7 @@ impl Monitor {
         let hook_errors = probe.hook_errors.clone();
         let exec_tracking = probe.exec_tracking;
         let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-        if let Err(e) = probe.set_guard(&guard_endpoints(ssh_connection().as_deref(), &resolv)) {
+        if let Err(e) = probe.set_guard(&guard_endpoints(ssh_connection().as_deref(), &resolv), &args.guard_ports) {
             probe.unpin();
             return Err(e);
         }
@@ -720,7 +724,12 @@ impl<K: Kernel> Monitor<K> {
         let old = self.rules.clone();
         let msg = match edit(&mut self.rules) {
             Ok(m) => m,
-            Err(e) => return e,
+            // A failed edit can have changed some rules already (a rules
+            // file that fails at its third rule): none of it stays.
+            Err(e) => {
+                self.rules = old;
+                return e;
+            }
         };
         match self.probe.set_rules(&self.rules.entries(), self.rules.exe_ids(), self.rules.default.kernel()) {
             Ok(()) => {
@@ -840,7 +849,7 @@ mod tests {
     }
 
     fn args(interval_ms: u64, expire_secs: u64) -> Args {
-        Args { interval_ms, expire_secs, rules: None, ask: false }
+        Args { interval_ms, expire_secs, rules: None, ask: false, guard_ports: Vec::new() }
     }
 
     #[test]
@@ -964,7 +973,7 @@ mod tests {
         fn rule_hits(&self, slot: usize) -> u64 {
             slot as u64 + 100
         }
-        fn set_guard(&mut self, _: &[std::net::SocketAddr]) -> anyhow::Result<()> {
+        fn set_guard(&mut self, _: &[std::net::SocketAddr], _: &[u16]) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -1308,7 +1317,7 @@ mod tests {
         act(&mut m, &mut app, Action::AskScope(1));
         act(&mut m, &mut app, Action::Answer(Answer::Rule { allow: true, always: false }));
         assert!(m.asks.pending.is_empty(), "{}", app.status);
-        assert_eq!(m.rules.rules[0].m.to_string(), "tcp port 22");
+        assert_eq!(m.rules.rules[0].m.to_string(), "out tcp port 22");
         let unknown = netmon_common::AskEvent { key: conn(40007, 23), tgid: 0, _pad: 0 };
         m.probe.asks.push_back(unknown);
         m.poll_asks(t0);
@@ -1473,5 +1482,22 @@ mod tests {
         m.probe.asks.push_back(ask(netmon_common::ConnKey { local_port: 50002, ..k }));
         m.poll_asks(secs(t0, 4));
         assert_eq!(m.containers_asked, Some(secs(t0, 4)), "a new connection");
+    }
+
+    #[test]
+    fn failed_rule_edit_leaves_nothing_behind() {
+        let (mut m, _) = monitor();
+        let msg = m.change_rules(|r| {
+            r.default = rules::Action::Deny;
+            r.insert(usize::MAX, rules::Action::Deny, BlockTarget::Port(6, 25).into(), "")?;
+            r.insert(usize::MAX, rules::Action::Deny, BlockTarget::Port(6, 25).into(), "").map(|_| String::new())
+        });
+        assert!(msg.contains("already exists"), "{msg}");
+        assert!(m.rules.rules.is_empty(), "the first rule of the failed edit is gone");
+        assert_eq!(m.rules.default, rules::Action::Allow, "and the default too");
+        assert!(m.probe.table.is_empty());
+        // The next change does not carry the failed edit into the kernel.
+        m.toggle_block(BlockTarget::Port(17, 53));
+        assert_eq!((m.rules.rules.len(), m.probe.default), (1, netmon_common::ACTION_ALLOW));
     }
 }

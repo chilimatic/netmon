@@ -160,8 +160,19 @@ pub struct ConnState {
 /// DHCP and DHCPv6 (client and server ports). Never blocked, so a host
 /// with default deny keeps its address.
 #[inline(always)]
-pub fn is_dhcp(proto: u8, port: u16) -> bool {
-    proto == IPPROTO_UDP && (port == 67 || port == 68 || port == 546 || port == 547)
+/// DHCP and DHCPv6 of this host as a client: local 68 with server 67,
+/// local 546 with server 547. Both ports must match: a remote host that
+/// only picks source port 67 reaches nothing but the DHCP client port.
+pub fn is_dhcp(proto: u8, local_port: u16, remote_port: u16) -> bool {
+    proto == IPPROTO_UDP && ((local_port == 68 && remote_port == 67) || (local_port == 546 && remote_port == 547))
+}
+
+/// IPv6 extension header types the parser follows. A packet whose
+/// protocol is still one of these after the walk has an upper header the
+/// parser did not reach.
+#[inline(always)]
+pub fn is_unparsed(family: u8, proto: u8) -> bool {
+    family == 6 && matches!(proto, 0 | 43 | 44 | 51 | 60)
 }
 
 /// One rule of the ordered rule table.
@@ -292,7 +303,8 @@ pub struct TraceCfg {
     pub fork_child_pid: u32,
 }
 
-/// A remote endpoint that is never blocked (SSH session, DNS resolver).
+/// A remote endpoint that is never blocked (SSH session, DNS resolver),
+/// or, with family 0, a local TCP port that is never blocked (sshd).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GuardKey {
@@ -300,6 +312,14 @@ pub struct GuardKey {
     pub port: u16,
     pub family: u8,
     pub _pad: u8,
+}
+
+impl GuardKey {
+    /// The key for a guarded local TCP port.
+    #[inline(always)]
+    pub fn local_tcp(port: u16) -> Self {
+        GuardKey { addr: [0; 16], port, family: 0, _pad: IPPROTO_TCP }
+    }
 }
 
 /// True for 127.0.0.0/8, ::1 and IPv4-mapped 127.x. Loopback is never
@@ -726,7 +746,11 @@ mod tests {
         k.ifindex = 7;
         k.local_addr[0] = 2;
         assert_eq!(ConnKey::from_flow(&k), c, "no interface or local address in the key");
-        assert!(is_dhcp(IPPROTO_UDP, 67) && is_dhcp(IPPROTO_UDP, 547) && !is_dhcp(IPPROTO_TCP, 67));
+        assert!(is_dhcp(IPPROTO_UDP, 68, 67) && is_dhcp(IPPROTO_UDP, 546, 547));
+        assert!(!is_dhcp(IPPROTO_TCP, 68, 67), "UDP only");
+        assert!(!is_dhcp(IPPROTO_UDP, 5432, 67), "source port 67 to another port");
+        assert!(!is_dhcp(IPPROTO_UDP, 67, 68), "not a DHCP server");
+        assert!(is_unparsed(6, 60) && is_unparsed(6, 44) && !is_unparsed(6, IPPROTO_TCP) && !is_unparsed(4, 0));
     }
 
     #[test]

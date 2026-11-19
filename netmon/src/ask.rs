@@ -17,7 +17,7 @@ use netmon_common::ConnKey;
 
 use crate::{
     collector::addr,
-    rules::{BlockTarget, Match},
+    rules::{BlockTarget, Dir, Match},
 };
 
 /// No answer in this time: deny the waiting connections once.
@@ -105,16 +105,20 @@ impl Prompt {
 
     /// The rule match for the current scope. Without an exe the rule
     /// covers every process, and the program scope (which would be "all
-    /// traffic") gives None.
+    /// traffic") gives None. The question is about outbound connections,
+    /// so the rule is too: an answer never opens inbound traffic (from
+    /// source port 53, or to the program's listeners).
     pub fn rule_match(&self) -> Option<Match> {
         let exe = (!self.exe.is_empty()).then(|| self.exe.clone());
         let d = self.selected_dest()?;
+        let dir = Some(Dir::Out);
         Some(match self.scope {
             Scope::Program if exe.is_none() => return None,
-            Scope::Program => Match { exe, ..Match::default() },
-            Scope::Port => Match { exe, proto: Some(d.proto), ports: Some((d.port, d.port)), ..Match::default() },
+            Scope::Program => Match { exe, dir, ..Match::default() },
+            Scope::Port => Match { exe, dir, proto: Some(d.proto), ports: Some((d.port, d.port)), ..Match::default() },
             Scope::Destination => Match {
                 exe,
+                dir,
                 proto: Some(d.proto),
                 ports: Some((d.port, d.port)),
                 ..Match::from(BlockTarget::host(d.remote))
@@ -258,11 +262,11 @@ mod tests {
         let p = &mut a.pending[0];
         p.move_selection(5);
         assert_eq!(p.selected, 1, "clamped");
-        assert_eq!(p.rule_match().unwrap().to_string(), "exe /usr/bin/curl");
+        assert_eq!(p.rule_match().unwrap().to_string(), "out exe /usr/bin/curl");
         p.scope = p.scope.step(1);
-        assert_eq!(p.rule_match().unwrap().to_string(), "exe /usr/bin/curl tcp port 80");
+        assert_eq!(p.rule_match().unwrap().to_string(), "out exe /usr/bin/curl tcp port 80");
         p.scope = p.scope.step(1);
-        assert_eq!(p.rule_match().unwrap().to_string(), "exe /usr/bin/curl tcp port 80 host 93.184.215.15");
+        assert_eq!(p.rule_match().unwrap().to_string(), "out exe /usr/bin/curl tcp port 80 host 93.184.215.15");
         assert_eq!(p.scope.step(1), Scope::Program, "wraps");
         assert_eq!(Scope::Program.step(-1), Scope::Destination);
         let gone = p.drop_decided(|d| d.port == 80);
@@ -271,7 +275,7 @@ mod tests {
         unknown.dests = p.dests.clone();
         assert_eq!(unknown.rule_match(), None, "no exe: no program rule");
         unknown.scope = Scope::Port;
-        assert_eq!(unknown.rule_match().unwrap().to_string(), "tcp port 443", "any process");
+        assert_eq!(unknown.rule_match().unwrap().to_string(), "out tcp port 443", "any process, outbound only");
         let mut a2 = Asks::default();
         a2.add(key(9, 1, 53), info("", 0, t0), None);
         assert_eq!(a2.pending[0].scope, Scope::Port, "unknown process starts at port scope");

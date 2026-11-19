@@ -688,7 +688,7 @@ mod tests {
         assert!(s.contains("netmon asks") && s.contains("wants 3 connections to 2 destinations"), "{s}");
         assert!(s.contains("example.com (93.184.215.14)  tcp 443  ×2"), "{s}");
         assert!(s.contains("> 93.184.215.15  tcp 80"), "{s}");
-        assert!(s.contains("rule: exe /usr/bin/curl tcp port 80") && s.contains("2 more waiting"), "{s}");
+        assert!(s.contains("rule: out exe /usr/bin/curl tcp port 80") && s.contains("2 more waiting"), "{s}");
         app.ask = None;
         app.tab = Tab::Rules;
         term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &rules)).unwrap();

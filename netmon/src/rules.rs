@@ -1,6 +1,6 @@
-//! Rules held by netmon: an ordered list, first match wins. They live in
-//! the kernel's rule table only while netmon runs (fail-open: quitting or a
-//! crash removes every rule).
+//! Rules held by the monitor: an ordered list, first match wins. A clean
+//! stop removes them from the kernel. netmond pins its links, so after a
+//! crash the last rules stay until the next start; local mode pins nothing.
 
 use std::{
     collections::BTreeMap,
