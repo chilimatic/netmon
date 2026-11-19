@@ -309,16 +309,47 @@ lost; the app's own retry gets through. NFQUEUE may come later.
 
 ## Phase 6 – Container and namespace awareness
 
-**Why.** Container traffic shows as `?` and is counted twice (veth and
-bridge).
+**Status (2026-11-19): in progress.** Step 1 (container owners) done and
+tested live. Step 2 next.
+
+**Why.** Container traffic shows as `?` (or `unknown process` in ask mode)
+and is counted several times (veth, bridge, uplink). Seen live: Docker with
+17 bridges and veths on the development host.
+
+**Facts.** A packet loses its socket when it crosses into the host's
+network namespace, so TC on the host never sees a cookie for container
+traffic. The cgroup hooks do see container processes, but connect runs
+before the local port exists. `/proc/<pid>/net/*` shows the socket table
+of that process's namespace; `/proc/*/fd` already covers container
+processes, so socket inodes resolve to their owners as on the host.
 
 **Design.**
-- Map veth peers to network namespaces (`/proc/<pid>/ns/net`, `ip link`
-  peer index) and namespaces to container names (Docker/Podman via
-  `/proc/<pid>/cgroup`).
-- Read `/proc/<pid>/net/{tcp,udp}` per namespace for owners.
-- Option to show only "uplink" interfaces in totals, so bridged traffic is
-  counted once.
+- Namespaces: group `/proc/*/ns/net` by inode, one pid per namespace,
+  skip netmon's own. Container name from the pid's cgroup: Docker
+  (`docker-<id>.scope`, name from `/var/lib/docker/containers/<id>/
+  config.v2.json`), Podman (`libpod-<id>.scope`, short id), else
+  `netns:<inode>`.
+- Per namespace, read `/proc/<pid>/net/{tcp,udp}{,6}` into a table, in a
+  background thread: measured 150-250 ms for 32 namespaces (each UDP read
+  walks the kernel's whole UDP hash table). Read only while a flow lacks a
+  good owner, at most every 3 s, and when an ask event has no process.
+  Flows with no host owner are matched:
+  - veth and bridge interfaces see the container as the remote end:
+    exact lookup with local and remote swapped;
+  - the uplink after masquerade: remote address, remote port and local
+    port (masquerade keeps the port unless it clashes).
+- Owner source `container`; Process column `container:<name>/<comm>`.
+  Ask questions for traffic without a socket name the container.
+- Totals count physical interfaces only (`/sys/class/net/<if>/device`);
+  `v` shows or hides veth and bridge rows (hidden by default).
+
+**Steps.**
+1. **Container owners.** Namespace scan, per-namespace socket tables,
+   matching, container names, ask questions.
+2. **Count once.** Physical-only totals, `v` toggle.
+
+**Limits.** Rules cannot name a container yet: the kernel sees no process
+for its traffic on the host. Rules by address and port still apply.
 
 **Acceptance.**
 - Rows for container traffic show `container:<name>/<process>`.

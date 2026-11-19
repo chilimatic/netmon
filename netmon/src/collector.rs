@@ -7,7 +7,7 @@ use std::{
 
 use netmon_common::{ConnState, FlowKey, FlowStats};
 
-use crate::procmap::{Listeners, Owner, SocketTable};
+use crate::procmap::{ContainerTable, Listeners, Owner, SocketTable};
 
 /// Ticks of history kept for the graphs.
 pub const HISTORY: usize = 120;
@@ -168,6 +168,7 @@ impl Collector {
     pub fn resolve(
         &mut self,
         table: &SocketTable,
+        containers: &[ContainerTable],
         listeners: &Listeners,
         kernel: impl Fn(u64) -> Option<Owner>,
     ) {
@@ -198,7 +199,19 @@ impl Collector {
                     f.owner_source = src;
                 }
             }
+            // Traffic of containers: no host socket, or only a guess by port.
+            let mut container_state = None;
+            if f.owner_source <= OwnerSource::Container
+                && let Some((o, exact)) = containers.iter().find_map(|t| t.lookup(f.key.proto, f.local, f.remote))
+            {
+                f.owner = Some(o.clone());
+                f.owner_source = OwnerSource::Container;
+                if exact {
+                    container_state = Some("container");
+                }
+            }
             f.state = match proc {
+                _ if f.owner_source == OwnerSource::Container => container_state.unwrap_or("nat"),
                 Some((i, _)) => i.state,
                 None if f.owner.is_some() => "closed",
                 None => "",
@@ -214,6 +227,8 @@ pub enum OwnerSource {
     Unknown,
     /// /proc socket matched by local port and bound address only.
     ProcPort,
+    /// Socket of a container (other network namespace).
+    Container,
     /// Kernel post_bind record of who bound the local address.
     Listener,
     /// /proc socket with the exact 4-tuple.
@@ -227,6 +242,7 @@ impl OwnerSource {
         match self {
             OwnerSource::Unknown => "",
             OwnerSource::ProcPort => "/proc (port)",
+            OwnerSource::Container => "container /proc",
             OwnerSource::Listener => "kernel (bind)",
             OwnerSource::ProcExact => "/proc",
             OwnerSource::Kernel => "kernel",
@@ -349,13 +365,13 @@ mod tests {
             &HashMap::from([(9, Owner::new(7, "proc"))]),
         );
         let kernel = |cookie: u64| (cookie == 77).then(|| Owner::new(8, "hook"));
-        c.resolve(&table, &Listeners::default(), kernel);
+        c.resolve(&table, &[], &Listeners::default(), kernel);
         assert_eq!(c.flows[&k].owner.as_ref().unwrap().pid, 7, "no cookie yet: /proc");
         c.ingest([(k, FlowStats { tx_bytes: 2, cookie: 77, ..Default::default() })], 1.0);
-        c.resolve(&table, &Listeners::default(), kernel);
+        c.resolve(&table, &[], &Listeners::default(), kernel);
         assert_eq!(c.flows[&k].owner.as_ref().unwrap().pid, 8, "cookie: kernel owner");
         assert_eq!(c.flows[&k].state, "ESTAB", "state still from /proc");
-        c.resolve(&table, &Listeners::default(), |_| unreachable!("looked up once per cookie"));
+        c.resolve(&table, &[], &Listeners::default(), |_| unreachable!("looked up once per cookie"));
     }
 
     #[test]
@@ -366,7 +382,7 @@ mod tests {
         let k = key(1, 2);
         c.ingest([(k, FlowStats { rx_bytes: 1, ..Default::default() })], 1.0);
         let listeners = Listeners::build([(6, "0.0.0.0:1".parse().unwrap(), Owner::new(5, "server"))]);
-        c.resolve(&SocketTable::default(), &listeners, |_| None);
+        c.resolve(&SocketTable::default(), &[], &listeners, |_| None);
         let f = &c.flows[&k];
         assert_eq!((f.owner.as_ref().unwrap().pid, f.owner_source), (5, OwnerSource::Listener));
         // The exact /proc socket (a forked worker) is better.
@@ -374,10 +390,10 @@ mod tests {
             vec![RawSock { proto: 6, local: "10.0.0.2:1".parse().unwrap(), remote: "1.1.1.1:443".parse().unwrap(), state: "ESTAB", inode: 9 }],
             &HashMap::from([(9, Owner::new(6, "worker"))]),
         );
-        c.resolve(&table, &listeners, |_| None);
+        c.resolve(&table, &[], &listeners, |_| None);
         assert_eq!(c.flows[&k].owner.as_ref().unwrap().pid, 6);
         // Socket closed: only the listener is left; the worker stays.
-        c.resolve(&SocketTable::default(), &listeners, |_| None);
+        c.resolve(&SocketTable::default(), &[], &listeners, |_| None);
         let f = &c.flows[&k];
         assert_eq!((f.owner.as_ref().unwrap().pid, f.owner_source, f.state), (6, OwnerSource::ProcExact, "closed"));
     }

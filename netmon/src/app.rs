@@ -7,7 +7,7 @@ use netmon_common::{FlowKey, IPPROTO_TCP, IPPROTO_UDP};
 use crate::{
     collector::{Collector, Flow},
     ifaces::Names,
-    procmap::ProcDetails,
+    procmap::{Owner, ProcDetails},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -429,6 +429,7 @@ impl App {
 
 fn owner_cols(f: &Flow) -> (String, String) {
     match &f.owner {
+        Some(Owner { container: Some(c), comm, pid, .. }) => (format!("container:{c}/{comm}"), pid.to_string()),
         Some(o) => (o.comm.clone(), o.pid.to_string()),
         None => ("?".into(), "-".into()),
     }
@@ -491,7 +492,7 @@ pub fn human(bytes: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::procmap::{Owner, RawSock, SocketTable};
+    use crate::procmap::{RawSock, SocketTable};
     use netmon_common::{FlowKey, FlowStats};
 
     fn collector() -> Collector {
@@ -508,7 +509,7 @@ mod tests {
             vec![RawSock { proto: IPPROTO_TCP, local: "10.0.0.2:1".parse().unwrap(), remote: "1.1.1.1:443".parse().unwrap(), state: "ESTAB", inode: 9 }],
             &HashMap::from([(9, Owner::new(7, "curl"))]),
         );
-        c.resolve(&table, &crate::procmap::Listeners::default(), |_| None);
+        c.resolve(&table, &[], &crate::procmap::Listeners::default(), |_| None);
         c
     }
 
@@ -604,6 +605,16 @@ mod tests {
         app.on_key(Key::Home);
         assert_eq!(app.sync_selection(&ids(&[3, 2])), 0);
         assert_eq!(app.sync_selection(&[]), 0);
+    }
+
+    #[test]
+    fn container_owner_shows_the_container() {
+        let mut c = Collector::new(30);
+        let k = FlowKey { family: 4, proto: 6, local_port: 1, remote_port: 443, ifindex: 2, ..Default::default() };
+        c.ingest([(k, FlowStats { tx_bytes: 5, ..Default::default() })], 1.0);
+        c.flows.get_mut(&k).unwrap().owner = Some(Owner { container: Some("web".into()), ..Owner::new(7, "curl") });
+        let rows = App::default().conn_rows(&c, &Names::default());
+        assert_eq!((rows[0].process.as_str(), rows[0].pid.as_str()), ("container:web/curl", "7"));
     }
 
     #[test]

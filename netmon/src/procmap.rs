@@ -1,7 +1,8 @@
 //! Maps sockets to the owning process with /proc.
 //! Reads /proc/net/{tcp,tcp6,udp,udp6} for socket inodes, then
 //! /proc/<pid>/fd for which process holds each inode.
-//! Only sockets in this process's network namespace are visible.
+//! Sockets of other network namespaces (containers) come from
+//! /proc/<pid>/net/* of a process in that namespace.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -24,6 +25,8 @@ pub struct Owner {
     /// Set by `ProcCache::fill`. None until then, or when unreadable
     /// (process gone, kernel thread).
     pub details: Option<ProcDetails>,
+    /// Container (network namespace) the socket lives in, if not netmon's.
+    pub container: Option<String>,
 }
 
 /// Facts about a process that the process itself cannot fake.
@@ -52,6 +55,7 @@ impl Owner {
             comm: crate::text::sanitize(&String::from_utf8_lossy(&o.comm[..end])),
             uid: Some(o.uid),
             details: None,
+            container: None,
         }
     }
 }
@@ -186,10 +190,67 @@ impl SocketTable {
     /// Reads the current socket table from /proc. Owners come from the
     /// cache, which scans /proc/*/fd only for sockets it has not seen.
     pub fn read(cache: &mut OwnerCache) -> Self {
-        let socks = read_sockets();
+        let socks = read_sockets(None);
         let inodes: HashSet<u64> = socks.iter().map(|s| s.inode).collect();
         cache.refresh(&inodes, |pid| Path::new(&format!("/proc/{pid}")).exists(), read_owners);
         Self::build(socks, &cache.owners)
+    }
+}
+
+/// Reads the socket tables of other network namespaces (containers). Costly
+/// (each UDP table read walks the kernel's whole UDP hash table: ~5 ms per
+/// namespace), so callers read them only when needed. `cache` is kept apart
+/// from the host's: the /proc/*/fd scan behind it covers container
+/// processes too.
+pub fn read_containers(cache: &mut OwnerCache, namespaces: &[crate::netns::Netns]) -> Vec<ContainerTable> {
+    let foreign: Vec<(String, Vec<RawSock>)> = namespaces
+        .iter()
+        .filter_map(|n| {
+            let p = procfs::process::Process::new(n.pid as i32).ok()?;
+            Some((n.name.clone(), read_sockets(Some(&p))))
+        })
+        .collect();
+    let inodes: HashSet<u64> = foreign.iter().flat_map(|(_, s)| s).map(|s| s.inode).collect();
+    cache.refresh(&inodes, |pid| Path::new(&format!("/proc/{pid}")).exists(), read_owners);
+    foreign.into_iter().map(|(name, socks)| ContainerTable::build(&name, socks, &cache.owners)).collect()
+}
+
+/// Sockets of one container's network namespace. Its flows are seen on the
+/// host from outside: on veth and bridge interfaces the container is the
+/// remote end; on the uplink, after masquerade, the local address is the
+/// host's but the remote end and (usually) the local port are the
+/// container socket's.
+#[derive(Default)]
+pub struct ContainerTable {
+    exact: HashMap<(u8, SocketAddr, SocketAddr), Owner>,
+    by_remote: HashMap<(u8, SocketAddr, u16), Owner>,
+}
+
+impl ContainerTable {
+    pub fn build(name: &str, socks: Vec<RawSock>, owners: &HashMap<u64, Owner>) -> Self {
+        let mut t = ContainerTable::default();
+        for s in socks {
+            let Some(o) = owners.get(&s.inode) else { continue };
+            let o = Owner { container: Some(name.to_string()), ..o.clone() };
+            let (local, remote) = (normalize(s.local), normalize(s.remote));
+            if remote.port() == 0 {
+                continue;
+            }
+            t.by_remote.insert((s.proto, remote, local.port()), o.clone());
+            t.exact.insert((s.proto, local, remote), o);
+        }
+        t
+    }
+
+    /// The container process behind a flow seen on the host with these
+    /// local and remote ends. True if the match is exact (veth, bridge),
+    /// false if it is by remote end and port (uplink after NAT).
+    pub fn lookup(&self, proto: u8, local: SocketAddr, remote: SocketAddr) -> Option<(&Owner, bool)> {
+        let (local, remote) = (normalize(local), normalize(remote));
+        if let Some(o) = self.exact.get(&(proto, remote, local)) {
+            return Some((o, true));
+        }
+        self.by_remote.get(&(proto, remote, local.port())).map(|o| (o, false))
     }
 }
 
@@ -341,9 +402,15 @@ fn tcp_state(s: &TcpState) -> &'static str {
     }
 }
 
-fn read_sockets() -> Vec<RawSock> {
+/// Sockets of netmon's network namespace (`None`) or of the namespace
+/// process `p` is in.
+fn read_sockets(p: Option<&procfs::process::Process>) -> Vec<RawSock> {
     let mut out = Vec::new();
-    for tcp in [procfs::net::tcp(), procfs::net::tcp6()].into_iter().flatten() {
+    let (tcp, tcp6, udp, udp6) = match p {
+        Some(p) => (p.tcp(), p.tcp6(), p.udp(), p.udp6()),
+        None => (procfs::net::tcp(), procfs::net::tcp6(), procfs::net::udp(), procfs::net::udp6()),
+    };
+    for tcp in [tcp, tcp6].into_iter().flatten() {
         out.extend(tcp.into_iter().map(|e| RawSock {
             proto: IPPROTO_TCP,
             local: e.local_address,
@@ -352,7 +419,7 @@ fn read_sockets() -> Vec<RawSock> {
             inode: e.inode,
         }));
     }
-    for udp in [procfs::net::udp(), procfs::net::udp6()].into_iter().flatten() {
+    for udp in [udp, udp6].into_iter().flatten() {
         out.extend(udp.into_iter().map(|e| RawSock {
             proto: IPPROTO_UDP,
             local: e.local_address,
@@ -481,6 +548,30 @@ mod tests {
 
     fn owner(pid: u32) -> Owner {
         Owner::new(pid, &format!("p{pid}"))
+    }
+
+    #[test]
+    fn container_sockets_seen_from_the_host() {
+        let sa = |s: &str| s.parse::<SocketAddr>().unwrap();
+        // curl in a container: 172.18.0.2:40000 -> 93.184.215.14:443.
+        let sock = RawSock {
+            proto: IPPROTO_TCP,
+            local: sa("172.18.0.2:40000"),
+            remote: sa("93.184.215.14:443"),
+            state: "ESTABLISHED",
+            inode: 7,
+        };
+        let listen = RawSock { local: sa("0.0.0.0:80"), remote: sa("0.0.0.0:0"), inode: 8, ..sock.clone() };
+        let owners = HashMap::from([(7, owner(4242)), (8, owner(4243))]);
+        let t = ContainerTable::build("web", vec![sock, listen], &owners);
+        // veth/bridge: the container is the flow's remote end.
+        let (o, exact) = t.lookup(IPPROTO_TCP, sa("93.184.215.14:443"), sa("172.18.0.2:40000")).unwrap();
+        assert_eq!((o.pid, o.container.as_deref(), exact), (4242, Some("web"), true));
+        // Uplink after masquerade: host address, same port.
+        let (o, exact) = t.lookup(IPPROTO_TCP, sa("192.168.1.5:40000"), sa("93.184.215.14:443")).unwrap();
+        assert_eq!((o.pid, exact), (4242, false));
+        assert!(t.lookup(IPPROTO_TCP, sa("192.168.1.5:40001"), sa("93.184.215.14:443")).is_none(), "port changed");
+        assert!(t.lookup(IPPROTO_UDP, sa("192.168.1.5:40000"), sa("93.184.215.14:443")).is_none());
     }
 
     #[test]

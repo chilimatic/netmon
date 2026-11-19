@@ -6,6 +6,7 @@ mod decode;
 mod ifaces;
 mod linkwatch;
 mod names;
+mod netns;
 mod probe;
 mod procmap;
 mod rulefile;
@@ -73,6 +74,42 @@ impl Args {
 const CAPTURE_POLL: Duration = Duration::from_millis(50);
 /// Max packets taken from the ring buffer per poll, so the UI stays responsive.
 const DRAIN_BATCH: usize = 4_096;
+/// The container process behind a connection without a socket on the
+/// host, by remote end and local port.
+fn container_of(tables: &[procmap::ContainerTable], key: &netmon_common::ConnKey) -> Option<Owner> {
+    let remote = std::net::SocketAddr::new(ask::remote(key), key.remote_port);
+    let any_local = std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), key.local_port);
+    tables.iter().find_map(|t| t.lookup(key.proto, any_local, remote)).map(|(o, _)| o.clone())
+}
+
+/// Reads container socket tables in a thread: one read takes 150-250 ms on
+/// a host with 30 namespaces, too long for the UI loop. Each `()` sent asks
+/// for one read; the tables come back on the other channel.
+fn container_reader() -> (std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<Vec<procmap::ContainerTable>>) {
+    let (req_tx, req_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (res_tx, res_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut owners = OwnerCache::default();
+        let mut namespaces = Vec::new();
+        let mut scanned: Option<Instant> = None;
+        // Ends when the Monitor (the sender) is dropped.
+        while req_rx.recv().is_ok() {
+            if scanned.is_none_or(|t| t.elapsed() >= NETNS_RESCAN) {
+                namespaces = netns::scan();
+                scanned = Some(Instant::now());
+            }
+            if res_tx.send(procmap::read_containers(&mut owners, &namespaces)).is_err() {
+                break;
+            }
+        }
+    });
+    (req_tx, res_rx)
+}
+
+/// How often container socket tables are reread while flows lack owners.
+const CONTAINER_REFRESH: Duration = Duration::from_secs(3);
+/// How often the list of network namespaces is rescanned.
+const NETNS_RESCAN: Duration = Duration::from_secs(10);
 /// Most ask events read per poll.
 const ASK_BATCH: usize = 256;
 /// ClientHello first segments waiting for their second one.
@@ -105,6 +142,11 @@ struct Monitor<K: Kernel = Probe> {
     hosts: names::HostNames,
     /// Ask mode: questions waiting for the user.
     asks: ask::Asks,
+    /// Their socket tables, read when needed (see refresh_containers).
+    containers: Vec<procmap::ContainerTable>,
+    containers_asked: Option<Instant>,
+    containers_tx: std::sync::mpsc::SyncSender<()>,
+    containers_rx: std::sync::mpsc::Receiver<Vec<procmap::ContainerTable>>,
     /// TLS server name per connection, from its ClientHello.
     sni: HashMap<netmon_common::FlowKey, String>,
     /// First segments of ClientHellos that continue in the next segment.
@@ -149,7 +191,8 @@ impl<K: Kernel> Monitor<K> {
         let mut names = Names::default();
         names.update(&ifs);
         let collector = Collector::new(args.expire_ticks());
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), sni: HashMap::new(), hello_parts: HashMap::new() };
+        let (containers_tx, containers_rx) = container_reader();
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new() };
         Ok((mon, errors))
     }
 
@@ -181,11 +224,22 @@ impl<K: Kernel> Monitor<K> {
         self.last = now;
         let expired = self.collector.ingest(self.probe.snapshot(), dt);
         self.probe.forget(&expired);
+        let listeners = Listeners::build(
+            self.probe.listeners().into_iter().map(|(proto, a, o)| (proto, a, Owner::from_kernel(&o))),
+        );
+        let table = SocketTable::read(&mut self.owners);
+        // Container tables only when a flow still lacks a good owner.
+        let unowned = self
+            .collector
+            .flows
+            .values()
+            .any(|f| f.owner_source <= collector::OwnerSource::Container && f.key.ifindex != netmon_common::LOOPBACK_IFINDEX);
+        if unowned {
+            self.refresh_containers(now, CONTAINER_REFRESH);
+        }
         let probe = &self.probe;
         let kernel = |cookie| probe.sock_owner(cookie).map(|o| Owner::from_kernel(&o));
-        let listeners =
-            Listeners::build(probe.listeners().into_iter().map(|(proto, a, o)| (proto, a, Owner::from_kernel(&o))));
-        self.collector.resolve(&SocketTable::read(&mut self.owners), &listeners, kernel);
+        self.collector.resolve(&table, &self.containers, &listeners, kernel);
         self.procs.prune(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
         for o in self.collector.flows.values_mut().filter_map(|f| f.owner.as_mut()) {
             self.procs.fill(o, read_details);
@@ -307,11 +361,30 @@ impl<K: Kernel> Monitor<K> {
         }
     }
 
+    /// Asks the container reader for fresh tables if the last request is
+    /// older than `max_age`, and takes any tables it has finished.
+    fn refresh_containers(&mut self, now: Instant, max_age: Duration) {
+        while let Ok(tables) = self.containers_rx.try_recv() {
+            self.containers = tables;
+        }
+        if self.containers_asked.is_some_and(|t| now.duration_since(t) < max_age) {
+            return;
+        }
+        // The reader is busy with the previous request if it is still
+        // queued; asking twice only repeats the work.
+        let _ = self.containers_tx.try_send(());
+        self.containers_asked = Some(now);
+    }
+
     /// Reads new ask events and times out old questions. Called often, so
     /// a question shows before the first TCP retransmit (~1 s).
     fn poll_asks(&mut self, now: Instant) {
         let mut events = Vec::new();
         self.probe.drain_asks(ASK_BATCH, |e| events.push(*e));
+        // Traffic without a socket may be a container's: get its table.
+        if events.iter().any(|e| e.tgid == 0) {
+            self.refresh_containers(now, Duration::from_secs(1));
+        }
         for ev in events {
             let (info, host) = self.prompt_for(&ev, now);
             // Events still in the ring when an answer made a rule: the rule
@@ -329,14 +402,31 @@ impl<K: Kernel> Monitor<K> {
                 self.answer_conns(&d.conns, netmon_common::ACTION_DENY);
             }
         }
+        // Container tables arrive a moment after the question: name the
+        // container as soon as they do.
+        for p in self.asks.pending.iter_mut().filter(|p| p.pid == 0) {
+            let Some(k) = p.dests.iter().flat_map(|d| &d.conns).next() else { continue };
+            if let Some(o) = container_of(&self.containers, k) {
+                p.pid = o.pid;
+                p.comm = format!("container:{}/{}", o.container.as_deref().unwrap_or("?"), o.comm);
+            }
+        }
     }
 
-    /// The asking process and the remote end's name.
+    /// The asking process and the remote end's name. Traffic without a
+    /// socket (pid 0) is looked up in the container tables: the question
+    /// then names the container process, but keeps no exe, because the
+    /// kernel cannot match exe rules on that traffic.
     fn prompt_for(&mut self, ev: &netmon_common::AskEvent, now: Instant) -> (ask::Prompt, Option<String>) {
-        let pid = ev.tgid;
-        let comm = match pid {
-            0 => "unknown process".to_string(),
-            _ => std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        let container = match ev.tgid {
+            0 => container_of(&self.containers, &ev.key),
+            _ => None,
+        };
+        let pid = container.as_ref().map_or(ev.tgid, |o| o.pid);
+        let comm = match &container {
+            Some(o) => format!("container:{}/{}", o.container.as_deref().unwrap_or("?"), o.comm),
+            None if pid == 0 => "unknown process".to_string(),
+            None => std::fs::read_to_string(format!("/proc/{pid}/comm"))
                 .map(|c| text::sanitize(c.trim()))
                 .unwrap_or_else(|_| "exited process".into()),
         };
@@ -348,7 +438,7 @@ impl<K: Kernel> Monitor<K> {
         let info = ask::Prompt {
             pid,
             comm,
-            exe: d.exe,
+            exe: if container.is_some() { String::new() } else { d.exe },
             user: d.user,
             dests: Vec::new(),
             since: now,

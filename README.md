@@ -308,8 +308,18 @@ sources:
 
 - Sockets that open and close between two refreshes (a DNS query, a short
   `curl`) are often never seen and show as `?`.
-- Only sockets in netmon's own network namespace are visible. Container
-  traffic on `veth` and bridge interfaces shows as `?`.
+- Containers (other network namespaces): their sockets are read from
+  `/proc/<pid>/net/*` of a process in each namespace, and their rows show
+  `container:<name>/<process>` (Docker name, Podman id, else
+  `netns:<inode>`), owner source `container /proc`. On veth and bridge
+  interfaces the match is exact (state `container`); on the uplink after
+  masquerade it is by remote end and local port (state `nat`), which fails
+  when NAT changed the port. These tables are read in the background, at
+  most every 3 s and only while some flow has no owner, because each read
+  walks the kernel's UDP hash table once per namespace.
+- Rules cannot name a container: on the host its packets have no socket.
+  Ask mode names the container in the question but makes rules without an
+  exe (port or destination for every process).
 - Listeners and unconnected UDP sockets are matched by port and bound
   address (or a wildcard bind). A process that binds a port gets the
   traffic of that port.
