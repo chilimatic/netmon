@@ -221,16 +221,37 @@ conditions ("curl may only reach port 443").
 
 ## Phase 4 – Hostnames: DNS answers and TLS SNI
 
+**Status (2026-11-19): in progress.** Step 1 (DNS names) done and tested
+live. Step 2 next.
+
 **Why.** `151.101.1.91` says little; `reddit.com` says a lot. Also needed for
 rules by hostname later.
 
 **Design.**
-- Always-on lightweight capture of DNS responses (UDP/TCP port 53 ingress)
-  into a small ring buffer. Decoder parses A/AAAA/CNAME answers into an
-  `ip -> name` cache with TTL.
-- TLS: on TCP egress packets with payload, if the first payload bytes are a
-  ClientHello, parse the SNI extension in userspace and attach it to the flow.
-- UI: Remote column shows the name, `n` toggles names/addresses.
+- A second, always-on ring buffer `NAMES` (1 MiB) next to the capture ring.
+  The kernel sends only candidate packets: the flow key, a kind and up to
+  1500 bytes of L4 payload. `parse_packet` reports the payload offset.
+- DNS: ingress UDP from port 53, on every interface (on `lo` this catches
+  answers from a local stub resolver). Userspace parses the answers
+  (compression pointers, hop and length limits, truncated data) and maps
+  every A/AAAA address to the name that was asked. Cache of 4096 names,
+  each kept 1 h after its last answer.
+- TLS: egress TCP whose payload starts like a ClientHello (`16 03 xx`,
+  handshake type 1). Userspace reads the SNI extension and stores it on the
+  flow. SNI beats the DNS name: it is what the client asked this server for.
+- UI: Remote column shows `name:port`; `h` toggles names and addresses
+  (`n` already sorts by name). The detail line always shows the address.
+
+**Steps.**
+1. **DNS names.** Name ring, payload offset, DNS answer parser, name
+   cache, Remote column, `h`.
+2. **TLS SNI.** ClientHello check in the kernel, SNI parser, per-flow name.
+
+**Limits.**
+- DNS over TLS/HTTPS (encrypted DNS) gives no names; SNI still does.
+- QUIC (HTTP/3) encrypts its ClientHello: those flows show DNS names only.
+- A ClientHello larger than one segment (post-quantum key shares) may put
+  SNI in the second segment, which is not read: DNS names cover it.
 
 **Acceptance.**
 - `curl https://example.com` shows `example.com` as remote within one refresh.

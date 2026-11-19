@@ -341,6 +341,28 @@ pub struct SockOwner {
     pub comm: [u8; COMM_LEN],
 }
 
+/// Kinds of name events.
+pub const NAME_DNS: u8 = 1;
+pub const NAME_TLS: u8 = 2;
+/// Payload bytes kept per name event.
+pub const NAME_DATA: usize = 1500;
+/// Size of the always-on name event ring buffer.
+pub const NAME_RING_BYTES: u32 = 1024 * 1024;
+
+/// A packet that may carry a hostname: a DNS answer (ingress from port 53)
+/// or a TLS ClientHello (egress). Only the L4 payload is kept.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NameEvent {
+    pub key: FlowKey,
+    /// Bytes valid in `data`.
+    pub len: u16,
+    /// NAME_DNS or NAME_TLS.
+    pub kind: u8,
+    pub _pad: u8,
+    pub data: [u8; NAME_DATA],
+}
+
 /// Bytes copied per captured packet. Longer packets (and GSO super-packets)
 /// are cut; `PacketEvent::len` keeps the original length.
 pub const CAPTURE_LEN: usize = 1500;
@@ -415,6 +437,9 @@ pub struct Packet {
     pub dst: [u8; 16],
     pub sport: u16,
     pub dport: u16,
+    /// Offset of the TCP/UDP payload from the start of the data. 0 when
+    /// unknown (no ports, other protocols, short header).
+    pub payload: u16,
 }
 
 /// Reads fixed-size byte arrays at an offset into a packet.
@@ -513,6 +538,7 @@ pub fn parse_packet<S: PacketSource>(s: &S, l3_offset: usize, ethertype: u16) ->
         dst: [0; 16],
         sport: 0,
         dport: 0,
+        payload: 0,
     };
     let l4_offset;
     let has_ports;
@@ -553,6 +579,15 @@ pub fn parse_packet<S: PacketSource>(s: &S, l3_offset: usize, ethertype: u16) ->
         && let Some(ports) = s.read::<4>(l4_offset) {
             p.sport = u16::from_be_bytes([ports[0], ports[1]]);
             p.dport = u16::from_be_bytes([ports[2], ports[3]]);
+            if p.proto == IPPROTO_UDP {
+                p.payload = (l4_offset + 8) as u16;
+            } else if let Some([b]) = s.read::<1>(l4_offset + 12) {
+                // TCP data offset: header length in 32-bit words.
+                let doff = ((b >> 4) as usize) * 4;
+                if doff >= 20 {
+                    p.payload = (l4_offset + doff) as u16;
+                }
+            }
         }
     Some(p)
 }
@@ -707,6 +742,19 @@ mod tests {
         assert_eq!(&p.src[..4], &[10, 0, 0, 2]);
         assert_eq!(&p.dst[..4], &[1, 1, 1, 1]);
         assert_eq!((p.sport, p.dport), (40000, 443));
+    }
+
+    #[test]
+    fn payload_offset() {
+        let mut b = TCP_V4;
+        assert_eq!(parse_packet(&&b[..], 14, ETH_P_IP).unwrap().payload, 0, "bad data offset");
+        b[46] = 0x50; // 20-byte TCP header
+        assert_eq!(parse_packet(&&b[..], 14, ETH_P_IP).unwrap().payload, 54);
+        b[46] = 0x80; // 32 bytes with options
+        assert_eq!(parse_packet(&&b[..], 14, ETH_P_IP).unwrap().payload, 66);
+        b[23] = IPPROTO_UDP;
+        assert_eq!(parse_packet(&&b[..], 14, ETH_P_IP).unwrap().payload, 42);
+        assert_eq!(parse_packet(&&b[14..], 0, ETH_P_IP).unwrap().payload, 28);
     }
 
     #[test]

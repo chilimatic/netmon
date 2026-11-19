@@ -18,7 +18,7 @@ use netmon_common::{
     ACTION_ALLOW, ACTION_DENY, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
-    ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
+    ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
     MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
     RuleEntry, SockOwner, TraceCfg, is_dhcp, is_loopback, parse_packet, rule_matches,
     unmap_v4_in_place,
@@ -45,6 +45,11 @@ static CAPTURE_KEYS: HashMap<FlowKey, u8> = HashMap::with_max_entries(MAX_CAPTUR
 /// Captured packets for userspace.
 #[map]
 static PACKETS: RingBuf = RingBuf::with_byte_size(CAPTURE_RING_BYTES, 0);
+
+/// DNS answers and TLS ClientHellos for hostnames. Always on; full means
+/// the event is dropped and that name is missed.
+#[map]
+static NAMES: RingBuf = RingBuf::with_byte_size(NAME_RING_BYTES, 0);
 
 /// Packets lost because the ring buffer was full. Index 0 only.
 #[map]
@@ -305,18 +310,56 @@ pub fn tc_ingress(ctx: TcContext) -> i32 {
     handle(&ctx, false)
 }
 
-/// Parses the packet into `out`, whose ifindex the caller sets. A separate
-/// BPF function for the same reason as count(): its stack stays off the
-/// rule walk's. BPF functions take at most 5 arguments.
+/// Parses the packet into `out`, whose ifindex the caller sets. Returns
+/// the payload offset (0: unknown), or -1 if the packet did not parse. A
+/// separate BPF function for the same reason as count(): its stack stays
+/// off the rule walk's. BPF functions take at most 5 arguments.
 #[inline(never)]
-fn parse_key(ctx: &TcContext, l3: u32, ethertype: u16, egress: bool, out: &mut FlowKey) -> bool {
+fn parse_key(ctx: &TcContext, l3: u32, ethertype: u16, egress: bool, out: &mut FlowKey) -> i32 {
     match parse_packet(&Skb(ctx), l3 as usize, ethertype) {
         Some(pkt) => {
             *out = FlowKey::from_packet(&pkt, out.ifindex, egress);
-            true
+            pkt.payload as i32
         }
-        None => false,
+        None => -1,
     }
+}
+
+/// Sends the payload of a packet that may carry a hostname to userspace.
+#[inline(never)]
+fn name_event(ctx: &TcContext, key: &FlowKey, off: u32, kind: u8) {
+    let len = ctx.len();
+    if off == 0 || off >= len {
+        return;
+    }
+    // The verifier needs the copy length proven to be in 1..=NAME_DATA.
+    // The compiler knows n >= 1 from off < len and would drop a plain
+    // check; the verifier does not know it. A volatile read hides the
+    // value from the compiler, so the check stays in the program.
+    let mut n = len - off;
+    if n > NAME_DATA as u32 {
+        n = NAME_DATA as u32;
+    }
+    let n = unsafe { core::ptr::read_volatile(&n) };
+    if n == 0 || n > NAME_DATA as u32 {
+        return;
+    }
+    let Some(mut entry) = NAMES.reserve::<NameEvent>(0) else { return };
+    let ev = entry.as_mut_ptr();
+    let ret = unsafe {
+        bpf_skb_load_bytes(ctx.as_ptr() as *const c_void, off, (*ev).data.as_mut_ptr() as *mut c_void, n)
+    };
+    if ret != 0 {
+        entry.discard(0);
+        return;
+    }
+    unsafe {
+        (*ev).key = *key;
+        (*ev).len = n as u16;
+        (*ev).kind = kind;
+        (*ev)._pad = 0;
+    }
+    entry.submit(0);
 }
 
 #[inline(always)]
@@ -328,10 +371,16 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
     let l3 = unsafe { L3_OFFSET.get(&ifindex) }.copied().unwrap_or(14);
 
     let mut parsed = FlowKey { ifindex, ..FlowKey::default() };
-    let key = parse_key(ctx, l3, ethertype, egress, &mut parsed).then_some(parsed);
+    let payload = parse_key(ctx, l3, ethertype, egress, &mut parsed);
+    let key = (payload >= 0).then_some(parsed);
     let mut action = TC_ACT_UNSPEC;
     if let Some(key) = &key {
         count(ctx, key, egress);
+        // DNS answers: from port 53, on every interface (lo carries the
+        // answers of a local stub resolver).
+        if !egress && key.proto == IPPROTO_UDP && key.remote_port == 53 {
+            name_event(ctx, key, payload as u32, NAME_DNS);
+        }
         // Unparsed packets have no key and pass (fail-open).
         if ifindex != LOOPBACK_IFINDEX && packet_denied(key, egress, packet_tgid(ctx, egress)) {
             action = TC_ACT_SHOT;

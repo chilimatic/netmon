@@ -103,7 +103,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             _ => "",
         };
         format!(
-            " q quit  ←→/1-5 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  p pause  g graph",
+            " q quit  ←→/1-5 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  p pause  g graph",
             app.filter
         )
     };
@@ -287,14 +287,15 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, rules:
     let [area, detail] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
     let line = match app.selected_in(&ids).map(|i| &rows[i]) {
         Some(r) if !r.source.is_empty() => format!(
-            " exe {}   user {}   unit {}   owner from {}{}",
+            " {}   exe {}   user {}   unit {}   owner from {}{}",
+            r.remote_addr,
             or_dash(&r.exe),
             or_dash(&r.user),
             or_dash(&r.unit),
             r.source,
             verdict(r)
         ),
-        Some(r) => format!(" owner unknown{}", verdict(r)),
+        Some(r) => format!(" {}   owner unknown{}", r.remote_addr, verdict(r)),
         None => String::new(),
     };
     f.render_widget(Paragraph::new(line).style(Style::new().fg(Color::Cyan)), detail);

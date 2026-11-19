@@ -88,12 +88,28 @@ Repeat the `install` and `setcap` lines after every rebuild.
 
 Without the TUI: `netmon --once 3` samples 3 s and prints a table.
 
-Keys: `←`/`→` (or `Tab`, `1-5`) switch view, `b`/`B` block remote IP/port, `Esc` clear filter, `Enter` capture the selected row, `r`/`t`/`n` sort by rate/total/name, `/` filter,
+Keys: `←`/`→` (or `Tab`, `1-5`) switch view, `b`/`B` block remote IP/port, `Esc` clear filter, `Enter` capture the selected row, `r`/`t`/`n` sort by rate/total/name, `/` filter, `h` hostnames or addresses,
 `p` pause the view (counting goes on), `g` toggle the traffic graph, `↑↓` select, `q` quit.
 
 The graph on top shows total traffic of all interfaces except `lo` for the
 last 120 samples: download above the zero line, upload below. Each half has
 its own scale (shown on the y axis).
+
+## Hostnames
+
+The Remote column shows the hostname when netmon saw a DNS answer for the
+address: `example.com:443`. `h` switches between names and addresses; the
+detail line under the table always shows the address, and `/` also finds
+hostnames.
+
+- The kernel passes DNS answers (UDP from port 53, every interface) to
+  netmon. Each A/AAAA address gets the name that was asked, not the CDN
+  name behind a CNAME. Names stay 1 hour after the last answer; up to 4096.
+- Only answers seen while netmon runs count: connections opened before it
+  started show addresses until the next lookup of that name.
+- Encrypted DNS (DNS over TLS/HTTPS, e.g. in browsers) gives no names.
+- DNS packets are untrusted input: the parser bounds every read and gives
+  up on malformed answers.
 
 ## Blocking
 

@@ -19,7 +19,7 @@ use aya::{
 use netmon_common::{
     CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CaptureConfig, ConnKey,
     ConnState, FlowKey, FlowStats, GuardKey,
-    ListenKey, ListenOwner, MAX_CAPTURE_FLOWS, MAX_EXE_PATH, MAX_FLOWS, MAX_RULES, PacketEvent, RuleEntry, SockOwner,
+    ListenKey, ListenOwner, MAX_CAPTURE_FLOWS, MAX_EXE_PATH, MAX_FLOWS, MAX_RULES, NameEvent, PacketEvent, RuleEntry, SockOwner,
     TraceCfg,
 };
 
@@ -57,6 +57,7 @@ pub struct Probe {
     /// The last capture key update did not fit in the kernel map.
     capture_full: bool,
     packets: RingBuf<MapData>,
+    names: RingBuf<MapData>,
     drops: PerCpuArray<MapData, u64>,
     sock_owner: HashMap<MapData, u64, SockOwner>,
     listeners: HashMap<MapData, ListenKey, ListenOwner>,
@@ -107,6 +108,7 @@ impl Probe {
         let capture_cfg = Array::try_from(take("CAPTURE_CFG")?)?;
         let capture_keys = HashMap::try_from(take("CAPTURE_KEYS")?)?;
         let packets = RingBuf::try_from(take("PACKETS")?)?;
+        let names = RingBuf::try_from(take("NAMES")?)?;
         let drops = PerCpuArray::try_from(take("CAPTURE_DROPS")?)?;
         let sock_owner = HashMap::try_from(take("SOCK_OWNER")?)?;
         let listeners = HashMap::try_from(take("LISTENERS")?)?;
@@ -129,6 +131,7 @@ impl Probe {
             capture_set: HashSet::new(),
             capture_full: false,
             packets,
+            names,
             drops,
             sock_owner,
             listeners,
@@ -319,6 +322,8 @@ pub trait Kernel {
     fn discard_packets(&mut self);
     /// Takes up to `max` captured packets from the ring buffer.
     fn drain_packets(&mut self, max: usize, f: impl FnMut(&PacketEvent));
+    /// Takes up to `max` name events (DNS answers, TLS ClientHellos).
+    fn drain_names(&mut self, max: usize, f: impl FnMut(&NameEvent));
     /// Packets lost because the ring buffer was full, since load. Callers
     /// subtract the value at capture start.
     fn capture_drops(&self) -> u64;
@@ -421,6 +426,17 @@ impl Kernel for Probe {
             if item.len() >= size_of::<PacketEvent>() {
                 // SAFETY: the kernel wrote a PacketEvent; the read is unaligned-safe.
                 let ev = unsafe { std::ptr::read_unaligned(item.as_ptr() as *const PacketEvent) };
+                f(&ev);
+            }
+        }
+    }
+
+    fn drain_names(&mut self, max: usize, mut f: impl FnMut(&NameEvent)) {
+        for _ in 0..max {
+            let Some(item) = self.names.next() else { break };
+            if item.len() >= size_of::<NameEvent>() {
+                // SAFETY: the kernel wrote a NameEvent; the read is unaligned-safe.
+                let ev = unsafe { std::ptr::read_unaligned(item.as_ptr() as *const NameEvent) };
                 f(&ev);
             }
         }

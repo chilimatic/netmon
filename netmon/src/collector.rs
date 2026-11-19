@@ -33,6 +33,8 @@ pub struct Flow {
     /// Direction and verdict the kernel holds for the connection. None
     /// while no rule or default deny is in force.
     pub conn: Option<ConnState>,
+    /// Hostname of the remote end, from DNS answers.
+    pub host: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,6 +102,7 @@ impl Collector {
                 owner_cookie: 0,
                 owner_source: OwnerSource::Unknown,
                 conn: None,
+                host: None,
                 state: "",
             });
             // A counter that went down means the LRU map evicted and

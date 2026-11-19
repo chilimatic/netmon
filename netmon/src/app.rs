@@ -81,6 +81,10 @@ pub struct ConnRow {
     pub total: u64,
     /// Direction and verdict from the kernel's connection state.
     pub conn: Option<netmon_common::ConnState>,
+    /// Hostname of the remote end, if known.
+    pub host: Option<String>,
+    /// Remote address and port, also when `remote` shows the hostname.
+    pub remote_addr: String,
 }
 
 pub struct ProcRow {
@@ -128,6 +132,8 @@ pub struct App {
     pub editing_filter: bool,
     pub paused: bool,
     pub show_graph: bool,
+    /// Remote column shows hostnames where known.
+    pub show_hosts: bool,
     /// Seconds between samples, for the graph's time axis.
     pub interval_secs: f64,
     /// Index of the selected row as last drawn.
@@ -149,6 +155,7 @@ impl Default for App {
             editing_filter: false,
             paused: false,
             show_graph: true,
+            show_hosts: true,
             interval_secs: 1.0,
             selected: 0,
             anchor: None,
@@ -260,6 +267,7 @@ impl App {
             Key::Char('p') | Key::Char(' ') => self.paused = !self.paused,
             Key::Char('/') => self.editing_filter = true,
             Key::Char('g') => self.show_graph = !self.show_graph,
+            Key::Char('h') => self.show_hosts = !self.show_hosts,
             Key::Up | Key::Char('k') => self.pending -= 1,
             Key::Down | Key::Char('j') => self.pending += 1,
             Key::PageUp => self.pending -= 20,
@@ -317,9 +325,10 @@ impl App {
         let mut rows: Vec<ConnRow> = c
             .flows
             .values()
-            .map(|f| conn_row(f, names))
+            .map(|f| conn_row(f, names, self.show_hosts))
             .filter(|r| {
-                self.matches(&[&r.process, &r.pid, &r.exe, &r.user, &r.unit, &r.local, &r.remote, &r.iface, r.proto])
+                let host = r.host.as_deref().unwrap_or("");
+                self.matches(&[&r.process, &r.pid, &r.exe, &r.user, &r.unit, &r.local, &r.remote, host, &r.iface, r.proto])
             })
             .collect();
         match self.sort {
@@ -396,7 +405,7 @@ fn details(f: &Flow) -> &ProcDetails {
     f.owner.as_ref().and_then(|o| o.details.as_ref()).unwrap_or(&NO_DETAILS)
 }
 
-fn conn_row(f: &Flow, names: &Names) -> ConnRow {
+fn conn_row(f: &Flow, names: &Names, show_hosts: bool) -> ConnRow {
     let (process, pid) = owner_cols(f);
     let d = details(f);
     ConnRow {
@@ -415,7 +424,12 @@ fn conn_row(f: &Flow, names: &Names) -> ConnRow {
             _ => "other",
         },
         local: f.local.to_string(),
-        remote: f.remote.to_string(),
+        remote: match &f.host {
+            Some(h) if show_hosts => format!("{h}:{}", f.remote.port()),
+            _ => f.remote.to_string(),
+        },
+        remote_addr: f.remote.to_string(),
+        host: f.host.clone(),
         iface: names.get(f.key.ifindex),
         state: f.state,
         tx_rate: f.tx_rate,

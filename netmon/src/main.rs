@@ -4,6 +4,7 @@ mod collector;
 mod decode;
 mod ifaces;
 mod linkwatch;
+mod names;
 mod probe;
 mod procmap;
 mod rulefile;
@@ -67,6 +68,8 @@ impl Args {
 const CAPTURE_POLL: Duration = Duration::from_millis(50);
 /// Max packets taken from the ring buffer per poll, so the UI stays responsive.
 const DRAIN_BATCH: usize = 4_096;
+/// Most name events read per refresh; the rest wait in the ring.
+const NAME_BATCH: usize = 4_096;
 /// How often the TUI loop checks for interface events between ticks.
 const LINK_POLL: Duration = Duration::from_millis(200);
 
@@ -89,6 +92,8 @@ struct Monitor<K: Kernel = Probe> {
     links: Option<LinkWatch>,
     /// Where `s` in the Rules tab saves.
     rules_path: std::path::PathBuf,
+    /// Hostnames from DNS answers.
+    hosts: names::HostNames,
 }
 
 impl Monitor {
@@ -120,7 +125,7 @@ impl<K: Kernel> Monitor<K> {
         let mut names = Names::default();
         names.update(&ifs);
         let collector = Collector::new(args.expire_ticks());
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default() };
         Ok((mon, errors))
     }
 
@@ -164,6 +169,7 @@ impl<K: Kernel> Monitor<K> {
         self.sync_exe_blocks();
         self.refresh_hits();
         self.refresh_conns();
+        self.refresh_hosts(now);
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {
             errors.push(format!("capture: {e:#}"));
@@ -274,6 +280,24 @@ impl<K: Kernel> Monitor<K> {
     fn refresh_hits(&mut self) {
         for (slot, r) in self.rules.rules.iter_mut().enumerate() {
             r.hits = r.hits_base + self.probe.rule_hits(slot);
+        }
+    }
+
+    /// Reads new DNS answers and names every flow's remote end.
+    fn refresh_hosts(&mut self, now: Instant) {
+        let hosts = &mut self.hosts;
+        self.probe.drain_names(NAME_BATCH, |ev| {
+            let data = &ev.data[..(ev.len as usize).min(ev.data.len())];
+            if ev.kind == netmon_common::NAME_DNS {
+                for (ip, name, _ttl) in names::dns_answers(data) {
+                    hosts.insert(ip, name, now);
+                }
+            }
+        });
+        for f in self.collector.flows.values_mut() {
+            // Dual-stack sockets show IPv4 peers as ::ffff:a.b.c.d.
+            let ip = procmap::normalize(f.remote).ip();
+            f.host = self.hosts.get(ip, now).map(str::to_string);
         }
     }
 
@@ -622,6 +646,7 @@ mod tests {
         exe_ids: std::collections::BTreeMap<String, u32>,
         default: u8,
         conns: HashMap<netmon_common::ConnKey, netmon_common::ConnState>,
+        names: VecDeque<netmon_common::NameEvent>,
         fail_block: bool,
         marked: Vec<(u32, u32)>,
     }
@@ -686,6 +711,12 @@ mod tests {
         fn conn(&self, key: &netmon_common::ConnKey) -> Option<netmon_common::ConnState> {
             self.conns.get(key).copied()
         }
+        fn drain_names(&mut self, max: usize, mut f: impl FnMut(&netmon_common::NameEvent)) {
+            for _ in 0..max {
+                let Some(ev) = self.names.pop_front() else { break };
+                f(&ev);
+            }
+        }
         fn mark_pids(&mut self, id: u32, pids: &[u32]) {
             self.marked.extend(pids.iter().map(|p| (id, *p)));
         }
@@ -730,6 +761,7 @@ mod tests {
             exe_ids: Default::default(),
             default: 0,
             conns: HashMap::new(),
+            names: VecDeque::new(),
             fail_block: false,
             marked: Vec::new(),
         };
@@ -891,6 +923,33 @@ mod tests {
         let mut app = App::default();
         m.handle(&mut app, Action::ToggleBlockPort);
         assert_eq!(m.probe.default, netmon_common::ACTION_DENY, "default sent with the table");
+    }
+
+    #[test]
+    fn dns_answers_name_flows() {
+        let (mut m, t0) = monitor();
+        m.probe.flows = vec![(key(50001), tx(10))];
+        // Answer for example.com: A 198.51.100.9, the flows' remote address.
+        let mut dns = vec![0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        dns.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        dns.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 198, 51, 100, 9]);
+        let mut ev = netmon_common::NameEvent {
+            key: key(53),
+            len: dns.len() as u16,
+            kind: netmon_common::NAME_DNS,
+            _pad: 0,
+            data: [0; netmon_common::NAME_DATA],
+        };
+        ev.data[..dns.len()].copy_from_slice(&dns);
+        m.probe.names.push_back(ev);
+        m.tick_at(secs(t0, 1));
+        assert_eq!(m.collector.flows[&key(50001)].host.as_deref(), Some("example.com"));
+        let mut app = App::default();
+        let rows = app.conn_rows(&m.collector, &m.names);
+        assert_eq!(rows[0].remote, "example.com:443");
+        assert_eq!(rows[0].remote_addr, "198.51.100.9:443");
+        app.on_key(crate::app::Key::Char('h'));
+        assert_eq!(app.conn_rows(&m.collector, &m.names)[0].remote, "198.51.100.9:443", "h shows addresses");
     }
 
     #[test]
