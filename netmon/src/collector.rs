@@ -187,6 +187,34 @@ impl Collector {
     /// exact 4-tuple, the kernel's record of who bound the local address
     /// (servers, UDP receivers), the /proc port guess. A weaker source never
     /// replaces a stronger one, so a closed socket keeps its owner.
+    /// Owners from the kernel hooks, by socket cookie. `resolve` does the
+    /// same first; this runs before the /proc socket table is read, so
+    /// the table needs owners only for what is left.
+    pub fn resolve_kernel(&mut self, kernel: impl Fn(u64) -> Option<Owner>) {
+        for f in self.flows.values_mut() {
+            let cookie = f.total.cookie;
+            if cookie != 0
+                && cookie != f.owner_cookie
+                && let Some(o) = kernel(cookie)
+            {
+                f.owner = Some(o);
+                f.owner_cookie = cookie;
+                f.owner_source = OwnerSource::Kernel;
+            }
+        }
+    }
+
+    /// Ends of flows without a kernel owner (after `resolve_kernel`).
+    pub fn unowned(&self) -> Unowned {
+        let mut u = Unowned::default();
+        for f in self.flows.values().filter(|f| f.owner_source < OwnerSource::Kernel) {
+            let (l, r) = (crate::procmap::normalize(f.local), crate::procmap::normalize(f.remote));
+            u.exact.insert((f.key.proto, l, r));
+            u.ports.insert((f.key.proto, l.port()));
+        }
+        u
+    }
+
     pub fn resolve(
         &mut self,
         table: &SocketTable,
@@ -242,6 +270,22 @@ impl Collector {
     }
 }
 
+/// Socket ends of flows whose owner the kernel hooks do not know: only
+/// for these is a /proc/*/fd scan worth its cost.
+#[derive(Default)]
+pub struct Unowned {
+    exact: HashSet<(u8, SocketAddr, SocketAddr)>,
+    /// Protocol and local port, for unconnected and listening sockets.
+    ports: HashSet<(u8, u16)>,
+}
+
+impl Unowned {
+    pub fn wants(&self, s: &crate::procmap::RawSock) -> bool {
+        let (l, r) = (crate::procmap::normalize(s.local), crate::procmap::normalize(s.remote));
+        self.exact.contains(&(s.proto, l, r)) || (r.port() == 0 && self.ports.contains(&(s.proto, l.port())))
+    }
+}
+
 /// Where a flow's owner came from, weakest first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum OwnerSource {
@@ -282,6 +326,32 @@ fn push<T>(h: &mut VecDeque<T>, v: T) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_owned_flows_need_no_proc_scan() {
+        use crate::procmap::RawSock;
+        let mut c = Collector::new(30);
+        let k = |port: u16, cookie: u64| {
+            let mut k = FlowKey { family: 4, proto: 6, local_port: port, remote_port: 443, ifindex: 2, ..Default::default() };
+            k.local_addr[..4].copy_from_slice(&[10, 0, 0, 2]);
+            k.remote_addr[..4].copy_from_slice(&[1, 1, 1, 1]);
+            (k, FlowStats { tx_bytes: 1, cookie, ..Default::default() })
+        };
+        c.ingest([k(1000, 7), k(1001, 0)], 1.0);
+        c.resolve_kernel(|cookie| (cookie == 7).then(|| Owner::new(5, "curl")));
+        let u = c.unowned();
+        let sock = |port: u16, remote: &str| RawSock {
+            proto: 6,
+            local: format!("10.0.0.2:{port}").parse().unwrap(),
+            remote: remote.parse().unwrap(),
+            state: "",
+            inode: 1,
+        };
+        assert!(!u.wants(&sock(1000, "1.1.1.1:443")), "kernel knows the owner");
+        assert!(u.wants(&sock(1001, "1.1.1.1:443")));
+        assert!(u.wants(&sock(1001, "0.0.0.0:0")), "unconnected socket on the port");
+        assert!(!u.wants(&sock(1002, "1.1.1.1:443")), "no flow");
+    }
 
     fn key(port: u16, ifindex: u32) -> FlowKey {
         let mut k = FlowKey { family: 4, proto: 6, local_port: port, remote_port: 443, ifindex, ..Default::default() };

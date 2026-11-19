@@ -419,11 +419,21 @@ root.
 
 Small, independent features after the firewall core:
 
-- **CPU use of netmond.** Seen 2026-11-19: about 35 % of one core
-  (40.8 s CPU in 115 s) with 4 exe rules and ask mode. Not measured yet;
-  suspects are the per-tick `/proc` scans (socket table, exe marks of all
-  processes). Measure first, then cut.
-
+- **CPU use of netmond: done (2026-11-19).** Measured with
+  `NETMON_PROFILE=1` on a host with 3 630 processes and ~30 container
+  namespaces in ask mode: 37 % of one core before, 16 % after. Fixes:
+  `/proc/*/fd` scans only for sockets the kernel hooks did not name (at
+  most every 2 s); container owner scans only over container processes;
+  container tables read only for new unowned TCP/UDP flows (not multicast
+  or broadcast, at most every 10 s) and for new asked connections without
+  a process (not their retransmits); exe marks scanned every 10 ticks while
+  the exec tracepoints run. The main loop now takes ~3 %.
+- **Container tables by netlink `sock_diag`.** The remaining ~12 % are
+  container table reads, ~400 ms each: `/proc/<pid>/net/udp` lists every
+  UDP socket of the host's hash table once per namespace. `sock_diag` per
+  namespace (reader thread `setns` into each) can filter by connection and
+  should take a few ms. Needed in ask mode with containers that open many
+  connections.
 - **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.

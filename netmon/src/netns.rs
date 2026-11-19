@@ -9,6 +9,8 @@ pub struct Netns {
     /// One process in the namespace (the lowest pid), whose
     /// /proc/<pid>/net/* shows the namespace's sockets.
     pub pid: u32,
+    /// Every process in the namespace: only these can own its sockets.
+    pub pids: Vec<u32>,
     pub name: String,
 }
 
@@ -25,23 +27,24 @@ fn netns_of(pid: &str) -> Option<u64> {
 pub fn scan() -> Vec<Netns> {
     let Some(own) = netns_of("self") else { return Vec::new() };
     let Ok(dir) = fs::read_dir("/proc") else { return Vec::new() };
-    let mut first: BTreeMap<u64, u32> = BTreeMap::new();
+    let mut members: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
     for e in dir.flatten() {
         let name = e.file_name();
         let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
         if let Some(ino) = netns_of(&pid.to_string())
             && ino != own
         {
-            let p = first.entry(ino).or_insert(pid);
-            *p = (*p).min(pid);
+            members.entry(ino).or_default().push(pid);
         }
     }
-    first
+    members
         .into_iter()
-        .map(|(inode, pid)| {
+        .map(|(inode, mut pids)| {
+            pids.sort_unstable();
+            let pid = pids[0];
             let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
             let name = container_name(&cgroup, docker_name).unwrap_or_else(|| format!("netns:{inode}"));
-            Netns { inode, pid, name }
+            Netns { inode, pid, pids, name }
         })
         .collect()
 }

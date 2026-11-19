@@ -58,6 +58,14 @@ impl Args {
 pub(crate) const CAPTURE_POLL: Duration = Duration::from_millis(50);
 /// Max packets taken from the ring buffer per poll, so the UI stays responsive.
 pub(crate) const DRAIN_BATCH: usize = 4_096;
+/// Multicast or broadcast address.
+fn is_group(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(a) => a.is_multicast() || a.is_broadcast(),
+        std::net::IpAddr::V6(a) => a.is_multicast(),
+    }
+}
+
 /// The container process behind a connection without a socket on the
 /// host, by remote end and local port.
 pub(crate) fn container_of(tables: &[procmap::ContainerTable], key: &netmon_common::ConnKey) -> Option<Owner> {
@@ -69,7 +77,9 @@ pub(crate) fn container_of(tables: &[procmap::ContainerTable], key: &netmon_comm
 /// Reads container socket tables in a thread: one read takes 150-250 ms on
 /// a host with 30 namespaces, too long for the UI loop. Each `()` sent asks
 /// for one read; the tables come back on the other channel.
-pub(crate) fn container_reader() -> (std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<Vec<procmap::ContainerTable>>) {
+pub(crate) type ContainerResult = (Vec<procmap::ContainerTable>, Duration);
+
+pub(crate) fn container_reader() -> (std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<ContainerResult>) {
     let (req_tx, req_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let (res_tx, res_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -78,11 +88,13 @@ pub(crate) fn container_reader() -> (std::sync::mpsc::SyncSender<()>, std::sync:
         let mut scanned: Option<Instant> = None;
         // Ends when the Monitor (the sender) is dropped.
         while req_rx.recv().is_ok() {
+            let start = Instant::now();
             if scanned.is_none_or(|t| t.elapsed() >= NETNS_RESCAN) {
                 namespaces = netns::scan();
                 scanned = Some(Instant::now());
             }
-            if res_tx.send(procmap::read_containers(&mut owners, &namespaces)).is_err() {
+            let tables = procmap::read_containers(&mut owners, &namespaces);
+            if res_tx.send((tables, start.elapsed())).is_err() {
                 break;
             }
         }
@@ -90,10 +102,21 @@ pub(crate) fn container_reader() -> (std::sync::mpsc::SyncSender<()>, std::sync:
     (req_tx, res_rx)
 }
 
-/// How often container socket tables are reread while flows lack owners.
-pub(crate) const CONTAINER_REFRESH: Duration = Duration::from_secs(3);
+/// Shortest time between two /proc/*/fd scans for host sockets.
+pub(crate) const FD_SCAN_GAP: Duration = Duration::from_secs(2);
+/// Ticks between full scans for exe marks while the exec tracepoints run.
+pub(crate) const EXE_SCAN_EVERY: u64 = 10;
+/// Shortest time between two container table reads for new unowned
+/// flows. One read covers every namespace: ~400 ms on a host with many
+/// containers.
+pub(crate) const CONTAINER_REFRESH: Duration = Duration::from_secs(10);
 /// How often the list of network namespaces is rescanned.
 pub(crate) const NETNS_RESCAN: Duration = Duration::from_secs(10);
+/// Shortest time between container reads for questions: the question
+/// should name the container before the user answers.
+pub(crate) const ASK_CONTAINER_REFRESH: Duration = Duration::from_secs(1);
+/// Asked connections remembered as already looked up; then forgotten.
+pub(crate) const MAX_ASKS_TRIED: usize = 4_096;
 /// Most ask events read per poll.
 pub(crate) const ASK_BATCH: usize = 256;
 /// ClientHello first segments waiting for their second one.
@@ -142,7 +165,16 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) containers: Vec<procmap::ContainerTable>,
     pub(crate) containers_asked: Option<Instant>,
     pub(crate) containers_tx: std::sync::mpsc::SyncSender<()>,
-    pub(crate) containers_rx: std::sync::mpsc::Receiver<Vec<procmap::ContainerTable>>,
+    pub(crate) containers_rx: std::sync::mpsc::Receiver<ContainerResult>,
+    /// Time per step, with NETMON_PROFILE set.
+    pub(crate) prof: crate::profile::Profile,
+    /// Unowned flows the container tables were already read for.
+    pub(crate) containers_tried: HashSet<netmon_common::FlowKey>,
+    /// Asked connections without a process the container tables were
+    /// already read for.
+    pub(crate) asks_tried: HashSet<netmon_common::ConnKey>,
+    /// Ticks between full /proc scans for exe marks.
+    pub(crate) exe_scan_every: u64,
     /// TLS server name per connection, from its ClientHello.
     pub(crate) sni: HashMap<netmon_common::FlowKey, String>,
     /// First segments of ClientHellos that continue in the next segment.
@@ -155,6 +187,7 @@ impl Monitor {
     pub(crate) fn new(args: &Args, pin_dir: Option<&std::path::Path>) -> anyhow::Result<(Self, Vec<String>)> {
         let mut probe = Probe::load(pin_dir)?;
         let hook_errors = probe.hook_errors.clone();
+        let exec_tracking = probe.exec_tracking;
         let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
         if let Err(e) = probe.set_guard(&guard_endpoints(ssh_connection().as_deref(), &resolv)) {
             probe.unpin();
@@ -168,6 +201,12 @@ impl Monitor {
             }
         };
         errors.extend(hook_errors);
+        mon.owners.min_gap = FD_SCAN_GAP;
+        // The tracepoints mark new processes; the full scan only catches
+        // what they missed.
+        if exec_tracking {
+            mon.exe_scan_every = EXE_SCAN_EVERY;
+        }
         if let Some(msg) = mon.load_rules_file(args) {
             errors.push(msg);
         }
@@ -201,7 +240,7 @@ impl<K: Kernel> Monitor<K> {
         let mut collector = Collector::new(args.expire_ticks());
         collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1 };
         Ok((mon, errors))
     }
 
@@ -248,6 +287,7 @@ impl<K: Kernel> Monitor<K> {
     }
 
     pub(crate) fn tick_at(&mut self, now: Instant) -> Vec<String> {
+        let t_tick = Instant::now();
         let mut errors = match self.links {
             Some(_) => self.check_links(),
             // No interface events: hot-plug check every 2 ticks.
@@ -256,36 +296,77 @@ impl<K: Kernel> Monitor<K> {
         };
         let dt = now.duration_since(self.last).as_secs_f64();
         self.last = now;
+        let t = Instant::now();
         let expired = self.collector.ingest(self.probe.snapshot(), dt);
         self.probe.forget(&expired);
+        self.prof.add("flow counters", t);
+        let t = Instant::now();
         let listeners = Listeners::build(
             self.probe.listeners().into_iter().map(|(proto, a, o)| (proto, a, Owner::from_kernel(&o))),
         );
-        let table = SocketTable::read(&mut self.owners);
-        // Container tables only when a flow still lacks a good owner.
-        let unowned = self
-            .collector
-            .flows
-            .values()
-            .any(|f| f.owner_source <= collector::OwnerSource::Container && f.key.ifindex != netmon_common::LOOPBACK_IFINDEX);
-        if unowned {
-            self.refresh_containers(now, CONTAINER_REFRESH);
+        self.prof.add("listeners", t);
+        let t = Instant::now();
+        let probe = &self.probe;
+        self.collector.resolve_kernel(|cookie| probe.sock_owner(cookie).map(|o| Owner::from_kernel(&o)));
+        let unowned = self.collector.unowned();
+        self.prof.add("kernel owners", t);
+        let t = Instant::now();
+        let scans = self.owners.scans;
+        let table = SocketTable::read(&mut self.owners, |s| unowned.wants(s));
+        self.prof.add("socket table", t);
+        if self.owners.scans > scans {
+            self.prof.add_time("fd scans in it (count)", Duration::ZERO);
         }
+        // Container tables only for new TCP/UDP flows without an owner:
+        // one read takes 150-250 ms. Flows that never get one (forwarded
+        // traffic) ask once.
+        let flows = &self.collector.flows;
+        self.containers_tried.retain(|k| flows.contains_key(k));
+        let new: Vec<_> = flows
+            .values()
+            .filter(|f| {
+                f.owner_source < collector::OwnerSource::Container
+                    && f.key.ifindex != netmon_common::LOOPBACK_IFINDEX
+                    && matches!(f.key.proto, netmon_common::IPPROTO_TCP | netmon_common::IPPROTO_UDP)
+                    // LAN multicast and broadcast (mDNS, SSDP, DHCP): a new
+                    // flow per sender port, and no container socket.
+                    && !is_group(f.local.ip())
+                    && !self.containers_tried.contains(&f.key)
+            })
+            .map(|f| f.key)
+            .collect();
+        if !new.is_empty() && self.refresh_containers(now, CONTAINER_REFRESH) {
+            self.containers_tried.extend(new);
+        }
+        self.take_containers();
+        let t = Instant::now();
         let probe = &self.probe;
         let kernel = |cookie| probe.sock_owner(cookie).map(|o| Owner::from_kernel(&o));
         self.collector.resolve(&table, &self.containers, &listeners, kernel);
+        self.prof.add("resolve owners", t);
+        let t = Instant::now();
         self.procs.prune(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
         for o in self.collector.flows.values_mut().filter_map(|f| f.owner.as_mut()) {
             self.procs.fill(o, read_details);
         }
-        self.sync_exe_blocks();
+        self.prof.add("process details", t);
+        if self.ticks.is_multiple_of(self.exe_scan_every) {
+            let t = Instant::now();
+            self.sync_exe_blocks();
+            self.prof.add("exe marks (/proc scan)", t);
+        }
+        let t = Instant::now();
         self.refresh_hits();
         self.refresh_conns();
+        self.prof.add("rule hits + verdicts", t);
+        let t = Instant::now();
         self.refresh_hosts(now);
+        self.prof.add("hostnames", t);
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {
             errors.push(format!("capture: {e:#}"));
         }
+        self.prof.add("tick (all)", t_tick);
         errors
     }
 
@@ -391,17 +472,25 @@ impl<K: Kernel> Monitor<K> {
 
     /// Asks the container reader for fresh tables if the last request is
     /// older than `max_age`, and takes any tables it has finished.
-    pub(crate) fn refresh_containers(&mut self, now: Instant, max_age: Duration) {
-        while let Ok(tables) = self.containers_rx.try_recv() {
+    /// Takes the tables the reader has finished.
+    pub(crate) fn take_containers(&mut self) {
+        while let Ok((tables, took)) = self.containers_rx.try_recv() {
             self.containers = tables;
+            self.prof.add_time("container tables (thread)", took);
         }
+    }
+
+    /// Returns true if it asked for a new read.
+    pub(crate) fn refresh_containers(&mut self, now: Instant, max_age: Duration) -> bool {
+        self.take_containers();
         if self.containers_asked.is_some_and(|t| now.duration_since(t) < max_age) {
-            return;
+            return false;
         }
         // The reader is busy with the previous request if it is still
         // queued; asking twice only repeats the work.
         let _ = self.containers_tx.try_send(());
         self.containers_asked = Some(now);
+        true
     }
 
     /// Reads new ask events and times out old questions. Called often, so
@@ -410,9 +499,21 @@ impl<K: Kernel> Monitor<K> {
     pub(crate) fn poll_asks(&mut self, now: Instant) -> bool {
         let mut events = Vec::new();
         self.probe.drain_asks(ASK_BATCH, |e| events.push(*e));
-        // Traffic without a socket may be a container's: get its table.
-        if events.iter().any(|e| e.tgid == 0) {
-            self.refresh_containers(now, Duration::from_secs(1));
+        // Traffic without a socket may be a container's: get its table,
+        // once per connection the tables do not know yet. Retransmits send
+        // the same event again.
+        self.take_containers();
+        let containers = &self.containers;
+        let new: Vec<_> = events
+            .iter()
+            .filter(|e| e.tgid == 0 && !self.asks_tried.contains(&e.key) && container_of(containers, &e.key).is_none())
+            .map(|e| e.key)
+            .collect();
+        if !new.is_empty() && self.refresh_containers(now, ASK_CONTAINER_REFRESH) {
+            if self.asks_tried.len() > MAX_ASKS_TRIED {
+                self.asks_tried.clear();
+            }
+            self.asks_tried.extend(new);
         }
         let mut changed = !events.is_empty();
         for ev in events {
@@ -1341,5 +1442,36 @@ mod tests {
         // Far behind: one tick, not a burst to catch up.
         assert_eq!(kinds(&e.step(now + Duration::from_secs(60))), ["snapshot"]);
         assert!(e.step(now + Duration::from_millis(60_500)).is_empty());
+    }
+
+    #[test]
+    fn container_tables_read_once_per_new_unowned_flow() {
+        let (mut m, t0) = monitor();
+        m.probe.flows = vec![(key(50001), tx(10))];
+        m.tick_at(secs(t0, 1));
+        assert_eq!(m.containers_asked, Some(secs(t0, 1)), "new flow without owner");
+        m.probe.flows = vec![(key(50001), tx(20))];
+        m.tick_at(secs(t0, 10));
+        assert_eq!(m.containers_asked, Some(secs(t0, 1)), "same flow: not again");
+        m.probe.flows = vec![(key(50001), tx(30)), (key(50002), tx(10))];
+        m.tick_at(secs(t0, 20));
+        assert_eq!(m.containers_asked, Some(secs(t0, 20)), "another new flow");
+    }
+
+    #[test]
+    fn asks_without_process_read_container_tables_once_per_connection() {
+        let (mut m, t0) = monitor();
+        let k = netmon_common::ConnKey::from_flow(&key(50001));
+        let ask = |key| netmon_common::AskEvent { key, tgid: 0, _pad: 0 };
+        m.probe.asks.push_back(ask(k));
+        m.poll_asks(secs(t0, 1));
+        assert_eq!(m.containers_asked, Some(secs(t0, 1)));
+        // A retransmit of the same connection: no new read.
+        m.probe.asks.push_back(ask(k));
+        m.poll_asks(secs(t0, 3));
+        assert_eq!(m.containers_asked, Some(secs(t0, 1)));
+        m.probe.asks.push_back(ask(netmon_common::ConnKey { local_port: 50002, ..k }));
+        m.poll_asks(secs(t0, 4));
+        assert_eq!(m.containers_asked, Some(secs(t0, 4)), "a new connection");
     }
 }

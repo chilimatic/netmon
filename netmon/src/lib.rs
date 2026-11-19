@@ -15,6 +15,7 @@ mod monitor;
 mod names;
 mod netns;
 mod probe;
+mod profile;
 mod procmap;
 mod proto;
 mod remote;

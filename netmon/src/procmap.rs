@@ -188,11 +188,13 @@ impl SocketTable {
     }
 
     /// Reads the current socket table from /proc. Owners come from the
-    /// cache, which scans /proc/*/fd only for sockets it has not seen.
-    pub fn read(cache: &mut OwnerCache) -> Self {
+    /// cache, which scans /proc/*/fd only for sockets `wanted` asks for
+    /// and it has not seen.
+    pub fn read(cache: &mut OwnerCache, wanted: impl Fn(&RawSock) -> bool) -> Self {
         let socks = read_sockets(None);
         let inodes: HashSet<u64> = socks.iter().map(|s| s.inode).collect();
-        cache.refresh(&inodes, |pid| Path::new(&format!("/proc/{pid}")).exists(), read_owners);
+        let want: HashSet<u64> = socks.iter().filter(|s| wanted(s)).map(|s| s.inode).collect();
+        cache.refresh_wanted(&inodes, &want, |pid| Path::new(&format!("/proc/{pid}")).exists(), || read_owners(None));
         Self::build(socks, &cache.owners)
     }
 }
@@ -211,7 +213,9 @@ pub fn read_containers(cache: &mut OwnerCache, namespaces: &[crate::netns::Netns
         })
         .collect();
     let inodes: HashSet<u64> = foreign.iter().flat_map(|(_, s)| s).map(|s| s.inode).collect();
-    cache.refresh(&inodes, |pid| Path::new(&format!("/proc/{pid}")).exists(), read_owners);
+    // Only processes in these namespaces can own their sockets.
+    let pids: Vec<u32> = namespaces.iter().flat_map(|n| n.pids.iter().copied()).collect();
+    cache.refresh(&inodes, |pid| Path::new(&format!("/proc/{pid}")).exists(), || read_owners(Some(&pids)));
     foreign.into_iter().map(|(name, socks)| ContainerTable::build(&name, socks, &cache.owners)).collect()
 }
 
@@ -264,6 +268,10 @@ pub struct OwnerCache {
     /// namespaces). Tried again with the next scan.
     misses: HashSet<u64>,
     pub scans: u64,
+    /// Shortest time between two scans. A scan reads every fd of every
+    /// process: 150 ms on a host with 3600 processes.
+    pub min_gap: std::time::Duration,
+    last_scan: Option<std::time::Instant>,
 }
 
 impl OwnerCache {
@@ -275,18 +283,31 @@ impl OwnerCache {
         alive: impl Fn(u32) -> bool,
         scan: impl FnOnce() -> HashMap<u64, Owner>,
     ) {
+        self.refresh_wanted(inodes, inodes, alive, scan);
+    }
+
+    /// Like `refresh`, but only a new inode in `wanted` (a subset of
+    /// `inodes`) starts a scan: sockets whose owner nobody needs never do.
+    pub fn refresh_wanted(
+        &mut self,
+        inodes: &HashSet<u64>,
+        wanted: &HashSet<u64>,
+        alive: impl Fn(u32) -> bool,
+        scan: impl FnOnce() -> HashMap<u64, Owner>,
+    ) {
         // A process that exits can leave its socket to a child (fork, then
         // exit). Drop the dead owner so the next scan finds the new one.
         let mut live: HashMap<u32, bool> = HashMap::new();
         self.owners
             .retain(|i, o| inodes.contains(i) && *live.entry(o.pid).or_insert_with(|| alive(o.pid)));
         self.misses.retain(|i| inodes.contains(i));
-        let new = inodes.iter().any(|i| *i != 0 && !self.owners.contains_key(i) && !self.misses.contains(i));
-        if !new {
+        let new = wanted.iter().any(|i| *i != 0 && !self.owners.contains_key(i) && !self.misses.contains(i));
+        if !new || self.last_scan.is_some_and(|t| t.elapsed() < self.min_gap) {
             return;
         }
         let found = scan();
         self.scans += 1;
+        self.last_scan = Some(std::time::Instant::now());
         for &i in inodes.iter().filter(|i| **i != 0) {
             match found.get(&i) {
                 Some(o) => {
@@ -431,13 +452,18 @@ fn read_sockets(p: Option<&procfs::process::Process>) -> Vec<RawSock> {
     out
 }
 
-/// Socket inode -> owning process. Processes we may not inspect are skipped.
-fn read_owners() -> HashMap<u64, Owner> {
+/// Socket inode -> owning process, from all processes or only `pids`.
+/// Processes we may not inspect are skipped.
+fn read_owners(pids: Option<&[u32]>) -> HashMap<u64, Owner> {
     let mut owners = HashMap::new();
-    let Ok(procs) = all_processes() else {
-        return owners;
+    let procs: Vec<procfs::process::Process> = match pids {
+        Some(pids) => pids.iter().filter_map(|p| procfs::process::Process::new(*p as i32).ok()).collect(),
+        None => match all_processes() {
+            Ok(all) => all.flatten().collect(),
+            Err(_) => return owners,
+        },
     };
-    for p in procs.flatten() {
+    for p in procs {
         let Ok(fds) = p.fd() else { continue };
         let mut comm = None;
         for fd in fds.flatten() {
@@ -588,6 +614,20 @@ mod tests {
         // Closed sockets leave the cache.
         c.refresh(&HashSet::from([1]), |_| true, || unreachable!());
         assert_eq!(c.owners.len(), 1);
+    }
+
+    #[test]
+    fn owner_cache_scans_only_for_wanted_inodes_and_not_too_often() {
+        let all = HashMap::from([(1, owner(10)), (2, owner(20)), (3, owner(30))]);
+        let mut c = OwnerCache { min_gap: std::time::Duration::from_secs(60), ..OwnerCache::default() };
+        let inodes = HashSet::from([1, 2, 3]);
+        c.refresh_wanted(&inodes, &HashSet::new(), |_| true, || unreachable!("nothing wanted"));
+        c.refresh_wanted(&inodes, &HashSet::from([2]), |_| true, || all.clone());
+        assert_eq!(c.scans, 1);
+        assert!(c.owners.contains_key(&3), "one scan fills every inode");
+        let more = HashSet::from([1, 2, 3, 4]);
+        c.refresh_wanted(&more, &HashSet::from([4]), |_| true, || unreachable!("within min_gap"));
+        assert_eq!(c.scans, 1);
     }
 
     #[test]

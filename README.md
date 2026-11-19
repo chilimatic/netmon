@@ -117,6 +117,9 @@ does not run. The next start of `netmond` replaces the file. A second
 
 The wire format is one JSON object per line (`netmon/src/proto.rs`).
 
+`NETMON_PROFILE=1` (for `netmond` or `netmon --local`) writes the CPU use
+and the time of each step of the monitor loop to stderr every 30 s.
+
 ### Install as a service
 
 The daemon runs from boot, so rules are in force with nobody logged in. The

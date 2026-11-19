@@ -84,6 +84,8 @@ pub struct Probe {
     pub hook_errors: Vec<String>,
     /// Where the links are pinned, if they are (netmond).
     pins: Option<PathBuf>,
+    /// The exec and fork tracepoints run: they keep exe marks current.
+    pub exec_tracking: bool,
 }
 
 /// Where netmond pins its links. A pinned link stays attached when the
@@ -183,7 +185,9 @@ impl Probe {
             None => None,
         };
         hook_errors.extend(attach_owner_hooks(&mut ebpf, pins.as_deref()));
-        hook_errors.extend(attach_exec_tracking(&mut ebpf, trace_cfg, pins.as_deref()));
+        let exec_errors = attach_exec_tracking(&mut ebpf, trace_cfg, pins.as_deref());
+        let exec_tracking = exec_errors.is_empty();
+        hook_errors.extend(exec_errors);
         Ok(Probe {
             ebpf,
             flows,
@@ -213,6 +217,7 @@ impl Probe {
             failed: HashSet::new(),
             hook_errors,
             pins,
+            exec_tracking,
         })
     }
 

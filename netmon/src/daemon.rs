@@ -143,11 +143,16 @@ fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> a
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => bail!("socket listener stopped"),
         }
-        for m in engine.step(Instant::now()) {
-            if let ToClient::Status(s) = &m {
+        let msgs = engine.step(Instant::now());
+        let t = Instant::now();
+        for m in &msgs {
+            if let ToClient::Status(s) = m {
                 eprintln!("netmond: {s}");
             }
-            send(&mut clients, None, &m);
+            send(&mut clients, None, m);
+        }
+        if !msgs.is_empty() {
+            engine.mon.prof.add("send to clients (JSON)", t);
         }
     }
     Ok(())

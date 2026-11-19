@@ -57,10 +57,12 @@ impl<K: Kernel> Engine<K> {
 
     /// Does what is due: packets, questions, interface events, the tick.
     pub(crate) fn step(&mut self, now: Instant) -> Vec<ToClient> {
+        let t = Instant::now();
         self.mon.drain_capture(DRAIN_BATCH);
         let mut out = self.packets();
         let mut changed = self.mon.poll_asks(now);
         let mut errors = self.mon.check_links();
+        self.mon.prof.add("poll (packets, asks, links)", t);
         if now >= self.next {
             self.next += self.interval;
             // Far behind (suspend, stopped process): do not catch up.
@@ -74,8 +76,11 @@ impl<K: Kernel> Engine<K> {
             out.push(ToClient::Status(e));
         }
         if changed {
+            let t = Instant::now();
             out.push(self.snapshot());
+            self.mon.prof.add("snapshot copy", t);
         }
+        self.mon.prof.report();
         out
     }
 
