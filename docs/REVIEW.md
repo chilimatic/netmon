@@ -74,6 +74,11 @@ Status column: `P0` = fixed in Phase 0, `Pn` = fixed in roadmap phase n,
 - **Lockout guard.** Never blocked: loopback, the SSH session netmon runs
   in (`SSH_CONNECTION`), DNS to the local system resolver (127.0.0.53 and
   the stub addresses in `/etc/resolv.conf`, port 53).
+- **Daemon crash (Phase 7, decided 2026-11-19).** `netmond` pins its
+  programs, links and maps: rules survive a crash and end only with a clean
+  `systemctl stop`. Local `sudo netmon` stays fail-open.
+- **Daemon protocol (Phase 7, decided 2026-11-19).** JSON lines for now;
+  packet decoding and pcap writing in the unprivileged client.
 - **Prompt mechanism (Phase 5, decided 2026-11-19).** Drop the first
   packet and rely on TCP retransmits; the first UDP datagram is lost.
   NFQUEUE may come later.

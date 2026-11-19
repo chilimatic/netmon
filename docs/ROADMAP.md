@@ -357,22 +357,61 @@ for its traffic on the host. Rules by address and port still apply.
 
 ## Phase 7 – Privileged daemon and unprivileged TUI
 
+**Status (2026-11-19): in progress.** Step 1 next.
+
 **Why.** Rules must hold when the UI is closed, and the UI should not run as
 root.
 
+**Decisions (2026-11-19).**
+- **Rules survive a daemon crash.** Programs, links and maps are pinned
+  under `/sys/fs/bpf/netmon`. A crash or `kill -9` leaves the last rules
+  enforced (including default deny/ask, with nobody to answer: asked
+  connections stay dropped). Only `systemctl stop netmond` (clean exit)
+  unpins and removes them. This replaces fail-open for the daemon; the
+  `sudo netmon` local mode stays fail-open. Recovery after a crash:
+  `systemctl restart netmond` or `rm -r /sys/fs/bpf/netmon`.
+- **Wire format: JSON lines** over the Unix socket for everything for now,
+  captured packets as base64. A binary frame format may come later for
+  capture throughput.
+- **Decoding in the client.** The daemon sends raw captured bytes; packet
+  decoding and pcap writing run in the unprivileged TUI. The kernel filter
+  still parses headers.
+
 **Design.**
-- `netmond` (systemd service, root or minimal capabilities) owns the eBPF
-  programs, maps and rules. It pins programs and maps under `/sys/fs/bpf`.
-- `netmon` connects over a Unix socket (`/run/netmon.sock`, group `netmon`),
-  receives snapshots and capture streams, sends rule changes. The protocol is
-  versioned and every request is validated by the daemon.
-- Prompts (Phase 5) go to every connected TUI; with no TUI, the default action
-  applies.
+- Crate `netmon` becomes a library plus two binaries: `netmond` (daemon)
+  and `netmon` (TUI). `netmon` connects to `/run/netmon.sock` if it exists,
+  else runs locally as today (needs root).
+- `netmond` owns the Probe and the Monitor (flows, owners, rules, names,
+  asks). Socket `/run/netmon.sock`, mode 0660, group `netmon`; the daemon
+  checks the peer with `SO_PEERCRED` and refuses other users.
+- Protocol: the client sends `hello` with the protocol version; the daemon
+  pushes a snapshot each tick (flows, interfaces, rules, questions, status)
+  and answers requests (block, remove rule, save, answer, capture start/
+  stop). Every request is validated by the daemon; unknown or malformed
+  lines end the connection.
+- Questions (Phase 5) go to every connected TUI; the first answer wins.
+  With no TUI the timeout applies (deny once).
+- On start the daemon removes old pins (a previous crash), loads, pins and
+  applies the rules file. Restart therefore has a short window without
+  rules.
+
+**Steps.**
+1. **Split into library + binaries.** Monitor and modules move to a
+   library; `netmon` behaves exactly as before. No daemon yet.
+2. **Monitor without the UI.** Requests and snapshots as plain data
+   (serde), the TUI renders snapshots and sends requests; local mode uses
+   the same path in one process.
+3. **Daemon and socket.** `netmond`, JSON lines protocol, peer check,
+   `netmon` client mode, capture stream and pcap in the client.
+4. **Pinning.** Pin programs/links/maps, crash survival, clean stop,
+   stale pins on start.
+5. **systemd and install.** Unit file, group `netmon`, docs.
 
 **Acceptance.**
 - Rules apply at boot with no user logged in.
 - TUI runs without sudo for a member of group `netmon`.
-- Killing the TUI leaves blocks active; stopping the service removes them.
+- Killing the TUI leaves blocks active; `kill -9` of the daemon leaves them
+  active; `systemctl stop` removes them.
 
 ## Phase 8 – Extras
 
