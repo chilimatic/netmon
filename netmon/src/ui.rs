@@ -65,7 +65,10 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
                 (n, Action::Deny) => format!("  RULES {n}  DEFAULT DENY"),
                 (n, Action::Ask) => format!("  RULES {n}  ASK"),
             },
-            paused,
+            match &app.ask {
+                Some((_, more)) if app.ask_hidden => format!("  {} QUESTIONS WAITING (? shows)", more + 1),
+                _ => String::new(),
+            } + paused,
             capturing,
             app.status
         ))
@@ -113,7 +116,9 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         )
     };
     f.render_widget(Paragraph::new(footer_text).style(Style::new().fg(Color::DarkGray)), footer);
-    if let Some((p, more)) = &app.ask {
+    if let Some((p, more)) = &app.ask
+        && !app.ask_hidden
+    {
         draw_ask(f, p, *more, &app.status);
     }
 }
@@ -161,7 +166,7 @@ fn draw_ask(f: &mut Frame, p: &Prompt, more: usize, status: &str) {
         Span::raw(format!("   {rule}")),
     ]));
     text.push(Line::from(Span::styled(
-        "a allow  A allow always  d deny  D deny always   o/x allow/deny selected once   ↑↓ select",
+        "a allow  A allow always  d deny  D deny always   o/x allow/deny selected once   ↑↓ select   Esc later",
         Style::new().fg(Color::Yellow),
     )));
     text.push(Line::from(format!("no answer in {left} s: deny once{more}")));

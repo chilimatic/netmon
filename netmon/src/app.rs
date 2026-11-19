@@ -140,8 +140,11 @@ pub struct App {
     /// which repeat traffic of other interfaces.
     pub show_virtual: bool,
     /// The question shown in ask mode and how many more wait. Set by the
-    /// main loop; while set, a and d answer it.
+    /// main loop; while set and not hidden, a and d answer it.
     pub ask: Option<(crate::ask::Prompt, usize)>,
+    /// The questions are put aside (Esc): the tab gets its keys back, the
+    /// header counts the questions, ? shows them again.
+    pub ask_hidden: bool,
     /// Seconds between samples, for the graph's time axis.
     pub interval_secs: f64,
     /// Index of the selected row as last drawn.
@@ -166,6 +169,7 @@ impl Default for App {
             show_hosts: true,
             show_virtual: false,
             ask: None,
+            ask_hidden: false,
             interval_secs: 1.0,
             selected: 0,
             anchor: None,
@@ -250,9 +254,17 @@ impl App {
             self.reset_selection();
             return None;
         }
-        if self.ask.is_some() {
+        if self.ask.is_some() && self.ask_hidden && matches!(key, Key::Char('?')) {
+            self.ask_hidden = false;
+            return None;
+        }
+        if self.ask.is_some() && !self.ask_hidden {
             let rule = |allow, always| Some(Action::Answer(Answer::Rule { allow, always }));
             match key {
+                Key::Esc => {
+                    self.ask_hidden = true;
+                    return None;
+                }
                 Key::Char('a') => return rule(true, false),
                 Key::Char('A') => return rule(true, true),
                 Key::Char('d') => return rule(false, false),
@@ -671,6 +683,13 @@ mod tests {
         assert_eq!(app.on_key(Key::Right), Some(Action::AskScope(1)), "arrows steer the question, not the tabs");
         assert_eq!(app.on_key(Key::Down), Some(Action::AskSelect(1)));
         assert_eq!(app.on_key(Key::Char('5')), None, "other keys still work");
+        // Esc puts the questions aside: the tab gets d back.
+        assert_eq!(app.on_key(Key::Esc), None);
+        assert!(app.ask_hidden && !app.quit);
+        assert_eq!(app.on_key(Key::Char('d')), Some(Action::RemoveRule));
+        assert_eq!(app.on_key(Key::Char('?')), None);
+        assert!(!app.ask_hidden);
+        assert_eq!(app.on_key(Key::Char('d')), Some(Action::Answer(Answer::Rule { allow: false, always: false })));
     }
 
     #[test]

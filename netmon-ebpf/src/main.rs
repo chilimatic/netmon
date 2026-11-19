@@ -20,7 +20,7 @@ use netmon_common::{
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
     MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
-    RuleEntry, SockOwner, TraceCfg, is_dhcp, is_loopback, is_unparsed, parse_packet, rule_matches,
+    RuleEntry, SockOwner, TraceCfg, is_dhcp, is_loopback, is_unparsed, keep_answer, parse_packet, rule_matches,
     unmap_v4_in_place,
 };
 
@@ -133,17 +133,19 @@ fn rules_active() -> bool {
 #[map]
 static ASKS: RingBuf = RingBuf::with_byte_size(ASK_RING_BYTES, 0);
 
+/// Sends an ask event. False if the ring is full: the caller must then
+/// not cache the ask, so the next packet (a retransmit) tries again.
 #[inline(never)]
-fn ask_event(c: &ConnKey, tgid: u32) {
-    if let Some(mut e) = ASKS.reserve::<AskEvent>(0) {
-        let ev = e.as_mut_ptr();
-        unsafe {
-            (*ev).key = *c;
-            (*ev).tgid = tgid;
-            (*ev)._pad = 0;
-        }
-        e.submit(0);
+fn ask_event(c: &ConnKey, tgid: u32) -> bool {
+    let Some(mut e) = ASKS.reserve::<AskEvent>(0) else { return false };
+    let ev = e.as_mut_ptr();
+    unsafe {
+        (*ev).key = *c;
+        (*ev).tgid = tgid;
+        (*ev)._pad = 0;
     }
+    e.submit(0);
+    true
 }
 
 /// Connection -> direction and cached verdict. LRU is fine here: an
@@ -277,24 +279,28 @@ fn packet_denied(key: &FlowKey, egress: bool, tgid: u32) -> bool {
         return decide(&c, tgid, dir) != ACTION_ALLOW;
     }
     let generation = cfg(CFG_GEN);
+    let (mut prev_action, mut prev_answered) = (0u8, 0u8);
     if let Some(st) = unsafe { CONNS.get(&c) } {
         // Decide again after a rule change, or when the process is known
         // now but was not then (exe rules could not match).
-        if st.answered != 0 || (st.generation == generation && (st.exe_known != 0 || tgid == 0)) {
+        if st.current(generation, tgid) {
             return st.action != ACTION_ALLOW;
         }
         dir = st.dir;
+        prev_action = st.action;
+        prev_answered = st.answered;
     }
     let mut tgid = tgid;
     if tgid == 0 && dir == DIR_IN {
         tgid = listener_tgid(key);
     }
-    let action = decide(&c, tgid, dir);
-    let st = ConnState { generation, dir, action, exe_known: (tgid != 0) as u8, answered: 0 };
-    let _ = CONNS.insert(&c, &st, 0);
-    if action == ACTION_ASK {
-        ask_event(&c, tgid);
+    let (action, answered) = keep_answer(decide(&c, tgid, dir), prev_action, prev_answered);
+    // A lost ask event is not cached: the retransmit asks again.
+    if action == ACTION_ASK && !ask_event(&c, tgid) {
+        return true;
     }
+    let st = ConnState { generation, dir, action, exe_known: (tgid != 0) as u8, answered };
+    let _ = CONNS.insert(&c, &st, 0);
     action != ACTION_ALLOW
 }
 
@@ -327,15 +333,18 @@ fn sock_denied(c: &ConnKey, tgid: u32) -> bool {
         return false;
     }
     let mut dir = DIR_OUT;
+    let (mut prev_action, mut prev_answered) = (0u8, 0u8);
     if c.local_port != 0
         && let Some(st) = unsafe { CONNS.get(c) }
     {
-        if st.answered != 0 || (st.generation == cfg(CFG_GEN) && st.exe_known != 0) {
+        if st.generation == cfg(CFG_GEN) && (st.answered != 0 || st.exe_known != 0) {
             return st.action == ACTION_DENY;
         }
         dir = st.dir;
+        prev_action = st.action;
+        prev_answered = st.answered;
     }
-    decide(c, tgid, dir) == ACTION_DENY
+    keep_answer(decide(c, tgid, dir), prev_action, prev_answered).0 == ACTION_DENY
 }
 
 /// Process of the socket that sent an egress packet, from its cookie.

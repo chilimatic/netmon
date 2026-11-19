@@ -152,9 +152,30 @@ pub struct ConnState {
     pub action: u8,
     /// 1 if the process was known when deciding, so exe rules could match.
     pub exe_known: u8,
-    /// 1 if the user answered for this connection (ask mode, "once"): the
-    /// verdict then stays through rule changes.
+    /// 1 if the verdict is the user's answer for this connection (ask
+    /// mode: once, or the deny after a timeout). After a rule change it
+    /// stays only while no rule decides the connection.
     pub answered: u8,
+}
+
+impl ConnState {
+    /// True if this state decides the next packet without a new rule walk:
+    /// it is from the current rules, and the process was known then (exe
+    /// rules could match) or is still unknown now. An answer counts while
+    /// its generation is current.
+    #[inline(always)]
+    pub fn current(&self, generation: u32, tgid: u32) -> bool {
+        self.generation == generation && (self.answered != 0 || self.exe_known != 0 || tgid == 0)
+    }
+}
+
+/// The verdict to store after a new rule walk gave `decided`, and whether
+/// it is still an answer. An earlier answer (`prev_action` with
+/// `prev_answered` != 0) stays only if no rule decides the connection now
+/// (`decided` is ask): a new rule or block always wins over "once".
+#[inline(always)]
+pub fn keep_answer(decided: u8, prev_action: u8, prev_answered: u8) -> (u8, u8) {
+    if prev_answered != 0 && decided == ACTION_ASK { (prev_action, 1) } else { (decided, 0) }
 }
 
 /// DHCP and DHCPv6 (client and server ports). Never blocked, so a host
@@ -677,6 +698,20 @@ impl FlowKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answers_hold_until_a_rule_decides() {
+        let st = |generation, answered| ConnState { generation, dir: DIR_OUT, action: ACTION_ALLOW, exe_known: 1, answered };
+        assert!(st(3, 1).current(3, 7), "answer of the current rules");
+        assert!(!st(2, 1).current(3, 7), "rules changed: decide again");
+        // After the change: no rule decides it (ask again) -> the answer stays.
+        assert_eq!(keep_answer(ACTION_ASK, ACTION_ALLOW, 1), (ACTION_ALLOW, 1));
+        // A new block or allow rule decides it -> the rule wins.
+        assert_eq!(keep_answer(ACTION_DENY, ACTION_ALLOW, 1), (ACTION_DENY, 0));
+        assert_eq!(keep_answer(ACTION_ALLOW, ACTION_DENY, 1), (ACTION_ALLOW, 0), "timeout deny ends with an allow rule");
+        // No earlier answer: the walk decides.
+        assert_eq!(keep_answer(ACTION_ASK, ACTION_DENY, 0), (ACTION_ASK, 0));
+    }
 
     fn v4(a: [u8; 4]) -> [u8; 16] {
         let mut b = [0u8; 16];

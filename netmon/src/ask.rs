@@ -181,7 +181,11 @@ impl Asks {
             let full = q.dests.len() >= MAX_DESTS;
             match q.dests.iter_mut().find(|d| d.remote == remote && d.port == port && d.proto == proto) {
                 Some(d) => {
-                    if !d.conns.contains(&key) && d.conns.len() < MAX_CONNS {
+                    if !d.conns.contains(&key) {
+                        // Not kept: no answer or timeout would reach it.
+                        if d.conns.len() >= MAX_CONNS {
+                            return Added::Full;
+                        }
                         d.conns.push(key);
                     }
                 }

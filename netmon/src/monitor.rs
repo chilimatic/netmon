@@ -121,6 +121,8 @@ pub(crate) const NETNS_RESCAN: Duration = Duration::from_secs(10);
 pub(crate) const ASK_CONTAINER_REFRESH: Duration = Duration::from_secs(1);
 /// Asked connections remembered as already looked up; then forgotten.
 pub(crate) const MAX_ASKS_TRIED: usize = 4_096;
+/// Name of a question whose connections belong to several containers.
+pub(crate) const SEVERAL: &str = "several containers or processes";
 /// Most ask events read per poll.
 pub(crate) const ASK_BATCH: usize = 256;
 /// ClientHello first segments waiting for their second one.
@@ -524,8 +526,12 @@ impl<K: Kernel> Monitor<K> {
             let (info, host) = self.prompt_for(&ev, now);
             // Events still in the ring when an answer made a rule: the rule
             // decides their next retransmit, so do not ask again.
+            // The kernel asked because it could not match the rule yet (the
+            // exe is not marked before the next /proc scan): write the
+            // rule's verdict, or the connection would hang with no question.
             let dest = std::net::SocketAddr::new(ask::remote(&ev.key), ev.key.remote_port);
-            if self.rules.first_match(ev.key.proto, dest, &info.exe, rules::Dir::Out).is_some() {
+            if let Some(rule) = self.rules.first_match(ev.key.proto, dest, &info.exe, rules::Dir::Out) {
+                let _ = self.probe.set_verdict(&ev.key, rule.action.kernel());
                 continue;
             }
             if self.asks.add(ev.key, info, host) == ask::Added::Full {
@@ -540,12 +546,23 @@ impl<K: Kernel> Monitor<K> {
         }
         // Container tables arrive a moment after the question: name the
         // container as soon as they do.
+        // Unknown processes share one question until then: name it only if
+        // all its connections belong to one container process.
         for p in self.asks.pending.iter_mut().filter(|p| p.pid == 0) {
-            let Some(k) = p.dests.iter().flat_map(|d| &d.conns).next() else { continue };
-            if let Some(o) = container_of(&self.containers, k) {
-                p.pid = o.pid;
-                p.comm = format!("container:{}/{}", o.container.as_deref().unwrap_or("?"), o.comm);
-                changed = true;
+            let owners: Vec<Option<Owner>> =
+                p.dests.iter().flat_map(|d| &d.conns).map(|k| container_of(&self.containers, k)).collect();
+            let label = |o: &Owner| format!("container:{}/{}", o.container.as_deref().unwrap_or("?"), o.comm);
+            match owners.first() {
+                Some(Some(first)) if owners.iter().all(|o| o.as_ref().is_some_and(|o| o.pid == first.pid)) => {
+                    p.pid = first.pid;
+                    p.comm = label(first);
+                    changed = true;
+                }
+                _ if owners.iter().flatten().count() > 0 && p.comm != SEVERAL => {
+                    p.comm = SEVERAL.into();
+                    changed = true;
+                }
+                _ => {}
             }
         }
         changed
@@ -1499,5 +1516,63 @@ mod tests {
         // The next change does not carry the failed edit into the kernel.
         m.toggle_block(BlockTarget::Port(17, 53));
         assert_eq!((m.rules.rules.len(), m.probe.default), (1, netmon_common::ACTION_ALLOW));
+    }
+
+    #[test]
+    fn rule_the_kernel_could_not_match_yet_decides_without_a_question() {
+        let (mut m, t0) = monitor();
+        let me = std::fs::read_link("/proc/self/exe").unwrap().to_string_lossy().into_owned();
+        m.change_rules(|r| {
+            let m = rules::Match { exe: Some(me.clone()), dir: Some(rules::Dir::Out), ..Default::default() };
+            r.insert(0, rules::Action::Allow, m, "").map(|_| String::new())
+        });
+        let k = netmon_common::ConnKey::from_flow(&key(50001));
+        m.probe.asks.push_back(netmon_common::AskEvent { key: k, tgid: std::process::id(), _pad: 0 });
+        m.poll_asks(t0);
+        assert!(m.asks.pending.is_empty(), "no question");
+        assert_eq!(m.probe.verdicts, vec![(k, netmon_common::ACTION_ALLOW)], "the rule's verdict, not a hang");
+    }
+
+    #[test]
+    fn connections_beyond_the_question_limit_are_denied_not_lost() {
+        let (mut m, t0) = monitor();
+        let k = netmon_common::ConnKey::from_flow(&key(50001));
+        for port in 0..=256u16 {
+            let key = netmon_common::ConnKey { local_port: 10_000 + port, ..k };
+            m.probe.asks.push_back(netmon_common::AskEvent { key, tgid: std::process::id(), _pad: 0 });
+        }
+        // ASK_BATCH events per poll.
+        m.poll_asks(t0);
+        m.poll_asks(t0);
+        assert_eq!(m.asks.pending[0].conns(), 256);
+        assert_eq!(m.probe.verdicts, vec![(netmon_common::ConnKey { local_port: 10_256, ..k }, netmon_common::ACTION_DENY)]);
+    }
+
+    #[test]
+    fn a_question_of_several_containers_gets_no_single_name() {
+        use crate::procmap::{ContainerTable, RawSock};
+        let (mut m, t0) = monitor();
+        let k1 = netmon_common::ConnKey::from_flow(&key(50001));
+        let k2 = netmon_common::ConnKey { local_port: 50002, ..k1 };
+        for k in [k1, k2] {
+            m.probe.asks.push_back(netmon_common::AskEvent { key: k, tgid: 0, _pad: 0 });
+        }
+        m.poll_asks(t0);
+        assert_eq!((m.asks.pending.len(), m.asks.pending[0].comm.as_str()), (1, "unknown process"));
+        let sock = |port: u16, inode| RawSock {
+            proto: 6,
+            local: format!("172.17.0.2:{port}").parse().unwrap(),
+            remote: "198.51.100.9:443".parse().unwrap(),
+            state: "",
+            inode,
+        };
+        let owners = HashMap::from([(1, Owner::new(11, "curl")), (2, Owner::new(22, "wget"))]);
+        m.containers = vec![
+            ContainerTable::build("web", vec![sock(50001, 1)], &owners),
+            ContainerTable::build("db", vec![sock(50002, 2)], &owners),
+        ];
+        m.poll_asks(t0);
+        assert_eq!(m.asks.pending[0].comm, SEVERAL, "not the first container's name");
+        assert_eq!(m.asks.pending[0].pid, 0);
     }
 }

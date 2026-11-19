@@ -285,6 +285,8 @@ that can connect, default `netmon`).
 | `s` | Rules | Save all rules to the rules file |
 | `s` `c` `x` `f` `End` | Capture | Save `.pcap`, clear, stop, follow new packets |
 | `a` `A` `d` `D` `o` `x` | question window | Answer a question (see [Ask mode](#ask-mode)) |
+| `Esc` | question window | Put the questions aside: the tab gets its keys back |
+| `?` | everywhere | Show the questions again |
 
 The filter finds rows whose process, PID, exe, user, unit, addresses,
 hostname, interface or protocol contain the text. Upper and lower case are
@@ -364,7 +366,10 @@ rules, the tab explains how to make one.
 ### Question window
 
 In ask mode, a yellow window opens over the tab when a program wants to
-connect. The section [Ask mode](#ask-mode) explains it.
+connect. While it is open, its keys have priority: in the Capture tab `x`
+denies, in the Rules tab `d` denies. `Esc` puts the questions aside, and the
+header then shows `n QUESTIONS WAITING (? shows)`. `?` shows them again.
+The section [Ask mode](#ask-mode) explains the answers.
 
 ## Hostnames
 
@@ -537,6 +542,7 @@ The question lists all waiting connections of the program by destination:
 | `a` / `d` | Allow or deny with a temporary rule for the scope (`tmp` in the Rules tab, never saved) |
 | `A` / `D` | Allow or deny with a lasting rule. `s` in the Rules tab saves it. |
 | `o` / `x` | Allow or deny only the waiting connections of the selected destination, without a rule |
+| `Esc` / `?` | Put the questions aside, show them again |
 
 - A rule from an answer is for outbound connections only (`out` in the
   rule line). It never opens inbound traffic, for example from source port
@@ -548,6 +554,17 @@ The question lists all waiting connections of the program by destination:
   its next try after the answer. UDP has no such retry. The first datagram
   is lost, and the next one of the program goes through.
 - With no answer in 30 s, the waiting connections are denied once.
+- An `o`/`x` answer and a timeout deny stay with their connections only
+  while no rule decides them. A later rule or block that covers the
+  connection wins, for example an allow rule after a timeout.
+- More than 256 waiting connections to one destination: the extra ones
+  are denied once.
+- If a rule allows a connection but the kernel could not match it yet
+  (the exe was not marked yet), the monitor writes the rule's verdict at
+  once. The connection does not wait for a question.
+- Traffic of several containers can share one question before their
+  names are known. Then the question shows `several containers or
+  processes`.
 - Unmatched inbound connections are denied in ask mode. The lockout guard
   is never asked.
 - Unknown process: traffic without a local socket (containers, VMs,
