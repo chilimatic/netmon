@@ -13,13 +13,15 @@ use std::{
 use netmon_common::{IPPROTO_TCP, IPPROTO_UDP};
 use serde::Deserialize;
 
-use crate::rules::{Action, Match};
+use crate::rules::{Action, Dir, Match};
 
 pub const DEFAULT_PATH: &str = "/etc/netmon/rules.toml";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFile {
+    /// Action for TCP and UDP traffic no rule matches.
+    default: Option<RawAction>,
     #[serde(default)]
     rule: Vec<toml::Spanned<RawRule>>,
 }
@@ -34,8 +36,17 @@ struct RawRule {
     remote: Option<String>,
     port: Option<RawPort>,
     proto: Option<String>,
+    /// "out": this host opened the connection; "in": the remote host did.
+    direction: Option<RawDir>,
     #[serde(default)]
     comment: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawDir {
+    Out,
+    In,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +62,13 @@ enum RawPort {
     One(u16),
     /// "8000-8100" or "443".
     Range(String),
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct RulesFile {
+    /// None: the file does not say; netmon keeps allow.
+    pub default: Option<Action>,
+    pub rules: Vec<FileRule>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -96,18 +114,29 @@ fn unsafe_owner(uid: u32, mode: u32) -> Option<&'static str> {
 }
 
 /// Parses the file. Errors name the line.
-pub fn parse(text: &str) -> Result<Vec<FileRule>, String> {
+pub fn parse(text: &str) -> Result<RulesFile, String> {
     let raw: RawFile = toml::from_str(text).map_err(|e| {
         let line = e.span().map(|s| line_of(text, s.start)).unwrap_or(0);
         format!("line {line}: {}", e.message().trim())
     })?;
-    raw.rule
+    let rules = raw
+        .rule
         .into_iter()
         .map(|r| {
             let line = line_of(text, r.span().start);
-            convert(r.into_inner()).map(|(action, m, comment)| FileRule { line, action, m, comment }).map_err(|e| format!("line {line}: {e}"))
+            convert(r.into_inner())
+                .map(|(action, m, comment)| FileRule { line, action, m, comment })
+                .map_err(|e| format!("line {line}: {e}"))
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(RulesFile { default: raw.default.map(action), rules })
+}
+
+fn action(a: RawAction) -> Action {
+    match a {
+        RawAction::Allow => Action::Allow,
+        RawAction::Deny => Action::Deny,
+    }
 }
 
 fn line_of(text: &str, offset: usize) -> usize {
@@ -115,10 +144,11 @@ fn line_of(text: &str, offset: usize) -> usize {
 }
 
 fn convert(r: RawRule) -> Result<(Action, Match, String), String> {
-    let action = match r.action {
-        RawAction::Allow => Action::Allow,
-        RawAction::Deny => Action::Deny,
-    };
+    let action = action(r.action);
+    let dir = r.direction.map(|d| match d {
+        RawDir::Out => Dir::Out,
+        RawDir::In => Dir::In,
+    });
     let proto = match r.proto.as_deref() {
         None => None,
         Some("tcp") => Some(IPPROTO_TCP),
@@ -131,7 +161,7 @@ fn convert(r: RawRule) -> Result<(Action, Match, String), String> {
         Some(RawPort::Range(s)) => Some(port_range(&s)?),
     };
     let net = r.remote.as_deref().map(network).transpose()?;
-    let m = Match { net, proto, ports, exe: r.process };
+    let m = Match { net, proto, ports, exe: r.process, dir };
     m.check()?;
     Ok((action, m, r.comment))
 }
@@ -208,8 +238,18 @@ remote = "2001:db8::1"
 "#;
 
     #[test]
+    fn default_and_direction() {
+        let f = parse("default = \"deny\"\n\n[[rule]]\naction = \"allow\"\ndirection = \"out\"\n").unwrap();
+        assert_eq!(f.default, Some(Action::Deny));
+        assert_eq!(f.rules[0].m.to_string(), "out");
+        assert_eq!(parse(EXAMPLE).unwrap().default, None);
+        assert!(err("[[rule]]\naction = \"deny\"\ndirection = \"both\"\n").starts_with("line 3:"));
+        assert!(err("default = \"block\"\n").starts_with("line 1:"));
+    }
+
+    #[test]
     fn parses_rules_in_order() {
-        let r = parse(EXAMPLE).unwrap();
+        let r = parse(EXAMPLE).unwrap().rules;
         assert_eq!(r.len(), 4);
         assert_eq!(r[0].line, 3);
         assert_eq!(r[0].action, Action::Allow);
@@ -218,7 +258,7 @@ remote = "2001:db8::1"
         assert_eq!(r[1].m.to_string(), "exe /usr/bin/curl");
         assert_eq!(r[2].m.to_string(), "port 8000-8100 net 10.0.0.0/8");
         assert_eq!(r[3].m.to_string(), "host 2001:db8::1");
-        assert!(parse("").unwrap().is_empty(), "empty file: no rules");
+        assert_eq!(parse("").unwrap(), RulesFile::default(), "empty file: no rules");
     }
 
     fn err(text: &str) -> String {
@@ -240,7 +280,7 @@ remote = "2001:db8::1"
         assert!(err("[[rule]]\naction = \"deny\"\nproto = \"icmp\"\n").contains("tcp"));
         assert!(err("[[rule]]\naction = \"deny\"\nremote = \"1.2.3.4/33\"\n").contains("prefix"));
         assert!(err("[[rule]]\nremote = \"1.2.3.4\"\n").starts_with("line 1:"), "missing action");
-        assert!(err("default = \"deny\"\n").starts_with("line 1:"), "unknown top-level key");
+        assert!(err("defaults = \"deny\"\n").starts_with("line 1:"), "unknown top-level key");
     }
 
     #[test]

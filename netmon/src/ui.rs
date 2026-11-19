@@ -9,9 +9,11 @@ use ratatui::{
     widgets::{Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Sparkline, Table, TableState, Tabs},
 };
 
+use netmon_common::{ACTION_DENY, DIR_IN};
+
 use crate::{
-    rules::{Action, Rules},
-    app::{App, RowId, Sort, Tab, human},
+    rules::{Action, Dir, Rules},
+    app::{App, ConnRow, RowId, Sort, Tab, human},
     capture::Capture,
     decode::hexdump,
     collector::{Collector, HISTORY, addr},
@@ -54,7 +56,11 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             rate(tx),
             rate(rx),
             c.flows.len(),
-            if rules.rules.is_empty() { String::new() } else { format!("  RULES {}", rules.rules.len()) },
+            match (rules.rules.len(), rules.default) {
+                (0, Action::Allow) => String::new(),
+                (n, Action::Allow) => format!("  RULES {n}"),
+                (n, Action::Deny) => format!("  RULES {n}  DEFAULT DENY"),
+            },
             paused,
             capturing,
             app.status
@@ -281,20 +287,26 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, rules:
     let [area, detail] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
     let line = match app.selected_in(&ids).map(|i| &rows[i]) {
         Some(r) if !r.source.is_empty() => format!(
-            " exe {}   user {}   unit {}   owner from {}",
+            " exe {}   user {}   unit {}   owner from {}{}",
             or_dash(&r.exe),
             or_dash(&r.user),
             or_dash(&r.unit),
-            r.source
+            r.source,
+            verdict(r)
         ),
-        Some(_) => " owner unknown".to_string(),
+        Some(r) => format!(" owner unknown{}", verdict(r)),
         None => String::new(),
     };
     f.render_widget(Paragraph::new(line).style(Style::new().fg(Color::Cyan)), detail);
     let table = Table::new(
         rows.into_iter().map(|r| {
             let remote = addr(r.key.family, &r.key.remote_addr, r.key.remote_port);
-            let blocked = rules.denies(r.key.proto, remote, &r.exe);
+            // The kernel's verdict when it has one; else what the rules say
+            // for a new outbound connection.
+            let blocked = match r.conn {
+                Some(c) => c.action == ACTION_DENY,
+                None => rules.denies(r.key.proto, remote, &r.exe, Dir::Out),
+            };
             let style = if blocked { Style::new().fg(Color::Red) } else { Style::new() };
             Row::new(vec![
                 Cell::from(r.process),
@@ -358,6 +370,18 @@ fn draw_rules(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
     )
     .header(header_row(&["#", "Action", "Match", "Comment", "Hits"]));
     render_table(f, app, table, &ids, area);
+}
+
+/// "   opened out, allowed" from the kernel's connection state.
+fn verdict(r: &ConnRow) -> String {
+    match r.conn {
+        Some(c) => format!(
+            "   opened {}, {}",
+            if c.dir == DIR_IN { "in" } else { "out" },
+            if c.action == ACTION_DENY { "denied" } else { "allowed" }
+        ),
+        None => String::new(),
+    }
 }
 
 fn or_dash(s: &str) -> &str {
@@ -560,6 +584,9 @@ mod tests {
         let row = (0..10).find(|y| (0..120).map(|x| buf[(x, *y)].symbol()).collect::<String>().contains("1.1.1.1:443")).unwrap();
         assert_eq!(buf[(0, row)].fg, Color::Red, "blocked row is red");
         assert!(screen(&term).contains("RULES 1"));
+        rules.default = Action::Deny;
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &rules)).unwrap();
+        assert!(screen(&term).contains("DEFAULT DENY"));
         app.tab = Tab::Rules;
         term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &rules)).unwrap();
         let s = screen(&term);

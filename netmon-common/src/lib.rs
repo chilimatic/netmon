@@ -79,7 +79,68 @@ pub const DIR_IN: u8 = 2;
 pub const CFG_ACTIVE: u32 = 0;
 /// Rule count of half 0; half 1 follows.
 pub const CFG_COUNT: u32 = 1;
-pub const CFG_LEN: u32 = 3;
+/// Action for TCP and UDP traffic no rule matches. 0 means allow.
+pub const CFG_DEFAULT: u32 = 3;
+/// Bumped on every table rewrite: cached connection verdicts of an older
+/// generation are decided again.
+pub const CFG_GEN: u32 = 4;
+pub const CFG_LEN: u32 = 5;
+
+/// Connections whose direction and verdict the kernel remembers.
+pub const MAX_CONNS: u32 = 65_536;
+
+/// A connection as the firewall sees it: the remote end, the local port
+/// and the protocol. No local address and no interface, so the socket
+/// hooks (which know neither for sure) and TC agree on the key.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ConnKey {
+    /// Remote address, IPv4-mapped addresses as IPv4.
+    pub remote_addr: [u8; 16],
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub family: u8,
+    pub proto: u8,
+    pub _pad: [u8; 2],
+}
+
+impl ConnKey {
+    #[inline(always)]
+    pub fn from_flow(k: &FlowKey) -> ConnKey {
+        let mut c = ConnKey {
+            remote_addr: k.remote_addr,
+            local_port: k.local_port,
+            remote_port: k.remote_port,
+            family: k.family,
+            proto: k.proto,
+            _pad: [0; 2],
+        };
+        unmap_v4_in_place(&mut c.family, &mut c.remote_addr);
+        c
+    }
+}
+
+/// What the kernel remembers about a connection.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConnState {
+    /// CFG_GEN when the verdict was made.
+    pub generation: u32,
+    /// DIR_OUT or DIR_IN: the side that sent the first packet.
+    pub dir: u8,
+    /// ACTION_ALLOW or ACTION_DENY.
+    pub action: u8,
+    /// 1 if the process was known when deciding, so exe rules could match.
+    pub exe_known: u8,
+    pub _pad: u8,
+}
+
+/// DHCP and DHCPv6 (client and server ports). Never blocked, so a host
+/// with default deny keeps its address.
+#[inline(always)]
+pub fn is_dhcp(proto: u8, port: u16) -> bool {
+    proto == IPPROTO_UDP && (port == 67 || port == 68 || port == 546 || port == 547)
+}
 
 /// One rule of the ordered rule table.
 #[repr(C)]
@@ -335,6 +396,10 @@ unsafe impl aya::Pod for ListenKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for RuleEntry {}
 #[cfg(feature = "user")]
+unsafe impl aya::Pod for ConnKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ConnState {}
+#[cfg(feature = "user")]
 unsafe impl aya::Pod for TraceCfg {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for GuardKey {}
@@ -584,6 +649,21 @@ mod tests {
         assert!(!rule_matches(&r, 4, &dst, IPPROTO_TCP, 443, 3, DIR_IN), "direction");
         let port = RuleEntry { fields: RULE_PORT, port_lo: 1, port_hi: 65535, ..any };
         assert!(!rule_matches(&port, 4, &dst, IPPROTO_TCP, 0, 0, DIR_OUT), "unknown port");
+    }
+
+    #[test]
+    fn conn_key_from_flow() {
+        let mut k = FlowKey { family: 6, proto: IPPROTO_UDP, local_port: 5353, remote_port: 53, ifindex: 3, ..Default::default() };
+        k.remote_addr[10] = 0xff;
+        k.remote_addr[11] = 0xff;
+        k.remote_addr[12..].copy_from_slice(&[9, 9, 9, 9]);
+        k.local_addr[0] = 1;
+        let c = ConnKey::from_flow(&k);
+        assert_eq!((c.family, c.remote_addr, c.local_port, c.remote_port), (4, v4([9, 9, 9, 9]), 5353, 53));
+        k.ifindex = 7;
+        k.local_addr[0] = 2;
+        assert_eq!(ConnKey::from_flow(&k), c, "no interface or local address in the key");
+        assert!(is_dhcp(IPPROTO_UDP, 67) && is_dhcp(IPPROTO_UDP, 547) && !is_dhcp(IPPROTO_TCP, 67));
     }
 
     #[test]

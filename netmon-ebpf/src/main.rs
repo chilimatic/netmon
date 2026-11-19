@@ -15,12 +15,13 @@ use aya_ebpf::{
     programs::{SockAddrContext, SockContext, TcContext, TracePointContext},
 };
 use netmon_common::{
-    ACTION_DENY, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES, CFG_ACTIVE,
-    CFG_COUNT, CFG_LEN, CaptureConfig, DIR_IN, DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP,
-    IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey, ListenOwner, MAX_CAPTURE_FLOWS, MAX_EXE_PATH,
-    MAX_FLOWS, MAX_GUARD, MAX_IFACES, MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS,
-    PacketEvent, PacketSource, RuleEntry, SockOwner, TraceCfg, is_loopback, parse_packet,
-    rule_matches, unmap_v4_in_place,
+    ACTION_ALLOW, ACTION_DENY, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
+    CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
+    DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
+    ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
+    MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
+    RuleEntry, SockOwner, TraceCfg, is_dhcp, is_loopback, parse_packet, rule_matches,
+    unmap_v4_in_place,
 };
 
 /// Byte counters per flow and interface.
@@ -110,6 +111,19 @@ fn live_rules() -> (u32, u32) {
     (cfg(CFG_COUNT + half), half)
 }
 
+/// Is any rule or default deny in force? If not, nothing is checked and
+/// no connection state is kept.
+#[inline(always)]
+fn rules_active() -> bool {
+    live_rules().0 != 0 || cfg(CFG_DEFAULT) == ACTION_DENY as u32
+}
+
+/// Connection -> direction and cached verdict. LRU is fine here: an
+/// evicted entry is decided again (an inbound reply may then count as a
+/// new outbound connection).
+#[map]
+static CONNS: LruHashMap<ConnKey, ConnState> = LruHashMap::with_max_entries(MAX_CONNS, 0);
+
 /// State of one rule table walk, on the caller's stack. Starts with the
 /// guard key, so the address is stored once.
 #[repr(C)]
@@ -148,39 +162,39 @@ extern "C" fn scan_rule(i: u64, ctx: *mut c_void) -> i64 {
     1
 }
 
-/// denied() with family, proto and dir packed into one word: BPF functions
-/// take at most 5 arguments.
-#[inline(always)]
-fn denied(family: u8, addr: &[u8; 16], proto: u8, port: u16, tgid: u32, dir: u8) -> bool {
-    denied_packed(addr, port, tgid, u32::from_le_bytes([family, proto, dir, 0]))
-}
-
-/// True if traffic of process `tgid` (0: unknown) to `addr`:`port` in
-/// direction `dir` is denied. Walks the live table; the first matching
-/// rule decides and counts a hit. Loopback and guarded endpoints always
-/// pass; no match passes. A separate BPF function: the bpf_loop callback
-/// frame adds to this small one, not to the program frame. Programs, this
-/// function and the callback share a 512-byte stack.
+/// The action for connection `c` of process `tgid` (0: unknown) in
+/// direction `dir`. Loopback, guarded endpoints, DHCP and TCP/UDP packets
+/// without ports (later fragments) are allowed. Otherwise the first
+/// matching rule decides and counts a hit; with no match TCP and UDP get
+/// the default action and other protocols are allowed.
+///
+/// A separate BPF function: the bpf_loop callback frame adds to this small
+/// one, not to the program frame. Programs, the functions they call and
+/// the callback share a 512-byte stack. BPF functions take at most 5
+/// arguments.
 #[inline(never)]
-fn denied_packed(addr: &[u8; 16], port: u16, tgid: u32, meta: u32) -> bool {
-    let [family, proto, dir, _] = meta.to_le_bytes();
+fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
     let (count, half) = live_rules();
-    if count == 0 {
-        return false;
+    let tcp_udp = c.proto == IPPROTO_TCP || c.proto == IPPROTO_UDP;
+    let default = if tcp_udp && cfg(CFG_DEFAULT) == ACTION_DENY as u32 { ACTION_DENY } else { ACTION_ALLOW };
+    if is_loopback(c.family, &c.remote_addr) || is_dhcp(c.proto, c.remote_port) || (tcp_udp && c.remote_port == 0) {
+        return ACTION_ALLOW;
     }
     let mut scan = Scan {
-        guard: GuardKey { addr: *addr, port, family, _pad: 0 },
+        guard: GuardKey { addr: c.remote_addr, port: c.remote_port, family: c.family, _pad: 0 },
         exe: 0,
         base: half * MAX_RULES,
         count: if count > MAX_RULES { MAX_RULES } else { count },
-        proto,
+        proto: c.proto,
         dir,
         action: 0,
         _pad: 0,
     };
-    unmap_v4_in_place(&mut scan.guard.family, &mut scan.guard.addr);
-    if is_loopback(scan.guard.family, &scan.guard.addr) || unsafe { GUARD.get(&scan.guard) }.is_some() {
-        return false;
+    if unsafe { GUARD.get(&scan.guard) }.is_some() {
+        return ACTION_ALLOW;
+    }
+    if scan.count == 0 {
+        return default;
     }
     if tgid != 0 {
         scan.exe = unsafe { TGID_EXE.get(&tgid) }.copied().unwrap_or(0);
@@ -188,13 +202,77 @@ fn denied_packed(addr: &[u8; 16], port: u16, tgid: u32, meta: u32) -> bool {
     unsafe {
         bpf_loop(scan.count, scan_rule as *mut c_void, &mut scan as *mut Scan as *mut c_void, 0);
     }
-    scan.action == ACTION_DENY
+    if scan.action == 0 { default } else { scan.action }
+}
+
+/// TC verdict for a packet of flow `key`. TCP and UDP use the connection
+/// state: the first packet sets the direction (egress: out, ingress: in)
+/// and the verdict, later packets reuse it until the rules change.
+#[inline(never)]
+fn packet_denied(key: &FlowKey, egress: bool, tgid: u32) -> bool {
+    if !rules_active() {
+        return false;
+    }
+    let c = ConnKey::from_flow(key);
+    let mut dir = if egress { DIR_OUT } else { DIR_IN };
+    if c.proto != IPPROTO_TCP && c.proto != IPPROTO_UDP {
+        return decide(&c, tgid, dir) == ACTION_DENY;
+    }
+    let generation = cfg(CFG_GEN);
+    if let Some(st) = unsafe { CONNS.get(&c) } {
+        // Decide again after a rule change, or when the process is known
+        // now but was not then (exe rules could not match).
+        if st.generation == generation && (st.exe_known != 0 || tgid == 0) {
+            return st.action == ACTION_DENY;
+        }
+        dir = st.dir;
+    }
+    let mut tgid = tgid;
+    if tgid == 0 && dir == DIR_IN {
+        tgid = listener_tgid(key);
+    }
+    let action = decide(&c, tgid, dir);
+    let st = ConnState { generation, dir, action, exe_known: (tgid != 0) as u8, _pad: 0 };
+    let _ = CONNS.insert(&c, &st, 0);
+    action == ACTION_DENY
+}
+
+/// The process that bound the local end of an inbound flow (a server),
+/// from the post_bind hooks: exact address first, then the wildcard.
+#[inline(never)]
+fn listener_tgid(key: &FlowKey) -> u32 {
+    let mut lk = ListenKey { addr: key.local_addr, port: key.local_port, proto: key.proto, family: key.family };
+    if let Some(o) = unsafe { LISTENERS.get(&lk) } {
+        return o.owner.tgid;
+    }
+    lk.addr = [0; 16];
+    unsafe { LISTENERS.get(&lk) }.map_or(0, |o| o.owner.tgid)
+}
+
+/// Verdict for connect/sendmsg. Usually a new outbound connection; a UDP
+/// reply a server sends with sendto() belongs to an inbound one, found by
+/// the socket's local port.
+#[inline(never)]
+fn sock_denied(c: &ConnKey, tgid: u32) -> bool {
+    if !rules_active() {
+        return false;
+    }
+    let mut dir = DIR_OUT;
+    if c.local_port != 0
+        && let Some(st) = unsafe { CONNS.get(c) }
+    {
+        if st.generation == cfg(CFG_GEN) && st.exe_known != 0 {
+            return st.action == ACTION_DENY;
+        }
+        dir = st.dir;
+    }
+    decide(c, tgid, dir) == ACTION_DENY
 }
 
 /// Process of the socket that sent an egress packet, from its cookie.
 #[inline(always)]
 fn packet_tgid(ctx: &TcContext, egress: bool) -> u32 {
-    if !egress || live_rules().0 == 0 {
+    if !egress || !rules_active() {
         return 0;
     }
     let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
@@ -255,10 +333,7 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
     if let Some(key) = &key {
         count(ctx, key, egress);
         // Unparsed packets have no key and pass (fail-open).
-        let dir = if egress { DIR_OUT } else { DIR_IN };
-        if ifindex != LOOPBACK_IFINDEX
-            && denied(key.family, &key.remote_addr, key.proto, key.remote_port, packet_tgid(ctx, egress), dir)
-        {
+        if ifindex != LOOPBACK_IFINDEX && packet_denied(key, egress, packet_tgid(ctx, egress)) {
             action = TC_ACT_SHOT;
         }
     }
@@ -383,23 +458,32 @@ const DENY: i32 = 0;
 #[inline(always)]
 fn addr_verdict(ctx: &SockAddrContext, family: u8) -> i32 {
     let sa = ctx.sock_addr;
-    let proto = unsafe { (*sa).protocol } as u8;
     let pb = unsafe { (*sa).user_port }.to_ne_bytes();
-    let port = u16::from_be_bytes([pb[0], pb[1]]);
-    let mut addr = [0u8; 16];
+    let mut c = ConnKey {
+        proto: unsafe { (*sa).protocol } as u8,
+        remote_port: u16::from_be_bytes([pb[0], pb[1]]),
+        family,
+        ..ConnKey::default()
+    };
     // Each hook may read only its own family's address field.
     if family == 4 {
-        addr[..4].copy_from_slice(&unsafe { (*sa).user_ip4 }.to_ne_bytes());
+        c.remote_addr[..4].copy_from_slice(&unsafe { (*sa).user_ip4 }.to_ne_bytes());
     } else {
         let ip6 = unsafe { (*sa).user_ip6 };
         let mut i = 0;
         while i < 4 {
-            addr[i * 4..i * 4 + 4].copy_from_slice(&ip6[i].to_ne_bytes());
+            c.remote_addr[i * 4..i * 4 + 4].copy_from_slice(&ip6[i].to_ne_bytes());
             i += 1;
         }
     }
+    unmap_v4_in_place(&mut c.family, &mut c.remote_addr);
+    // Local port in host order; 0 until the socket is bound.
+    let sk = unsafe { (*sa).__bindgen_anon_1.sk };
+    if !sk.is_null() {
+        c.local_port = unsafe { (*sk).src_port } as u16;
+    }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if denied(family, &addr, proto, port, tgid, DIR_OUT) { DENY } else { ALLOW }
+    if sock_denied(&c, tgid) { DENY } else { ALLOW }
 }
 
 /// Writes the current process as owner of the socket behind `ctx`. Skips the

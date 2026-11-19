@@ -102,11 +102,21 @@ remote port (TCP or UDP). In **Processes**, `b` blocks every process running
 the selected process's exe, including ones started later. Press the key
 again to unblock. Blocked rows turn
 red. The **Rules** tab (`5`) lists every rule in match order with its hit
-count (packets and socket calls it decided); `d` removes the selected one.
+count (connections and socket calls it decided); `d` removes the selected
+one.
 
-Rules form an ordered list: the first rule that matches decides, and
-traffic no rule matches passes. A new block goes on top. Up to 256 rules;
-the kernel checks them in order for every packet.
+Rules form an ordered list: the first rule that matches decides. TCP and
+UDP traffic no rule matches gets the default action (`allow` unless the
+rules file says `default = "deny"`); other protocols (ICMP) pass. A new
+block goes on top. Up to 256 rules.
+
+The kernel decides each TCP or UDP connection once, on its first packet,
+and remembers the verdict and who opened it (up to 65 536 connections,
+oldest forgotten first). Later packets, replies included, reuse the
+verdict, so `default = "deny"` with `direction = "out"` allows replies to
+your own connections. A rule change decides every connection again. The
+detail line under the Connections table shows `opened in/out, allowed/
+denied`.
 
 - New connections and UDP sends to a blocked destination fail with
   `Operation not permitted` (cgroup `connect`/`sendmsg` hooks). Packets of
@@ -119,7 +129,12 @@ the kernel checks them in order for every packet.
 - Blocks end when netmon exits or crashes (fail-open). Packets netmon
   cannot parse pass.
 - Never blocked (lockout guard): loopback, the SSH session netmon runs in,
-  and DNS (port 53) to the nameservers in `/etc/resolv.conf`.
+  DNS (port 53) to the nameservers in `/etc/resolv.conf`, DHCP and DHCPv6
+  (UDP 67, 68, 546, 547), and TCP/UDP fragments without ports.
+- With default deny, allow what the host needs, e.g. your DNS upstream if
+  a local resolver (systemd-resolved) forwards to it, and NTP.
+- A connection forgotten while open (map full) is decided again on its
+  next packet, which may then count as opened by the other side.
 
 ### Rules file
 
@@ -148,6 +163,10 @@ port = "8000-8100"         # or one number; without proto: tcp and udp
 
 - `action` is required. Every other field is optional and narrows the
   match; a rule with only `action` matches all traffic.
+- `direction = "out"` matches connections this host opened, `"in"` ones
+  the remote host opened.
+- Top level `default = "deny"` denies TCP and UDP traffic no rule allows.
+  Inbound exe rules use the process that bound the local port.
 - `process` is an absolute exe path. Process names (`comm`) are not
   accepted: any process can choose its own.
 - `remote` must not have host bits set (`10.1.0.0/8` is refused).

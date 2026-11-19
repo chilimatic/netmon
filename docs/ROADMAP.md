@@ -151,7 +151,8 @@ loopback, the SSH session and DNS to the local resolver.
 ## Phase 3 – Rule engine and rules file
 
 **Status (2026-11-19): in progress.** Step 1 (kernel rule table) done and
-tested live. Step 2 (rules file) done and tested live. Step 3 next.
+tested live. Step 2 (rules file) and step 3 (direction, default
+deny) done and tested live. Step 4 next.
 
 **Why.** Blocks should survive a restart, be editable as text, and combine
 conditions ("curl may only reach port 443").

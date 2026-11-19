@@ -17,7 +17,8 @@ use aya::{
     util::{KernelVersion, nr_cpus},
 };
 use netmon_common::{
-    CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, CFG_ACTIVE, CFG_COUNT, CaptureConfig, FlowKey, FlowStats, GuardKey,
+    CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CaptureConfig, ConnKey,
+    ConnState, FlowKey, FlowStats, GuardKey,
     ListenKey, ListenOwner, MAX_CAPTURE_FLOWS, MAX_EXE_PATH, MAX_FLOWS, MAX_RULES, PacketEvent, RuleEntry, SockOwner,
     TraceCfg,
 };
@@ -63,6 +64,8 @@ pub struct Probe {
     rule_cfg: Array<MapData, u32>,
     /// Live table half, as last written to RULE_CFG.
     active: u32,
+    generation: u32,
+    conns: HashMap<MapData, ConnKey, ConnState>,
     guard: HashMap<MapData, GuardKey, u8>,
     rule_hits: PerCpuArray<MapData, u64>,
     exe_id_map: HashMap<MapData, [u8; MAX_EXE_PATH], u32>,
@@ -109,6 +112,7 @@ impl Probe {
         let listeners = HashMap::try_from(take("LISTENERS")?)?;
         let rule_table = Array::try_from(take("RULES")?)?;
         let rule_cfg = Array::try_from(take("RULE_CFG")?)?;
+        let conns = HashMap::try_from(take("CONNS")?)?;
         let guard = HashMap::try_from(take("GUARD")?)?;
         let rule_hits = PerCpuArray::try_from(take("RULE_HITS")?)?;
         let exe_id_map = HashMap::try_from(take("EXE_IDS")?)?;
@@ -131,6 +135,8 @@ impl Probe {
             rule_table,
             rule_cfg,
             active: 0,
+            generation: 0,
+            conns,
             guard,
             rule_hits,
             exe_id_map,
@@ -321,9 +327,13 @@ pub trait Kernel {
     fn sock_owner(&self, cookie: u64) -> Option<SockOwner>;
     /// Bound sockets recorded by the post_bind hooks: proto, address, owner.
     fn listeners(&self) -> Vec<(u8, SocketAddr, SockOwner)>;
-    /// Replaces the rule table. Hit counters of the new table start at 0.
-    /// On error the old table stays live.
-    fn set_rules(&mut self, rules: &[RuleEntry], exe_ids: &BTreeMap<String, u32>) -> anyhow::Result<()>;
+    /// Replaces the rule table and the default action (ACTION_*). Hit
+    /// counters of the new table start at 0 and every connection is
+    /// decided again. On error the old table stays live.
+    fn set_rules(&mut self, rules: &[RuleEntry], exe_ids: &BTreeMap<String, u32>, default: u8)
+    -> anyhow::Result<()>;
+    /// Direction and verdict the kernel holds for a connection.
+    fn conn(&self, key: &ConnKey) -> Option<ConnState>;
     /// Packets and socket calls matched by the rule in `slot` of the live
     /// table, since the last `set_rules`.
     fn rule_hits(&self, slot: usize) -> u64;
@@ -430,7 +440,7 @@ impl Kernel for Probe {
         self.sock_owner.get(&cookie, 0).ok()
     }
 
-    fn set_rules(&mut self, rules: &[RuleEntry], exe_ids: &BTreeMap<String, u32>) -> anyhow::Result<()> {
+    fn set_rules(&mut self, rules: &[RuleEntry], exe_ids: &BTreeMap<String, u32>, default: u8) -> anyhow::Result<()> {
         if rules.len() > MAX_RULES as usize {
             bail!("{} rules, the limit is {MAX_RULES}", rules.len());
         }
@@ -449,8 +459,13 @@ impl Kernel for Probe {
             self.rule_hits.set(base + i as u32, PerCpuValues::try_from(vec![0u64; self.cpus])?, 0)?;
         }
         self.rule_cfg.set(CFG_COUNT + half, rules.len() as u32, 0)?;
+        self.rule_cfg.set(CFG_DEFAULT, default as u32, 0)?;
         self.rule_cfg.set(CFG_ACTIVE, half, 0)?;
         self.active = half;
+        // Cached verdicts are stale now. Bumped last, so no packet caches a
+        // verdict of the old table under the new generation.
+        self.generation = self.generation.wrapping_add(1);
+        self.rule_cfg.set(CFG_GEN, self.generation, 0)?;
         // Then drop exe ids no rule names any more, with their marks.
         for (path, id) in &self.exe_ids {
             if !exe_ids.contains_key(path) {
@@ -466,6 +481,10 @@ impl Kernel for Probe {
         }
         self.exe_ids = exe_ids.clone();
         Ok(())
+    }
+
+    fn conn(&self, key: &ConnKey) -> Option<ConnState> {
+        self.conns.get(key, 0).ok()
     }
 
     fn rule_hits(&self, slot: usize) -> u64 {

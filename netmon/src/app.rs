@@ -79,6 +79,8 @@ pub struct ConnRow {
     pub tx_rate: f64,
     pub rx_rate: f64,
     pub total: u64,
+    /// Direction and verdict from the kernel's connection state.
+    pub conn: Option<netmon_common::ConnState>,
 }
 
 pub struct ProcRow {
@@ -416,6 +418,7 @@ fn conn_row(f: &Flow, names: &Names) -> ConnRow {
         tx_rate: f.tx_rate,
         rx_rate: f.rx_rate,
         total: f.total.tx_bytes + f.total.rx_bytes,
+        conn: f.conn,
     }
 }
 

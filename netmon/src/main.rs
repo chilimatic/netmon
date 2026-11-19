@@ -161,6 +161,7 @@ impl<K: Kernel> Monitor<K> {
         }
         self.sync_exe_blocks();
         self.refresh_hits();
+        self.refresh_conns();
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {
             errors.push(format!("capture: {e:#}"));
@@ -274,6 +275,15 @@ impl<K: Kernel> Monitor<K> {
         }
     }
 
+    /// Reads the kernel's direction and verdict for every flow, while rules
+    /// are in force.
+    fn refresh_conns(&mut self) {
+        let active = !self.rules.rules.is_empty() || self.rules.default == rules::Action::Deny;
+        for f in self.collector.flows.values_mut() {
+            f.conn = if active { self.probe.conn(&netmon_common::ConnKey::from_flow(&f.key)) } else { None };
+        }
+    }
+
     /// Edits the rules and writes the new table to the kernel. On any error
     /// the old rules stay, in userspace and in the kernel.
     fn change_rules(&mut self, edit: impl FnOnce(&mut Rules) -> Result<String, String>) -> String {
@@ -287,7 +297,7 @@ impl<K: Kernel> Monitor<K> {
             Ok(m) => m,
             Err(e) => return e,
         };
-        match self.probe.set_rules(&self.rules.entries(), self.rules.exe_ids()) {
+        match self.probe.set_rules(&self.rules.entries(), self.rules.exe_ids(), self.rules.default.kernel()) {
             Ok(()) => {
                 self.sync_exe_blocks();
                 msg
@@ -314,16 +324,21 @@ impl<K: Kernel> Monitor<K> {
             Ok(p) => p,
             Err(e) => return fail(e),
         };
-        let n = parsed.len();
+        let n = parsed.rules.len();
+        let default = parsed.default;
         let mut failed = false;
         let msg = self.change_rules(|rules| {
-            for r in parsed {
+            if let Some(d) = default {
+                rules.default = d;
+            }
+            for r in parsed.rules {
                 rules.insert(usize::MAX, r.action, r.m, &r.comment).map_err(|e| {
                     failed = true;
                     format!("line {}: {e}", r.line)
                 })?;
             }
-            Ok(format!("{n} rules from {}", path.display()))
+            let d = if rules.default == rules::Action::Deny { ", default deny" } else { "" };
+            Ok(format!("{n} rules from {}{d}", path.display()))
         });
         if failed || msg.starts_with("rule update failed") { fail(msg) } else { Some(msg) }
     }
@@ -574,7 +589,7 @@ mod tests {
         assert_eq!(args(0, 30).interval(), Duration::from_millis(100));
     }
 
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
 
     use netmon_common::{CAPTURE_LEN, FlowStats, IPPROTO_TCP, PacketEvent, RULE_EXE, RULE_NET, RULE_PORT, RULE_PROTO, RuleEntry};
 
@@ -595,6 +610,8 @@ mod tests {
         drops: u64,
         table: Vec<RuleEntry>,
         exe_ids: std::collections::BTreeMap<String, u32>,
+        default: u8,
+        conns: HashMap<netmon_common::ConnKey, netmon_common::ConnState>,
         fail_block: bool,
         marked: Vec<(u32, u32)>,
     }
@@ -646,13 +663,18 @@ mod tests {
             &mut self,
             rules: &[RuleEntry],
             exe_ids: &std::collections::BTreeMap<String, u32>,
+            default: u8,
         ) -> anyhow::Result<()> {
             if self.fail_block {
                 anyhow::bail!("map full");
             }
             self.table = rules.to_vec();
             self.exe_ids = exe_ids.clone();
+            self.default = default;
             Ok(())
+        }
+        fn conn(&self, key: &netmon_common::ConnKey) -> Option<netmon_common::ConnState> {
+            self.conns.get(key).copied()
         }
         fn mark_pids(&mut self, id: u32, pids: &[u32]) {
             self.marked.extend(pids.iter().map(|p| (id, *p)));
@@ -696,6 +718,8 @@ mod tests {
             drops: 0,
             table: Vec::new(),
             exe_ids: Default::default(),
+            default: 0,
+            conns: HashMap::new(),
             fail_block: false,
             marked: Vec::new(),
         };
@@ -841,6 +865,22 @@ mod tests {
         assert!(m.rules.rules.is_empty());
         let missing = Args { rules: Some(dir.join("gone.toml")), ..args(1000, 30) };
         assert!(m.load_rules_file(&missing).unwrap().contains("no file rules loaded"), "explicit path must exist");
+    }
+
+    #[test]
+    fn kernel_verdicts_read_while_rules_are_in_force() {
+        let (mut m, t0) = monitor();
+        m.probe.flows = vec![(key(50001), tx(10))];
+        let st = netmon_common::ConnState { dir: netmon_common::DIR_IN, action: netmon_common::ACTION_DENY, ..Default::default() };
+        m.probe.conns.insert(netmon_common::ConnKey::from_flow(&key(50001)), st);
+        m.tick_at(secs(t0, 1));
+        assert_eq!(m.collector.flows[&key(50001)].conn, None, "no rules: not read");
+        m.rules.default = rules::Action::Deny;
+        m.tick_at(secs(t0, 2));
+        assert_eq!(m.collector.flows[&key(50001)].conn, Some(st));
+        let mut app = App::default();
+        m.handle(&mut app, Action::ToggleBlockPort);
+        assert_eq!(m.probe.default, netmon_common::ACTION_DENY, "default sent with the table");
     }
 
     #[test]

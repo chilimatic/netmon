@@ -9,8 +9,8 @@ use std::{
 };
 
 use netmon_common::{
-    ACTION_ALLOW, ACTION_DENY, DIR_OUT, IPPROTO_TCP, IPPROTO_UDP, MAX_EXE_PATH, MAX_RULES, RULE_EXE, RULE_NET,
-    RULE_PORT, RULE_PROTO, RuleEntry, rule_matches,
+    ACTION_ALLOW, ACTION_DENY, DIR_IN, DIR_OUT, IPPROTO_TCP, IPPROTO_UDP, MAX_EXE_PATH, MAX_RULES, RULE_DIR,
+    RULE_EXE, RULE_NET, RULE_PORT, RULE_PROTO, RuleEntry, rule_matches,
 };
 
 use crate::procmap::normalize;
@@ -58,10 +58,38 @@ pub fn proto_name(p: u8) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Action {
+    #[default]
     Allow,
     Deny,
+}
+
+impl Action {
+    pub fn kernel(self) -> u8 {
+        match self {
+            Action::Allow => ACTION_ALLOW,
+            Action::Deny => ACTION_DENY,
+        }
+    }
+}
+
+/// The side that opened a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dir {
+    /// This host.
+    Out,
+    /// The remote host.
+    In,
+}
+
+impl Dir {
+    pub fn kernel(self) -> u8 {
+        match self {
+            Dir::Out => DIR_OUT,
+            Dir::In => DIR_IN,
+        }
+    }
 }
 
 impl fmt::Display for Action {
@@ -84,6 +112,8 @@ pub struct Match {
     pub ports: Option<(u16, u16)>,
     /// Absolute exe path of the local process.
     pub exe: Option<String>,
+    /// Who opened the connection.
+    pub dir: Option<Dir>,
 }
 
 impl Match {
@@ -117,6 +147,11 @@ impl Match {
 impl fmt::Display for Match {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut parts = Vec::new();
+        match self.dir {
+            Some(Dir::Out) => parts.push("out".to_string()),
+            Some(Dir::In) => parts.push("in".to_string()),
+            None => {}
+        }
         if let Some(p) = &self.exe {
             parts.push(format!("exe {p}"));
         }
@@ -169,6 +204,8 @@ pub struct Rules {
     exe_ids: BTreeMap<String, u32>,
     next_exe_id: u32,
     next_id: u32,
+    /// Action for TCP and UDP traffic no rule matches.
+    pub default: Action,
 }
 
 impl Rules {
@@ -227,10 +264,11 @@ impl Rules {
     }
 
     fn entry(&self, r: &Rule) -> RuleEntry {
-        let mut e = RuleEntry {
-            action: if r.action == Action::Deny { ACTION_DENY } else { ACTION_ALLOW },
-            ..RuleEntry::default()
-        };
+        let mut e = RuleEntry { action: r.action.kernel(), ..RuleEntry::default() };
+        if let Some(d) = r.m.dir {
+            e.fields |= RULE_DIR;
+            e.dir = d.kernel();
+        }
         if let Some((ip, len)) = r.m.net {
             e.fields |= RULE_NET;
             (e.family, e.addr) = addr_bytes(ip);
@@ -251,18 +289,25 @@ impl Rules {
         e
     }
 
-    /// The first rule that matches outgoing traffic to `remote` by a process
-    /// running `exe` ("" if unknown), with the kernel's match logic.
-    pub fn first_match(&self, proto: u8, remote: SocketAddr, exe: &str) -> Option<&Rule> {
+    /// The first rule that matches traffic to `remote` by a process running
+    /// `exe` ("" if unknown) on a connection opened in direction `dir`,
+    /// with the kernel's match logic.
+    pub fn first_match(&self, proto: u8, remote: SocketAddr, exe: &str, dir: Dir) -> Option<&Rule> {
         let remote = normalize(remote);
         let (family, addr) = addr_bytes(remote.ip());
         let exe = self.exe_ids.get(exe).copied().unwrap_or(0);
-        self.rules.iter().find(|r| rule_matches(&self.entry(r), family, &addr, proto, remote.port(), exe, DIR_OUT))
+        self.rules
+            .iter()
+            .find(|r| rule_matches(&self.entry(r), family, &addr, proto, remote.port(), exe, dir.kernel()))
     }
 
-    /// Is this traffic denied?
-    pub fn denies(&self, proto: u8, remote: SocketAddr, exe: &str) -> bool {
-        self.first_match(proto, remote, exe).is_some_and(|r| r.action == Action::Deny)
+    /// Is this traffic denied, by a rule or the default? Ignores the
+    /// kernel's exemptions (loopback, guard, DHCP).
+    pub fn denies(&self, proto: u8, remote: SocketAddr, exe: &str, dir: Dir) -> bool {
+        match self.first_match(proto, remote, exe, dir) {
+            Some(r) => r.action == Action::Deny,
+            None => (proto == IPPROTO_TCP || proto == IPPROTO_UDP) && self.default == Action::Deny,
+        }
     }
 
     /// Does a deny rule name this exe?
@@ -334,17 +379,17 @@ mod tests {
     fn blocks_match() {
         let mut r = Rules::default();
         r.block(BlockTarget::host("1.1.1.1".parse().unwrap())).unwrap();
-        assert!(r.denies(IPPROTO_TCP, sa("1.1.1.1:443"), ""));
-        assert!(r.denies(IPPROTO_UDP, sa("[::ffff:1.1.1.1]:53"), ""), "mapped v4");
-        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.2:443"), ""));
+        assert!(r.denies(IPPROTO_TCP, sa("1.1.1.1:443"), "", Dir::Out));
+        assert!(r.denies(IPPROTO_UDP, sa("[::ffff:1.1.1.1]:53"), "", Dir::Out), "mapped v4");
+        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.2:443"), "", Dir::Out));
         r.block(BlockTarget::Net("10.0.0.0".parse().unwrap(), 8)).unwrap();
-        assert!(r.denies(IPPROTO_TCP, sa("10.200.3.4:1"), ""));
-        assert!(!r.denies(IPPROTO_TCP, sa("11.0.0.1:1"), ""));
+        assert!(r.denies(IPPROTO_TCP, sa("10.200.3.4:1"), "", Dir::Out));
+        assert!(!r.denies(IPPROTO_TCP, sa("11.0.0.1:1"), "", Dir::Out));
         r.block(BlockTarget::Net("2001:db8::".parse().unwrap(), 32)).unwrap();
-        assert!(r.denies(IPPROTO_TCP, sa("[2001:db8:1::5]:80"), ""));
+        assert!(r.denies(IPPROTO_TCP, sa("[2001:db8:1::5]:80"), "", Dir::Out));
         r.block(BlockTarget::Port(IPPROTO_TCP, 25)).unwrap();
-        assert!(r.denies(IPPROTO_TCP, sa("9.9.9.9:25"), ""));
-        assert!(!r.denies(IPPROTO_UDP, sa("9.9.9.9:25"), ""));
+        assert!(r.denies(IPPROTO_TCP, sa("9.9.9.9:25"), "", Dir::Out));
+        assert!(!r.denies(IPPROTO_UDP, sa("9.9.9.9:25"), "", Dir::Out));
     }
 
     #[test]
@@ -355,11 +400,22 @@ mod tests {
         // Inserted above the deny: curl may reach port 443 only.
         r.insert(0, Action::Allow, Match { ports: Some((443, 443)), proto: Some(IPPROTO_TCP), ..curl() }, "web")
             .unwrap();
-        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.1:443"), "/usr/bin/curl"));
-        assert_eq!(r.first_match(IPPROTO_TCP, sa("1.1.1.1:443"), "/usr/bin/curl").unwrap().comment, "web");
-        assert!(r.denies(IPPROTO_TCP, sa("1.1.1.1:80"), "/usr/bin/curl"));
-        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.1:80"), "/usr/bin/wget"));
-        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.1:80"), ""), "unknown exe never matches");
+        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.1:443"), "/usr/bin/curl", Dir::Out));
+        assert_eq!(r.first_match(IPPROTO_TCP, sa("1.1.1.1:443"), "/usr/bin/curl", Dir::Out).unwrap().comment, "web");
+        assert!(r.denies(IPPROTO_TCP, sa("1.1.1.1:80"), "/usr/bin/curl", Dir::Out));
+        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.1:80"), "/usr/bin/wget", Dir::Out));
+        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.1:80"), "", Dir::Out), "unknown exe never matches");
+    }
+
+    #[test]
+    fn direction_and_default() {
+        let mut r = Rules { default: Action::Deny, ..Rules::default() };
+        r.insert(9, Action::Allow, Match { dir: Some(Dir::Out), ..Match::default() }, "").unwrap();
+        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.1:443"), "", Dir::Out));
+        assert!(r.denies(IPPROTO_TCP, sa("1.1.1.1:443"), "", Dir::In), "default deny for inbound");
+        assert!(!r.denies(1, sa("1.1.1.1:0"), "", Dir::In), "default applies to tcp and udp only");
+        let e = r.entries();
+        assert_eq!((e[0].fields, e[0].dir, e[0].action), (RULE_DIR, DIR_OUT, ACTION_ALLOW));
     }
 
     #[test]
@@ -373,8 +429,9 @@ mod tests {
             proto: Some(IPPROTO_TCP),
             ports: Some((8000, 8100)),
             net: Some(("10.0.0.0".parse().unwrap(), 8)),
+            dir: Some(Dir::In),
         };
-        assert_eq!(m.to_string(), "exe /usr/bin/curl tcp port 8000-8100 net 10.0.0.0/8");
+        assert_eq!(m.to_string(), "in exe /usr/bin/curl tcp port 8000-8100 net 10.0.0.0/8");
         assert_eq!(Match::default().to_string(), "all traffic");
     }
 

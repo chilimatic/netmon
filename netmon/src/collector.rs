@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
-use netmon_common::{FlowKey, FlowStats};
+use netmon_common::{ConnState, FlowKey, FlowStats};
 
 use crate::procmap::{Listeners, Owner, SocketTable};
 
@@ -30,6 +30,9 @@ pub struct Flow {
     pub owner_cookie: u64,
     pub owner_source: OwnerSource,
     pub state: &'static str,
+    /// Direction and verdict the kernel holds for the connection. None
+    /// while no rule or default deny is in force.
+    pub conn: Option<ConnState>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -96,6 +99,7 @@ impl Collector {
                 owner: None,
                 owner_cookie: 0,
                 owner_source: OwnerSource::Unknown,
+                conn: None,
                 state: "",
             });
             // A counter that went down means the LRU map evicted and
