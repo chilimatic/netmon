@@ -985,6 +985,7 @@ dependencies = [
  "anyhow",
  "aya",
  "aya-build",
+ "base64",
  "clap",
  "crossterm",
  "libc",
@@ -992,6 +993,7 @@ dependencies = [
  "procfs",
  "ratatui",
  "serde",
+ "serde_json",
  "toml",
 ]
 
@@ -1000,6 +1002,7 @@ name = "netmon-common"
 version = "0.1.0"
 dependencies = [
  "aya",
+ "serde",
 ]
 
 [[package]]

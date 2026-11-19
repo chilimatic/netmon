@@ -30,7 +30,7 @@ const MAX_DESTS: usize = 64;
 const MAX_CONNS: usize = 256;
 
 /// What a scope answer covers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Scope {
     /// The program, any destination.
     Program,
@@ -59,7 +59,7 @@ impl Scope {
 }
 
 /// One remote end a program wants to reach.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Dest {
     pub remote: IpAddr,
     pub port: u16,
@@ -70,8 +70,10 @@ pub struct Dest {
 }
 
 /// One question: a program wants to connect.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Prompt {
+    /// Names the question in answers. Never reused.
+    pub id: u64,
     pub pid: u32,
     pub comm: String,
     /// Empty if the process is unknown (forwarded traffic has no local
@@ -80,6 +82,7 @@ pub struct Prompt {
     pub exe: String,
     pub user: String,
     pub dests: Vec<Dest>,
+    #[serde(with = "crate::proto::age")]
     pub since: Instant,
     /// Destination the "once" answers and the destination scope use.
     pub selected: usize,
@@ -161,6 +164,7 @@ pub enum Added {
 pub struct Asks {
     /// Oldest first; the first is the one shown.
     pub pending: VecDeque<Prompt>,
+    next_id: u64,
 }
 
 impl Asks {
@@ -187,7 +191,8 @@ impl Asks {
         }
         // An unknown process cannot get a program rule: start at port.
         let scope = if info.exe.is_empty() { Scope::Port } else { Scope::Program };
-        self.pending.push_back(Prompt { dests: vec![new_dest()], selected: 0, scope, ..info });
+        self.next_id += 1;
+        self.pending.push_back(Prompt { id: self.next_id, dests: vec![new_dest()], selected: 0, scope, ..info });
         Added::New
     }
 
@@ -214,6 +219,7 @@ mod tests {
 
     pub fn info(exe: &str, pid: u32, since: Instant) -> Prompt {
         Prompt {
+            id: 0,
             pid,
             comm: "firefox".into(),
             exe: exe.into(),

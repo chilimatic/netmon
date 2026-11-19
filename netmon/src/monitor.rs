@@ -9,16 +9,16 @@ use std::{
 use clap::Parser;
 
 use crate::{
-    app::{Action, App, Tab},
-    capture,
+    app::Answer,
     ask,
-    capture::{Capture, Captured, Target},
+    capture::{self, Target},
     collector::{self, Collector},
     ifaces::{self, Names},
     linkwatch::LinkWatch,
     names, netns,
     probe::{Kernel, Probe},
     procmap::{self, Listeners, Owner, OwnerCache, ProcCache, SocketTable, read_details},
+    proto::{CaptureInfo, DestId, RawPacket, Request, Snapshot},
     rulefile,
     rules::{self, BlockTarget, Rules, guard_endpoints},
     text,
@@ -109,6 +109,19 @@ pub(crate) const NAME_BATCH: usize = 4_096;
 /// How often the TUI loop checks for interface events between ticks.
 pub(crate) const LINK_POLL: Duration = Duration::from_millis(200);
 
+/// The running or last capture, on the kernel side.
+pub(crate) struct Capturing {
+    pub(crate) info: CaptureInfo,
+    /// CLOCK_MONOTONIC -> wall clock offset in nanoseconds.
+    mono_to_wall: i128,
+    /// Kernel drop counter (counts since load) when the capture started.
+    drop_base: u64,
+}
+
+/// Packets kept for the UI at most; older ones are dropped first. Matches
+/// what the UI keeps.
+pub(crate) const MAX_QUEUED_PACKETS: usize = capture::MAX_PACKETS;
+
 /// The main loop's state. Generic over the kernel side so tests can run it
 /// with a fake.
 pub(crate) struct Monitor<K: Kernel = Probe> {
@@ -117,10 +130,9 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) names: Names,
     pub(crate) last: Instant,
     pub(crate) ticks: u64,
-    pub(crate) capture: Option<Capture>,
-    /// Copy of the collector shown while paused. Counting goes on behind it,
-    /// so rates are right again after resume.
-    pub(crate) frozen: Option<Collector>,
+    pub(crate) capture: Option<Capturing>,
+    /// Packets read from the kernel that no UI has taken yet.
+    pub(crate) packets: Vec<RawPacket>,
     pub(crate) owners: OwnerCache,
     pub(crate) procs: ProcCache,
     pub(crate) rules: Rules,
@@ -183,19 +195,44 @@ impl<K: Kernel> Monitor<K> {
         let mut collector = Collector::new(args.expire_ticks());
         collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new() };
         Ok((mon, errors))
     }
 
-    /// What the UI shows: the frozen copy while paused, else live data.
-    pub(crate) fn view(&self) -> &Collector {
-        self.frozen.as_ref().unwrap_or(&self.collector)
+    /// Everything a UI shows.
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            collector: self.collector.clone(),
+            names: self.names.clone(),
+            rules: self.rules.clone(),
+            questions: self.asks.pending.iter().cloned().collect(),
+            capture: self.capture.as_ref().map(|c| c.info.clone()),
+        }
     }
 
-    /// Freezes or unfreezes the view to match the pause state.
-    pub(crate) fn set_paused(&mut self, paused: bool) {
-        if paused != self.frozen.is_some() {
-            self.frozen = paused.then(|| self.collector.clone());
+    /// Takes the packets captured since the last call.
+    pub(crate) fn take_packets(&mut self) -> Vec<RawPacket> {
+        std::mem::take(&mut self.packets)
+    }
+
+    /// Carries out a request of a UI. Returns a status message.
+    pub(crate) fn request(&mut self, req: Request) -> String {
+        match req {
+            Request::ToggleBlock(target) => self.toggle_block(target),
+            Request::RemoveRule(id) => self.remove_rule(id),
+            Request::SaveRules => {
+                let path = &self.rules_path;
+                match rulefile::save(path, &rulefile::render(&self.rules)) {
+                    Ok(()) => format!("saved {} rules to {}", self.rules.rules.len(), path.display()),
+                    Err(e) => format!("save {} failed: {e}", path.display()),
+                }
+            }
+            Request::Answer { question, dest, scope, answer } => self.answer(question, dest, scope, answer),
+            Request::StartCapture(target) => match self.start_capture(target) {
+                Ok(()) => String::new(),
+                Err(e) => format!("capture failed: {e:#}"),
+            },
+            Request::StopCapture => self.stop_capture(),
         }
     }
 
@@ -260,7 +297,9 @@ impl<K: Kernel> Monitor<K> {
 
     /// A process capture follows the process: new flows join, closed ones leave.
     pub(crate) fn sync_process_capture(&mut self) -> anyhow::Result<()> {
-        let Some(Capture { target: Target::Process { pid, .. }, running: true, .. }) = &self.capture else {
+        let Some(Capturing { info: CaptureInfo { target: Target::Process { pid, .. }, running: true, .. }, .. }) =
+            &self.capture
+        else {
             return Ok(());
         };
         let keys = self.process_flows(*pid);
@@ -280,56 +319,47 @@ impl<K: Kernel> Monitor<K> {
         self.probe.capture_off()?;
         // Packets still queued belong to the old capture.
         self.probe.discard_packets();
-        let mut cap = Capture::new(target);
-        cap.drop_base = self.probe.capture_drops();
-        let target = &cap.target;
-        match target {
+        self.packets.clear();
+        match &target {
             Target::Interface { index, .. } => self.probe.capture_iface(*index)?,
             Target::Process { pid, .. } => self.probe.capture_flows(&self.process_flows(*pid))?,
             Target::Connection { key, .. } => self.probe.capture_flows(&HashSet::from([*key]))?,
         }
-        self.capture = Some(cap);
+        self.capture = Some(Capturing {
+            info: CaptureInfo { id: self.capture.as_ref().map_or(1, |c| c.info.id + 1), target, running: true, dropped: 0 },
+            mono_to_wall: capture::mono_to_wall_offset(),
+            drop_base: self.probe.capture_drops(),
+        });
         Ok(())
     }
 
-    /// Moves up to `max` packets from the ring into the capture and updates
-    /// its drop count.
-    pub(crate) fn drain_capture(&mut self, max: usize) {
-        let Some(cap) = self.capture.as_mut().filter(|c| c.running) else { return };
-        let offset = cap.mono_to_wall;
-        self.probe.drain_packets(max, |ev| cap.push(Captured::from_event(ev, offset)));
-        cap.dropped = self.probe.capture_drops().saturating_sub(cap.drop_base);
+    /// Stops the capture. Packets already captured still go to the UI.
+    pub(crate) fn stop_capture(&mut self) -> String {
+        let mut msg = String::new();
+        if let Err(e) = self.probe.capture_off() {
+            msg = format!("stop failed: {e:#}");
+        }
+        // Keep what the kernel already captured. The ring holds at most
+        // CAPTURE_RING_BYTES, so this ends.
+        self.drain_capture(usize::MAX);
+        if let Some(cap) = self.capture.as_mut() {
+            cap.info.running = false;
+        }
+        msg
     }
 
-    /// Turns the selected row of a tab into a capture target.
-    pub(crate) fn target_for(&self, app: &App, tab: Tab) -> Result<Target, String> {
-        // Rows as the user sees them, so a paused view picks the shown row.
-        let c = self.view();
-        match tab {
-            Tab::Interfaces => {
-                let rows = app.iface_rows(c, &self.names);
-                let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
-                let r = app.selected_in(&ids).map(|i| &rows[i]).ok_or("no interface selected")?;
-                Ok(Target::Interface { index: r.index, name: r.name.clone() })
-            }
-            Tab::Processes => {
-                let rows = app.proc_rows(c, &self.names);
-                let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
-                let r = app.selected_in(&ids).map(|i| &rows[i]).ok_or("no process selected")?;
-                let pid = r.pid_num.ok_or("owner unknown: capture its connections instead")?;
-                Ok(Target::Process { pid, comm: r.process.clone() })
-            }
-            Tab::Connections => {
-                let rows = app.conn_rows(c, &self.names);
-                let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
-                let r = app.selected_in(&ids).map(|i| &rows[i]).ok_or("no connection selected")?;
-                Ok(Target::Connection {
-                    key: r.key,
-                    label: format!("{} {} → {} on {}", r.proto, r.local, r.remote, r.iface),
-                })
-            }
-            Tab::Capture | Tab::Rules => Err("select a row in another tab".into()),
+    /// Moves up to `max` packets from the ring to the UI queue and updates
+    /// the drop count.
+    pub(crate) fn drain_capture(&mut self, max: usize) {
+        let Some(cap) = self.capture.as_mut().filter(|c| c.info.running) else { return };
+        let offset = cap.mono_to_wall;
+        let queue = &mut self.packets;
+        self.probe.drain_packets(max, |ev| queue.push(capture::raw_packet(ev, offset)));
+        // No UI took them: keep the newest.
+        if queue.len() > MAX_QUEUED_PACKETS {
+            queue.drain(..queue.len() - MAX_QUEUED_PACKETS);
         }
+        cap.info.dropped = self.probe.capture_drops().saturating_sub(cap.drop_base);
     }
 
     /// Adds the rule, or removes it if it exists.
@@ -369,14 +399,16 @@ impl<K: Kernel> Monitor<K> {
     }
 
     /// Reads new ask events and times out old questions. Called often, so
-    /// a question shows before the first TCP retransmit (~1 s).
-    pub(crate) fn poll_asks(&mut self, now: Instant) {
+    /// a question shows before the first TCP retransmit (~1 s). Returns
+    /// true if the questions changed.
+    pub(crate) fn poll_asks(&mut self, now: Instant) -> bool {
         let mut events = Vec::new();
         self.probe.drain_asks(ASK_BATCH, |e| events.push(*e));
         // Traffic without a socket may be a container's: get its table.
         if events.iter().any(|e| e.tgid == 0) {
             self.refresh_containers(now, Duration::from_secs(1));
         }
+        let mut changed = !events.is_empty();
         for ev in events {
             let (info, host) = self.prompt_for(&ev, now);
             // Events still in the ring when an answer made a rule: the rule
@@ -390,6 +422,7 @@ impl<K: Kernel> Monitor<K> {
             }
         }
         for p in self.asks.expired(now) {
+            changed = true;
             for d in &p.dests {
                 self.answer_conns(&d.conns, netmon_common::ACTION_DENY);
             }
@@ -401,8 +434,10 @@ impl<K: Kernel> Monitor<K> {
             if let Some(o) = container_of(&self.containers, k) {
                 p.pid = o.pid;
                 p.comm = format!("container:{}/{}", o.container.as_deref().unwrap_or("?"), o.comm);
+                changed = true;
             }
         }
+        changed
     }
 
     /// The asking process and the remote end's name. Traffic without a
@@ -428,6 +463,7 @@ impl<K: Kernel> Monitor<K> {
         }
         let d = owner.details.unwrap_or_default();
         let info = ask::Prompt {
+            id: 0,
             pid,
             comm,
             exe: if container.is_some() { String::new() } else { d.exe },
@@ -447,19 +483,26 @@ impl<K: Kernel> Monitor<K> {
         }
     }
 
-    /// Answers the shown question.
-    pub(crate) fn answer(&mut self, a: crate::app::Answer) -> String {
-        use crate::app::Answer;
-        let Some(p) = self.asks.pending.front_mut() else { return String::new() };
+    /// Answers question `question` for destination `dest`, with a rule of
+    /// scope `scope` or once.
+    pub(crate) fn answer(&mut self, question: u64, dest: DestId, scope: ask::Scope, a: Answer) -> String {
+        let Some(qi) = self.asks.pending.iter().position(|p| p.id == question) else {
+            return "question already answered or timed out".into();
+        };
+        let p = &mut self.asks.pending[qi];
+        let Some(di) = p.dests.iter().position(|d| DestId::from(d) == dest)
+        else {
+            return "destination already answered".into();
+        };
+        p.selected = di;
+        p.scope = scope;
         match a {
             Answer::Once { allow } => {
-                let Some(d) = (p.selected < p.dests.len()).then(|| p.dests.remove(p.selected)) else {
-                    return String::new();
-                };
+                let d = p.dests.remove(di);
                 p.selected = p.selected.min(p.dests.len().saturating_sub(1));
                 let comm = p.comm.clone();
                 if p.dests.is_empty() {
-                    self.asks.pending.pop_front();
+                    self.asks.pending.remove(qi);
                 }
                 let action = if allow { netmon_common::ACTION_ALLOW } else { netmon_common::ACTION_DENY };
                 self.answer_conns(&d.conns, action);
@@ -634,116 +677,6 @@ impl<K: Kernel> Monitor<K> {
         }
     }
 
-    /// The selected connection in the Connections tab.
-    pub(crate) fn selected_conn(&self, app: &App) -> Option<crate::app::ConnRow> {
-        let rows = app.conn_rows(self.view(), &self.names);
-        let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
-        let i = app.selected_in(&ids)?;
-        rows.into_iter().nth(i)
-    }
-
-    pub(crate) fn handle(&mut self, app: &mut App, action: Action) {
-        match action {
-            Action::StartCapture(tab) => match self.target_for(app, tab) {
-                Ok(target) => match self.start_capture(target) {
-                    Ok(()) => {
-                        app.tab = Tab::Capture;
-                        app.status.clear();
-                    }
-                    Err(e) => app.status = format!("capture failed: {e:#}"),
-                },
-                Err(e) => app.status = e,
-            },
-            Action::StopCapture => {
-                if let Err(e) = self.probe.capture_off() {
-                    app.status = format!("stop failed: {e:#}");
-                }
-                // Keep what the kernel already captured. The ring holds at
-                // most CAPTURE_RING_BYTES, so this ends.
-                self.drain_capture(usize::MAX);
-                // Packets stay for viewing and saving until the next capture.
-                if let Some(cap) = self.capture.as_mut() {
-                    cap.running = false;
-                    app.status = format!("capture stopped, {} packets kept", cap.packets.len());
-                }
-            }
-            Action::SavePcap => match &self.capture {
-                Some(cap) if !cap.packets.is_empty() => {
-                    let dir = std::env::current_dir().unwrap_or_else(|_| ".".into());
-                    app.status = match capture::save(cap, &dir) {
-                        Ok(path) => format!("saved {} packets to {}", cap.packets.len(), path.display()),
-                        Err(e) => format!("save failed: {e}"),
-                    };
-                }
-                _ => app.status = "nothing to save".into(),
-            },
-            Action::ClearCapture => {
-                if let Some(cap) = self.capture.as_mut() {
-                    cap.clear();
-                }
-            }
-            Action::MovePacket(d) => {
-                if let Some(cap) = self.capture.as_mut() {
-                    cap.select(d);
-                }
-            }
-            Action::ToggleBlockRemote => {
-                app.status = match self.selected_conn(app) {
-                    Some(r) => {
-                        let remote = collector::addr(r.key.family, &r.key.remote_addr, r.key.remote_port);
-                        self.toggle_block(BlockTarget::host(remote.ip()))
-                    }
-                    None => "no connection selected".into(),
-                };
-            }
-            Action::ToggleBlockPort => {
-                app.status = match self.selected_conn(app) {
-                    Some(r) if r.key.remote_port != 0 => self.toggle_block(BlockTarget::Port(r.key.proto, r.key.remote_port)),
-                    Some(_) => "this connection has no port".into(),
-                    None => "no connection selected".into(),
-                };
-            }
-            Action::ToggleBlockProcess => {
-                let rows = app.proc_rows(self.view(), &self.names);
-                let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
-                app.status = match app.selected_in(&ids).map(|i| &rows[i]) {
-                    Some(r) if !r.exe.is_empty() => self.toggle_block(BlockTarget::Exe(r.exe.clone())),
-                    Some(_) => "exe unknown for this process: block its remote address instead".into(),
-                    None => "no process selected".into(),
-                };
-            }
-            Action::Answer(a) => app.status = self.answer(a),
-            Action::AskSelect(step) => {
-                if let Some(p) = self.asks.pending.front_mut() {
-                    p.move_selection(step);
-                }
-            }
-            Action::AskScope(step) => {
-                if let Some(p) = self.asks.pending.front_mut() {
-                    p.scope = p.scope.step(step);
-                }
-            }
-            Action::SaveRules => {
-                let path = &self.rules_path;
-                app.status = match rulefile::save(path, &rulefile::render(&self.rules)) {
-                    Ok(()) => format!("saved {} rules to {}", self.rules.rules.len(), path.display()),
-                    Err(e) => format!("save {} failed: {e}", path.display()),
-                };
-            }
-            Action::RemoveRule => {
-                let ids: Vec<_> = self.rules.rules.iter().map(|r| crate::app::RowId::Rule(r.id)).collect();
-                app.status = match app.selected_in(&ids).map(|i| self.rules.rules[i].id) {
-                    Some(id) => self.remove_rule(id),
-                    None => "no rule selected".into(),
-                };
-            }
-            Action::JumpPacket(newest) => {
-                if let Some(cap) = self.capture.as_mut() {
-                    cap.select(if newest { isize::MAX / 2 } else { isize::MIN / 2 });
-                }
-            }
-        }
-    }
 }
 
 /// SSH_CONNECTION of the session netmon runs in. sudo usually drops it from
@@ -772,6 +705,32 @@ pub(crate) fn ssh_connection() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        app::{Action, App, Tab},
+        client::Client,
+    };
+
+    /// One key action of a UI, as the TUI loop runs it.
+    fn act(m: &mut Monitor<Fake>, app: &mut App, action: Action) {
+        let mut client = Client::new(m.snapshot(), app);
+        ui_act(m, &mut client, app, action);
+    }
+
+    fn ui_act(m: &mut Monitor<Fake>, client: &mut Client, app: &mut App, action: Action) {
+        if let Some(req) = client.action(app, action) {
+            let msg = m.request(req.clone());
+            client.add_packets(m.take_packets());
+            client.apply(m.snapshot(), app);
+            client.replied(app, &req, msg);
+        }
+    }
+
+    /// The UI loop's step after the kernel delivered packets.
+    fn ui_drain(m: &mut Monitor<Fake>, client: &mut Client, app: &mut App) {
+        m.drain_capture(DRAIN_BATCH);
+        client.add_packets(m.take_packets());
+        client.apply(m.snapshot(), app);
+    }
 
     fn args(interval_ms: u64, expire_secs: u64) -> Args {
         Args { interval_ms, expire_secs, once: None, rules: None, ask: false }
@@ -957,18 +916,22 @@ mod tests {
         let (mut m, t0) = monitor();
         m.probe.flows = vec![(key(50001), tx(0))];
         m.tick_at(secs(t0, 1));
-        m.set_paused(true);
+        let mut app = App::default();
+        let mut client = Client::new(m.snapshot(), &mut app);
+        app.paused = true;
         m.probe.flows = vec![(key(50001), tx(1000))];
         m.tick_at(secs(t0, 2));
-        assert_eq!(m.view().flows[&key(50001)].tx_rate, 0.0, "view frozen");
+        client.apply(m.snapshot(), &mut app);
+        assert_eq!(client.snap.collector.flows[&key(50001)].tx_rate, 0.0, "view frozen");
         assert_eq!(m.collector.flows[&key(50001)].tx_rate, 1000.0, "counting goes on");
         // 60 s paused, 1000 B/s all the time.
         for s in 3..=61 {
             m.probe.flows = vec![(key(50001), tx(1000 * (s - 1)))];
             m.tick_at(secs(t0, s));
         }
-        m.set_paused(false);
-        assert_eq!(m.view().flows[&key(50001)].tx_rate, 1000.0, "no spike after resume");
+        app.paused = false;
+        client.apply(m.snapshot(), &mut app);
+        assert_eq!(client.snap.collector.flows[&key(50001)].tx_rate, 1000.0, "no spike after resume");
     }
 
     #[test]
@@ -978,32 +941,41 @@ mod tests {
         m.tick_at(secs(t0, 1));
         m.probe.drops = 5;
         let mut app = App::default();
-        m.handle(&mut app, Action::StartCapture(Tab::Connections));
+        let mut client = Client::new(m.snapshot(), &mut app);
+        ui_act(&mut m, &mut client, &mut app, Action::StartCapture(Tab::Connections));
         assert_eq!(app.tab, Tab::Capture, "{}", app.status);
         assert_eq!(m.probe.mode, Mode::Flows(HashSet::from([key(50001)])));
 
         m.probe.ring.extend([packet(), packet()]);
         m.probe.drops = 7;
-        m.drain_capture(DRAIN_BATCH);
-        let cap = m.capture.as_ref().unwrap();
+        ui_drain(&mut m, &mut client, &mut app);
+        let cap = client.capture.as_ref().unwrap();
         assert_eq!((cap.packets.len(), cap.dropped), (2, 2), "drops count from capture start");
 
         // Stop keeps what is still queued in the ring.
         m.probe.ring.extend([packet(), packet(), packet()]);
-        m.handle(&mut app, Action::StopCapture);
-        let cap = m.capture.as_ref().unwrap();
+        ui_act(&mut m, &mut client, &mut app, Action::StopCapture);
+        let cap = client.capture.as_ref().unwrap();
         assert!(!cap.running);
         assert_eq!(cap.packets.len(), 5);
+        assert_eq!(app.status, "capture stopped, 5 packets kept");
         assert_eq!(m.probe.mode, Mode::Off);
 
         // A stopped capture takes no more packets; a new one discards leftovers.
         m.probe.ring.push_back(packet());
-        m.drain_capture(DRAIN_BATCH);
-        assert_eq!(m.capture.as_ref().unwrap().packets.len(), 5);
-        m.handle(&mut app, Action::StartCapture(Tab::Interfaces));
+        ui_drain(&mut m, &mut client, &mut app);
+        assert_eq!(client.capture.as_ref().unwrap().packets.len(), 5);
+        app.tab = Tab::Interfaces;
+        ui_act(&mut m, &mut client, &mut app, Action::StartCapture(Tab::Interfaces));
         assert_eq!(m.probe.mode, Mode::Iface(2));
         assert!(m.probe.ring.is_empty());
-        assert_eq!(m.capture.as_ref().unwrap().packets.len(), 0);
+        assert_eq!(client.capture.as_ref().unwrap().packets.len(), 0);
+        // Restarting the same target starts a new, empty capture too.
+        m.probe.ring.push_back(packet());
+        ui_drain(&mut m, &mut client, &mut app);
+        app.tab = Tab::Interfaces;
+        ui_act(&mut m, &mut client, &mut app, Action::StartCapture(Tab::Interfaces));
+        assert_eq!(client.capture.as_ref().unwrap().packets.len(), 0);
     }
 
     #[test]
@@ -1023,7 +995,7 @@ mod tests {
         assert_eq!(m.probe.mode, Mode::Flows(HashSet::from([key(50001), key(50002)])));
 
         let mut app = App::default();
-        m.handle(&mut app, Action::StopCapture);
+        act(&mut m, &mut app, Action::StopCapture);
         m.tick_at(secs(t0, 3));
         assert_eq!(m.probe.mode, Mode::Off, "a stopped capture does not restart");
     }
@@ -1034,7 +1006,7 @@ mod tests {
         m.probe.flows = vec![(key(50001), tx(10))];
         m.tick_at(secs(t0, 1));
         let mut app = App { tab: Tab::Processes, ..App::default() };
-        m.handle(&mut app, Action::StartCapture(Tab::Processes));
+        act(&mut m, &mut app, Action::StartCapture(Tab::Processes));
         assert!(app.status.contains("owner unknown"), "{}", app.status);
         assert!(m.capture.is_none());
     }
@@ -1045,11 +1017,11 @@ mod tests {
         m.probe.flows = vec![(key(50001), tx(10))];
         m.tick_at(secs(t0, 1));
         let mut app = App::default();
-        m.handle(&mut app, Action::ToggleBlockRemote);
+        act(&mut m, &mut app, Action::ToggleBlockRemote);
         assert_eq!(m.probe.table.len(), 1, "{}", app.status);
         assert_eq!((m.probe.table[0].fields, m.probe.table[0].prefix), (RULE_NET, 32));
         assert!(app.status.starts_with("blocked host 198.51.100.9"), "{}", app.status);
-        m.handle(&mut app, Action::ToggleBlockPort);
+        act(&mut m, &mut app, Action::ToggleBlockPort);
         // New blocks go on top.
         let port = m.probe.table[0];
         assert_eq!((port.fields, port.port_lo, port.port_hi), (RULE_PROTO | RULE_PORT, 443, 443));
@@ -1058,14 +1030,14 @@ mod tests {
         // had 100 hits before the rewrite and now sits in slot 1.
         assert_eq!((m.rules.rules[0].hits, m.rules.rules[1].hits), (100, 201), "hits read every tick");
         // b again unblocks; the port rule keeps its hits across the rewrite.
-        m.handle(&mut app, Action::ToggleBlockRemote);
+        act(&mut m, &mut app, Action::ToggleBlockRemote);
         assert_eq!(m.probe.table, vec![port]);
         assert_eq!(m.rules.rules[0].hits_base, 100);
         m.tick_at(secs(t0, 3));
         assert_eq!(m.rules.rules[0].hits, 200);
         // d in the Rules tab removes the selected rule.
         app.on_key(crate::app::Key::Char('5'));
-        m.handle(&mut app, Action::RemoveRule);
+        act(&mut m, &mut app, Action::RemoveRule);
         assert!(m.probe.table.is_empty() && m.rules.rules.is_empty(), "{}", app.status);
     }
 
@@ -1098,7 +1070,7 @@ mod tests {
         m.tick_at(secs(t0, 2));
         assert_eq!(m.collector.flows[&key(50001)].conn, Some(st));
         let mut app = App::default();
-        m.handle(&mut app, Action::ToggleBlockPort);
+        act(&mut m, &mut app, Action::ToggleBlockPort);
         assert_eq!(m.probe.default, netmon_common::ACTION_DENY, "default sent with the table");
     }
 
@@ -1184,13 +1156,21 @@ mod tests {
         let mut app = App::default();
 
         // o: only the selected destination (port 443, two connections), once.
-        m.handle(&mut app, Action::Answer(Answer::Once { allow: true }));
+        act(&mut m, &mut app, Action::Answer(Answer::Once { allow: true }));
         assert_eq!(m.probe.verdicts, vec![(k1, netmon_common::ACTION_ALLOW), (k2, netmon_common::ACTION_ALLOW)]);
         assert_eq!(m.asks.pending[0].dests.len(), 1, "port 80 still waits");
+        // A second UI answering the same destination late changes nothing.
+        let q = m.asks.pending[0].id;
+        let dest = crate::proto::DestId { remote: crate::ask::remote(&k1), port: 443, proto: k1.proto };
+        let late = Request::Answer { question: q, dest, scope: ask::Scope::Program, answer: Answer::Once { allow: false } };
+        assert_eq!(m.request(late), "destination already answered");
+        let gone = Request::Answer { question: q + 1, dest, scope: ask::Scope::Program, answer: Answer::Once { allow: false } };
+        assert_eq!(m.request(gone), "question already answered or timed out");
+        assert_eq!(m.probe.verdicts.len(), 2);
 
         // d with port scope: a temporary deny rule; the question is decided.
-        m.handle(&mut app, Action::AskScope(1));
-        m.handle(&mut app, Action::Answer(Answer::Rule { allow: false, always: false }));
+        act(&mut m, &mut app, Action::AskScope(1));
+        act(&mut m, &mut app, Action::Answer(Answer::Rule { allow: false, always: false }));
         assert!(m.asks.pending.is_empty(), "{}", app.status);
         let r = &m.rules.rules[0];
         assert_eq!((r.action, r.temporary, r.m.ports), (rules::Action::Deny, true, Some((80, 80))));
@@ -1200,7 +1180,7 @@ mod tests {
         // A with program scope: always; later connections of it are decided.
         m.probe.asks.push_back(ask(conn(40003, 8443)));
         m.poll_asks(t0);
-        m.handle(&mut app, Action::Answer(Answer::Rule { allow: true, always: true }));
+        act(&mut m, &mut app, Action::Answer(Answer::Rule { allow: true, always: true }));
         assert!(m.asks.pending.is_empty());
         // Events queued before the answer do not bring the question back.
         m.probe.asks.push_back(ask(conn(40005, 8443)));
@@ -1215,11 +1195,11 @@ mod tests {
         m.probe.asks.push_back(unknown);
         m.poll_asks(t0);
         assert_eq!(m.asks.pending[0].comm, "unknown process");
-        m.handle(&mut app, Action::AskScope(-1));
-        m.handle(&mut app, Action::Answer(Answer::Rule { allow: true, always: false }));
+        act(&mut m, &mut app, Action::AskScope(-1));
+        act(&mut m, &mut app, Action::Answer(Answer::Rule { allow: true, always: false }));
         assert!(app.status.contains("process unknown"), "{}", app.status);
-        m.handle(&mut app, Action::AskScope(1));
-        m.handle(&mut app, Action::Answer(Answer::Rule { allow: true, always: false }));
+        act(&mut m, &mut app, Action::AskScope(1));
+        act(&mut m, &mut app, Action::Answer(Answer::Rule { allow: true, always: false }));
         assert!(m.asks.pending.is_empty(), "{}", app.status);
         assert_eq!(m.rules.rules[0].m.to_string(), "tcp port 22");
         let unknown = netmon_common::AskEvent { key: conn(40007, 23), tgid: 0, _pad: 0 };
@@ -1237,7 +1217,7 @@ mod tests {
         m.tick_at(secs(t0, 1));
         m.probe.fail_block = true;
         let mut app = App::default();
-        m.handle(&mut app, Action::ToggleBlockRemote);
+        act(&mut m, &mut app, Action::ToggleBlockRemote);
         assert!(app.status.contains("rule update failed"), "{}", app.status);
         assert!(m.rules.rules.is_empty());
     }
@@ -1256,10 +1236,70 @@ mod tests {
             ..Owner::new(pid, "test")
         });
         let mut app = App { tab: Tab::Processes, ..App::default() };
-        m.handle(&mut app, Action::ToggleBlockProcess);
+        act(&mut m, &mut app, Action::ToggleBlockProcess);
         assert_eq!((m.probe.table[0].fields, m.probe.table[0].exe), (RULE_EXE, 1), "{}", app.status);
         assert_eq!(m.probe.exe_ids.get(&me), Some(&1));
         assert!(m.probe.marked.contains(&(1, pid)), "running pid marked at once");
     }
-}
 
+    #[test]
+    fn snapshot_and_requests_survive_json() {
+        let (mut m, t0) = monitor();
+        m.probe.flows = vec![(key(50001), tx(10))];
+        m.tick_at(secs(t0, 1));
+        let f = m.collector.flows.get_mut(&key(50001)).unwrap();
+        f.owner = Some(Owner { container: Some("web".into()), ..Owner::new(7, "curl") });
+        f.state = "ESTAB";
+        f.host = Some("example.com".into());
+        f.host_source = "tls";
+        m.toggle_block(BlockTarget::Exe("/usr/bin/curl".into()));
+        let k = netmon_common::ConnKey::from_flow(&key(50001));
+        m.probe.asks.push_back(netmon_common::AskEvent { key: k, tgid: std::process::id(), _pad: 0 });
+        m.poll_asks(t0);
+        m.start_capture(Target::Connection { key: key(50001), label: "x".into() }).unwrap();
+        m.probe.ring.push_back(PacketEvent { cap_len: 3, data: [7; CAPTURE_LEN], ..packet() });
+        m.drain_capture(DRAIN_BATCH);
+
+        let snap = m.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: Snapshot = serde_json::from_str(&json).unwrap();
+        let (a, b) = (&snap.collector.flows[&key(50001)], &back.collector.flows[&key(50001)]);
+        assert_eq!((&a.owner, a.state, &a.host, a.host_source), (&b.owner, b.state, &b.host, b.host_source));
+        assert_eq!(back.collector.flows.len(), 1);
+        assert_eq!(back.names.get(2), snap.names.get(2));
+        assert_eq!(back.rules.rules, snap.rules.rules);
+        assert_eq!(back.rules.exe_ids(), snap.rules.exe_ids());
+        let same_since = |mut p: ask::Prompt| {
+            p.since = t0;
+            p
+        };
+        assert_eq!(back.questions.iter().cloned().map(same_since).collect::<Vec<_>>(), snap.questions.iter().cloned().map(same_since).collect::<Vec<_>>());
+        let drift = back.questions[0].since.saturating_duration_since(snap.questions[0].since);
+        assert!(drift < Duration::from_secs(1), "age kept, to the millisecond: {drift:?}");
+        assert_eq!(back.capture, snap.capture);
+
+        let packets = m.take_packets();
+        let json = serde_json::to_string(&packets).unwrap();
+        assert!(json.contains("\"data\":\"BwcH\""), "bytes as base64: {json}");
+        assert_eq!(serde_json::from_str::<Vec<RawPacket>>(&json).unwrap(), packets);
+
+        let q = &snap.questions[0];
+        for req in [
+            Request::ToggleBlock(BlockTarget::host("192.0.2.1".parse().unwrap())),
+            Request::ToggleBlock(BlockTarget::Port(6, 25)),
+            Request::RemoveRule(3),
+            Request::SaveRules,
+            Request::Answer {
+                question: q.id,
+                dest: (&q.dests[0]).into(),
+                scope: ask::Scope::Port,
+                answer: crate::app::Answer::Rule { allow: true, always: false },
+            },
+            Request::StartCapture(Target::Process { pid: 7, comm: "curl".into() }),
+            Request::StopCapture,
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req, "{json}");
+        }
+    }
+}

@@ -11,12 +11,15 @@ use std::{
 
 use netmon_common::{FlowKey, PacketEvent};
 
-use crate::decode::{Decoded, decode};
+use crate::{
+    decode::{Decoded, decode},
+    proto::RawPacket,
+};
 
 /// Packets kept in memory. Older ones are dropped first.
 pub const MAX_PACKETS: usize = 20_000;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Target {
     Interface { index: u32, name: String },
     Process { pid: u32, comm: String },
@@ -44,30 +47,39 @@ pub struct Captured {
     pub decoded: Decoded,
 }
 
+/// Builds a packet from a ring buffer event. Devices without a link layer
+/// get a dummy Ethernet header (zero MACs) so every packet in a capture,
+/// and in the .pcap file, has the same framing.
+pub fn raw_packet(ev: &PacketEvent, mono_to_wall: i128) -> RawPacket {
+    let cap = (ev.cap_len as usize).min(ev.data.len());
+    let mut data = Vec::with_capacity(cap + 14);
+    let mut orig_len = ev.len;
+    if ev.has_l2 == 0 {
+        data.extend_from_slice(&[0; 12]);
+        data.extend_from_slice(&ev.ethertype.to_be_bytes());
+        orig_len += 14;
+    }
+    data.extend_from_slice(&ev.data[..cap]);
+    let wall_ns = (ev.ts_ns as i128 + mono_to_wall).max(0) as u64;
+    RawPacket {
+        time: UNIX_EPOCH + Duration::from_nanos(wall_ns),
+        ifindex: ev.ifindex,
+        egress: ev.egress != 0,
+        orig_len,
+        data,
+    }
+}
+
 impl Captured {
-    /// Builds a packet from a ring buffer event. Devices without a link
-    /// layer get a dummy Ethernet header (zero MACs) so every packet in a
-    /// capture, and in the .pcap file, has the same framing.
+    /// Decodes a packet from the monitor.
+    pub fn from_raw(p: RawPacket) -> Self {
+        let decoded = decode(&p.data);
+        Captured { time: p.time, ifindex: p.ifindex, egress: p.egress, orig_len: p.orig_len, data: p.data, decoded }
+    }
+
+    #[cfg(test)]
     pub fn from_event(ev: &PacketEvent, mono_to_wall: i128) -> Self {
-        let cap = (ev.cap_len as usize).min(ev.data.len());
-        let mut data = Vec::with_capacity(cap + 14);
-        let mut orig_len = ev.len;
-        if ev.has_l2 == 0 {
-            data.extend_from_slice(&[0; 12]);
-            data.extend_from_slice(&ev.ethertype.to_be_bytes());
-            orig_len += 14;
-        }
-        data.extend_from_slice(&ev.data[..cap]);
-        let wall_ns = (ev.ts_ns as i128 + mono_to_wall).max(0) as u64;
-        let decoded = decode(&data);
-        Captured {
-            time: UNIX_EPOCH + Duration::from_nanos(wall_ns),
-            ifindex: ev.ifindex,
-            egress: ev.egress != 0,
-            orig_len,
-            data,
-            decoded,
-        }
+        Captured::from_raw(raw_packet(ev, mono_to_wall))
     }
 }
 
@@ -83,12 +95,8 @@ pub struct Capture {
     /// Keep the selection on the newest packet.
     pub follow: bool,
     pub selected: usize,
-    /// CLOCK_MONOTONIC -> wall clock offset in nanoseconds.
-    pub mono_to_wall: i128,
     /// Packets this capture lost because the ring buffer was full.
     pub dropped: u64,
-    /// Kernel drop counter (counts since load) when the capture started.
-    pub drop_base: u64,
 }
 
 impl Capture {
@@ -101,9 +109,7 @@ impl Capture {
             started: SystemTime::now(),
             follow: true,
             selected: 0,
-            mono_to_wall: mono_to_wall_offset(),
             dropped: 0,
-            drop_base: 0,
         }
     }
 
@@ -132,7 +138,7 @@ impl Capture {
 }
 
 /// Offset to add to bpf_ktime_get_ns() values to get Unix-epoch nanoseconds.
-fn mono_to_wall_offset() -> i128 {
+pub fn mono_to_wall_offset() -> i128 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: valid pointer to a timespec on the stack.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };

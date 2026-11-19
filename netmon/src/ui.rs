@@ -576,7 +576,7 @@ mod tests {
         ev.data[..syn.len()].copy_from_slice(&syn);
         let mut cap = Capture::new(Target::Interface { index: 2, name: "eth0".into() });
         for _ in 0..3 {
-            cap.push(Captured::from_event(&ev, cap.mono_to_wall));
+            cap.push(Captured::from_event(&ev, 0));
         }
         cap.dropped = 7;
         let mut app = App { tab: Tab::Capture, show_graph: false, ..App::default() };
@@ -669,6 +669,7 @@ mod tests {
         };
         app.ask = Some((
             crate::ask::Prompt {
+                id: 1,
                 pid: 42,
                 comm: "curl".into(),
                 exe: "/usr/bin/curl".into(),

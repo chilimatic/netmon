@@ -4,6 +4,7 @@
 mod app;
 mod ask;
 mod capture;
+mod client;
 mod collector;
 mod decode;
 mod ifaces;
@@ -13,6 +14,7 @@ mod names;
 mod netns;
 mod probe;
 mod procmap;
+mod proto;
 mod rulefile;
 mod rules;
 mod text;

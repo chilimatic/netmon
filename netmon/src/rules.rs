@@ -16,7 +16,7 @@ use netmon_common::{
 use crate::procmap::normalize;
 
 /// What the UI blocks with one key: a one-field deny rule.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlockTarget {
     /// Remote network: address and prefix length.
     Net(IpAddr, u8),
@@ -58,7 +58,7 @@ pub fn proto_name(p: u8) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
     #[default]
     Allow,
@@ -78,7 +78,7 @@ impl Action {
 }
 
 /// The side that opened a connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Dir {
     /// This host.
     Out,
@@ -107,7 +107,7 @@ impl fmt::Display for Action {
 
 /// The conditions of a rule. Unset fields match anything; an empty match
 /// matches all traffic.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Match {
     /// Remote network: address and prefix length.
     pub net: Option<(IpAddr, u8)>,
@@ -179,7 +179,7 @@ impl fmt::Display for Match {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Rule {
     /// Stable id for the UI. Not the kernel slot: that is the position.
     pub id: u32,
@@ -200,7 +200,7 @@ impl fmt::Display for Rule {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Rules {
     /// In match order.
     pub rules: Vec<Rule>,

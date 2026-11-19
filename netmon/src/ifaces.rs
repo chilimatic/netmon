@@ -16,7 +16,7 @@ pub struct Iface {
 }
 
 /// What an interface is, for counting traffic once.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     /// Backed by hardware (or a VM's virtual NIC): traffic on the wire.
     Physical,
@@ -95,7 +95,7 @@ pub fn list() -> Vec<Iface> {
 }
 
 /// ifindex -> name and kind, keeping interfaces that disappeared.
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Names(HashMap<u32, (String, Kind)>);
 
 impl Names {

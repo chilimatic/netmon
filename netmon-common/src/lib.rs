@@ -20,6 +20,7 @@ pub const LOOPBACK_IFINDEX: u32 = 1;
 /// IPv4 addresses use the first 4 bytes; the rest stays zero.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "user", derive(serde::Serialize, serde::Deserialize))]
 pub struct FlowKey {
     pub local_addr: [u8; 16],
     pub remote_addr: [u8; 16],
@@ -35,6 +36,7 @@ pub struct FlowKey {
 /// Byte and packet counters for one flow. Values are per CPU in the kernel.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "user", derive(serde::Serialize, serde::Deserialize))]
 pub struct FlowStats {
     pub tx_bytes: u64,
     pub rx_bytes: u64,
@@ -110,6 +112,7 @@ pub const MAX_CONNS: u32 = 65_536;
 /// hooks (which know neither for sure) and TC agree on the key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "user", derive(serde::Serialize, serde::Deserialize))]
 pub struct ConnKey {
     /// Remote address, IPv4-mapped addresses as IPv4.
     pub remote_addr: [u8; 16],
@@ -139,6 +142,7 @@ impl ConnKey {
 /// What the kernel remembers about a connection.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "user", derive(serde::Serialize, serde::Deserialize))]
 pub struct ConnState {
     /// CFG_GEN when the verdict was made.
     pub generation: u32,

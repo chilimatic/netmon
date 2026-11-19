@@ -8,6 +8,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 
 use crate::{
     app::{App, Key, human},
+    client::Client,
     monitor::{Args, CAPTURE_POLL, DRAIN_BATCH, LINK_POLL, Monitor},
     rules, ui,
 };
@@ -51,28 +52,39 @@ fn run_tui(mon: &mut Monitor, args: &Args, status: String) -> anyhow::Result<()>
     let mut terminal = ratatui::init();
     let result = (|| -> anyhow::Result<()> {
         mon.tick();
+        let mut client = Client::new(mon.snapshot(), &mut app);
         let mut next = Instant::now() + interval;
         while !app.quit {
-            terminal.draw(|f| ui::draw(f, &mut app, mon.view(), &mon.names, mon.capture.as_ref(), &mon.rules))?;
+            terminal.draw(|f| {
+                let s = &client.snap;
+                ui::draw(f, &mut app, &s.collector, &s.names, client.capture.as_ref(), &s.rules)
+            })?;
             let mut timeout = next.saturating_duration_since(Instant::now());
-            if mon.capture.as_ref().is_some_and(|c| c.running) {
+            if mon.capture.as_ref().is_some_and(|c| c.info.running) {
                 timeout = timeout.min(CAPTURE_POLL);
             }
             if mon.links.is_some() || mon.rules.default == rules::Action::Ask {
                 timeout = timeout.min(LINK_POLL);
             }
+            let was_paused = app.paused;
+            let mut changed = false;
             if event::poll(timeout).context("poll terminal events")?
                 && let Event::Key(k) = event::read()?
                 && k.kind == KeyEventKind::Press
                 && let Some(key) = map_key(k)
                 && let Some(action) = app.on_key(key)
+                && let Some(req) = client.action(&mut app, action)
             {
-                mon.handle(&mut app, action);
+                let msg = mon.request(req.clone());
+                client.add_packets(mon.take_packets());
+                client.apply(mon.snapshot(), &mut app);
+                client.replied(&mut app, &req, msg);
             }
-            mon.set_paused(app.paused);
+            // Resume shows live data at once.
+            changed |= was_paused && !app.paused;
             mon.drain_capture(DRAIN_BATCH);
-            mon.poll_asks(Instant::now());
-            app.ask = mon.asks.pending.front().map(|p| (p.clone(), mon.asks.pending.len() - 1));
+            client.add_packets(mon.take_packets());
+            changed |= mon.poll_asks(Instant::now());
             if let Some(e) = mon.check_links().first() {
                 app.status = e.clone();
             }
@@ -82,6 +94,10 @@ fn run_tui(mon: &mut Monitor, args: &Args, status: String) -> anyhow::Result<()>
                 if let Some(e) = errs.first() {
                     app.status = e.clone();
                 }
+                changed = true;
+            }
+            if changed {
+                client.apply(mon.snapshot(), &mut app);
             }
         }
         Ok(())

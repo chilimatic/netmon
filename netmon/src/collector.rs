@@ -7,14 +7,17 @@ use std::{
 
 use netmon_common::{ConnState, FlowKey, FlowStats};
 
-use crate::procmap::{ContainerTable, Listeners, Owner, SocketTable};
+use crate::{
+    procmap::{ContainerTable, Listeners, Owner, SocketTable},
+    proto::label::Label,
+};
 
 /// Ticks of history kept for the graphs.
 pub const HISTORY: usize = 120;
 
 pub use netmon_common::LOOPBACK_IFINDEX;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Flow {
     pub key: FlowKey,
     pub local: SocketAddr,
@@ -29,7 +32,8 @@ pub struct Flow {
     /// /proc or unknown.
     pub owner_cookie: u64,
     pub owner_source: OwnerSource,
-    pub state: &'static str,
+    #[serde(deserialize_with = "crate::proto::label::deserialize")]
+    pub state: Label,
     /// Direction and verdict the kernel holds for the connection. None
     /// while no rule or default deny is in force.
     pub conn: Option<ConnState>,
@@ -37,10 +41,11 @@ pub struct Flow {
     /// else the DNS name of the address.
     pub host: Option<String>,
     /// "tls" or "dns".
-    pub host_source: &'static str,
+    #[serde(deserialize_with = "crate::proto::label::deserialize")]
+    pub host_source: Label,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct IfaceStats {
     pub tx_rate: f64,
     pub rx_rate: f64,
@@ -51,8 +56,9 @@ pub struct IfaceStats {
     pub history: VecDeque<u64>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Collector {
+    #[serde(with = "crate::proto::values")]
     pub flows: HashMap<FlowKey, Flow>,
     pub ifaces: HashMap<u32, IfaceStats>,
     /// Total (tx, rx) bytes per second over all interfaces except loopback,
@@ -70,6 +76,13 @@ pub fn addr(family: u8, raw: &[u8; 16], port: u16) -> SocketAddr {
         IpAddr::V6(Ipv6Addr::from(*raw))
     };
     SocketAddr::new(ip, port)
+}
+
+impl crate::proto::values::Keyed for Flow {
+    type Key = FlowKey;
+    fn key(&self) -> FlowKey {
+        self.key
+    }
 }
 
 impl Collector {
@@ -230,7 +243,7 @@ impl Collector {
 }
 
 /// Where a flow's owner came from, weakest first.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum OwnerSource {
     #[default]
     Unknown,

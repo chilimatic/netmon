@@ -16,7 +16,7 @@ use procfs::{
     process::{FDTarget, all_processes},
 };
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Owner {
     pub pid: u32,
     /// Task name. Any process can change its own; never proof of identity.
@@ -30,7 +30,7 @@ pub struct Owner {
 }
 
 /// Facts about a process that the process itself cannot fake.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProcDetails {
     /// Path of the running binary, from /proc/<pid>/exe.
     pub exe: String,

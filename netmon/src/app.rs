@@ -223,7 +223,7 @@ pub enum Action {
     AskScope(isize),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Answer {
     /// Only the selected destination's waiting connections.
     Once { allow: bool },
@@ -653,6 +653,7 @@ mod tests {
         app.tab = Tab::Rules;
         assert_eq!(app.on_key(Key::Char('d')), Some(Action::RemoveRule));
         let p = crate::ask::Prompt {
+            id: 1,
             pid: 1,
             comm: "x".into(),
             exe: String::new(),
