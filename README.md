@@ -49,8 +49,8 @@ AYA_BUILD_SKIP=1 cargo test -p netmon -p netmon-common
 
 ## Run
 
-netmon loads eBPF programs and reads every process's sockets, so it runs as
-root:
+Without the daemon (below), netmon monitors in its own process. It loads
+eBPF programs and reads every process's sockets, so it runs as root:
 
 ```sh
 sudo ./target/release/netmon
@@ -116,6 +116,49 @@ does not run. The next start of `netmond` replaces the file. A second
 `netmond` refuses to start while one runs.
 
 The wire format is one JSON object per line (`netmon/src/proto.rs`).
+
+### Install as a service
+
+The daemon runs from boot, so rules are in force with nobody logged in. The
+UI runs as a member of group `netmon`, without sudo.
+
+```sh
+cargo build --release
+sudo install -o root -g root -m 0755 target/release/netmond target/release/netmon /usr/local/bin/
+sudo groupadd --system netmon
+sudo usermod -aG netmon "$USER"          # log in again afterwards
+sudo install -d -o root -g root -m 0755 /etc/netmon
+sudo install -o root -g root -m 0644 docs/rules.example.toml /etc/netmon/rules.toml   # optional
+sudo install -o root -g root -m 0644 dist/netmond.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now netmond
+netmon
+```
+
+`docs/rules.example.toml` sets `default = "ask"`. Change it to `"allow"`, or
+remove the line, if you do not want ask mode.
+
+- Options go into a drop-in: `sudo systemctl edit netmond`, then
+  `[Service]`, an empty `ExecStart=` and `ExecStart=/usr/local/bin/netmond --ask`.
+- The unit starts before `network-pre.target`, so the rules apply before
+  the network comes up.
+- `systemctl stop netmond` is a clean stop: all rules end.
+  `systemctl restart netmond` stops cleanly and starts again: for a moment
+  no rule is in force, then the rules file loads. Temporary rules are lost.
+- After a crash the rules stay in force (see "Rules survive a crash"), and
+  systemd starts netmond again after 2 s (`Restart=on-failure`).
+- Log: `journalctl -u netmond`.
+- After a rebuild, run the `install` line for the binaries again, then
+  `sudo systemctl restart netmond`. A running `netmon` UI loses its
+  connection and must be started again.
+
+Remove:
+
+```sh
+sudo systemctl disable --now netmond
+sudo rm /etc/systemd/system/netmond.service /usr/local/bin/netmond /usr/local/bin/netmon
+sudo systemctl daemon-reload
+```
 
 ### Without sudo (file capabilities)
 

@@ -1,0 +1,33 @@
+# netmond: netmon's monitor and firewall daemon.
+# Install: see README.md, "Install as a service".
+# Options (--ask, --rules PATH, --interval-ms): sudo systemctl edit netmond
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/local/bin/netmond --ask
+
+[Unit]
+Description=netmon network monitor and firewall
+# Rules are in force before the network comes up.
+Wants=network-pre.target
+Before=network-pre.target
+# Links are pinned here so rules survive a crash.
+RequiresMountsFor=/sys/fs/bpf
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/netmond
+# SIGTERM is a clean stop: netmond removes its pins and rules. A crash
+# leaves them in force; the restart replaces them with the rules file.
+Restart=on-failure
+RestartSec=2
+# netmond loads eBPF programs and reads every process's sockets: it runs
+# as root. It writes only the socket, its pins and /etc/netmon (s in the
+# Rules tab saves there).
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadWritePaths=-/etc/netmon
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

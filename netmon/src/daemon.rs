@@ -92,8 +92,9 @@ pub fn run() -> anyhow::Result<()> {
             return Err(e);
         }
     };
+    // Start messages: problems and the rules file summary.
     for w in &warnings {
-        eprintln!("warning: {w}");
+        eprintln!("netmond: {w}");
     }
     eprintln!("netmond: listening on {}", args.socket.display());
     for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {

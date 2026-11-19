@@ -85,6 +85,14 @@ impl Backend {
 pub fn run() -> anyhow::Result<()> {
     let args = TuiArgs::parse();
     let remote = !args.local && std::fs::symlink_metadata(&args.socket).is_ok();
+    // SAFETY: geteuid has no preconditions.
+    if !remote && !args.local && unsafe { libc::geteuid() } != 0 {
+        bail!(
+            "netmond does not run ({} missing): start it with `sudo systemctl start netmond`, \
+             or run netmon as root to monitor in this process",
+            args.socket.display()
+        );
+    }
     if !remote {
         let (mut mon, errors) = Monitor::new(&args.monitor, None)?;
         for e in &errors {

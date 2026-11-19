@@ -357,7 +357,7 @@ for its traffic on the host. Rules by address and port still apply.
 
 ## Phase 7 – Privileged daemon and unprivileged TUI
 
-**Status (2026-11-19): in progress.** Step 1 done (`532fed9`), step 2 done (`43eda25`), step 3 done (`fbdf6d1`), step 4 done. Step 5 next.
+**Status (2026-11-19): done.** All five steps tested live: library split (`532fed9`), requests and snapshots (`43eda25`), daemon and socket (`fbdf6d1`), pinning (`db2f308`), systemd unit and install (this commit). Acceptance met: rules apply at boot with nobody logged in, the TUI runs without sudo for group `netmon`, a killed daemon leaves its rules in force and systemd restarts it, `systemctl stop` removes them.
 
 **Why.** Rules must hold when the UI is closed, and the UI should not run as
 root.
@@ -418,6 +418,11 @@ root.
 ## Phase 8 – Extras
 
 Small, independent features after the firewall core:
+
+- **CPU use of netmond.** Seen 2026-11-19: about 35 % of one core
+  (40.8 s CPU in 115 s) with 4 exe rules and ask mode. Not measured yet;
+  suspects are the per-tick `/proc` scans (socket table, exe marks of all
+  processes). Measure first, then cut.
 
 - **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
