@@ -103,6 +103,7 @@ pub struct ProcRow {
 pub struct IfaceRow {
     pub index: u32,
     pub name: String,
+    pub kind: &'static str,
     pub tx_rate: f64,
     pub rx_rate: f64,
     pub total: u64,
@@ -135,6 +136,9 @@ pub struct App {
     pub show_graph: bool,
     /// Remote column shows hostnames where known.
     pub show_hosts: bool,
+    /// Connections also lists rows of bridges and veth/vlan interfaces,
+    /// which repeat traffic of other interfaces.
+    pub show_virtual: bool,
     /// The question shown in ask mode and how many more wait. Set by the
     /// main loop; while set, a and d answer it.
     pub ask: Option<(crate::ask::Prompt, usize)>,
@@ -160,6 +164,7 @@ impl Default for App {
             paused: false,
             show_graph: true,
             show_hosts: true,
+            show_virtual: false,
             ask: None,
             interval_secs: 1.0,
             selected: 0,
@@ -304,6 +309,10 @@ impl App {
             Key::Char('/') => self.editing_filter = true,
             Key::Char('g') => self.show_graph = !self.show_graph,
             Key::Char('h') => self.show_hosts = !self.show_hosts,
+            Key::Char('v') => {
+                self.show_virtual = !self.show_virtual;
+                self.reset_selection();
+            }
             Key::Up | Key::Char('k') => self.pending -= 1,
             Key::Down | Key::Char('j') => self.pending += 1,
             Key::PageUp => self.pending -= 20,
@@ -361,6 +370,7 @@ impl App {
         let mut rows: Vec<ConnRow> = c
             .flows
             .values()
+            .filter(|f| self.show_virtual || !names.kind(f.key.ifindex).is_virtual())
             .map(|f| conn_row(f, names, self.show_hosts))
             .filter(|r| {
                 let host = r.host.as_deref().unwrap_or("");
@@ -375,9 +385,10 @@ impl App {
         rows
     }
 
-    pub fn proc_rows(&self, c: &Collector) -> Vec<ProcRow> {
+    pub fn proc_rows(&self, c: &Collector, names: &Names) -> Vec<ProcRow> {
         let mut by: HashMap<(String, String), ProcRow> = HashMap::new();
-        for f in c.flows.values() {
+        // Container flows on veth and bridge repeat the uplink's.
+        for f in c.flows.values().filter(|f| self.show_virtual || !names.kind(f.key.ifindex).is_virtual()) {
             let (process, pid) = owner_cols(f);
             let d = details(f);
             let r = by.entry((process.clone(), pid.clone())).or_insert(ProcRow {
@@ -412,6 +423,7 @@ impl App {
             .map(|(idx, s)| IfaceRow {
                 index: *idx,
                 name: names.get(*idx),
+                kind: names.kind(*idx).label(),
                 tx_rate: s.tx_rate,
                 rx_rate: s.rx_rate,
                 total: s.tx_total + s.rx_total,
@@ -528,7 +540,7 @@ mod tests {
 
     #[test]
     fn groups_processes() {
-        let rows = App::default().proc_rows(&collector());
+        let rows = App::default().proc_rows(&collector(), &Names::default());
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].process, "?");
     }
@@ -605,6 +617,23 @@ mod tests {
         app.on_key(Key::Home);
         assert_eq!(app.sync_selection(&ids(&[3, 2])), 0);
         assert_eq!(app.sync_selection(&[]), 0);
+    }
+
+    #[test]
+    fn virtual_interface_rows_hidden_until_v() {
+        let mut c = Collector::new(30);
+        let k = |ifindex| FlowKey { family: 4, proto: 6, local_port: 1, remote_port: 443, ifindex, ..Default::default() };
+        c.ingest([(k(2), FlowStats { tx_bytes: 5, ..Default::default() }), (k(18), FlowStats { tx_bytes: 5, ..Default::default() })], 1.0);
+        let mut names = Names::default();
+        names.update(&[
+            crate::ifaces::Iface { index: 2, name: "enp5s0".into(), l3_offset: 14, kind: crate::ifaces::Kind::Physical },
+            crate::ifaces::Iface { index: 18, name: "veth1".into(), l3_offset: 14, kind: crate::ifaces::Kind::Peer },
+        ]);
+        let mut app = App::default();
+        assert_eq!(app.conn_rows(&c, &names).len(), 1);
+        app.on_key(Key::Char('v'));
+        assert_eq!(app.conn_rows(&c, &names).len(), 2);
+        assert_eq!(names.physical(), std::collections::HashSet::from([2]));
     }
 
     #[test]

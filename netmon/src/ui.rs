@@ -84,7 +84,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     match app.tab {
         Tab::Connections => draw_conns(f, app, c, names, rules, body),
         Tab::Rules => draw_rules(f, app, rules, body),
-        Tab::Processes => draw_procs(f, app, c, rules, body),
+        Tab::Processes => draw_procs(f, app, c, names, rules, body),
         Tab::Interfaces => draw_ifaces(f, app, c, names, body),
         Tab::Capture => draw_capture(f, cap, names, body),
     }
@@ -107,8 +107,9 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             _ => "",
         };
         format!(
-            " q quit  ←→/1-5 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  p pause  g graph",
-            app.filter
+            " q quit  ←→/1-5 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  v veth/bridge [{}]  p pause  g graph",
+            app.filter,
+            if app.show_virtual { "on" } else { "off" }
         )
     };
     f.render_widget(Paragraph::new(footer_text).style(Style::new().fg(Color::DarkGray)), footer);
@@ -459,8 +460,8 @@ fn or_dash(s: &str) -> &str {
     if s.is_empty() { "-" } else { s }
 }
 
-fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, rules: &Rules, area: Rect) {
-    let rows = app.proc_rows(c);
+fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, rules: &Rules, area: Rect) {
+    let rows = app.proc_rows(c, names);
     let ids: Vec<RowId> = rows.iter().map(|r| r.id()).collect();
     let table = Table::new(
         rows.into_iter().map(|r| {
@@ -502,14 +503,15 @@ fn draw_ifaces(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area:
         rows.into_iter().map(|r| {
             Row::new(vec![
                 Cell::from(r.name),
+                Cell::from(r.kind),
                 Cell::from(Line::from(rate(r.tx_rate)).right_aligned()),
                 Cell::from(Line::from(rate(r.rx_rate)).right_aligned()),
                 Cell::from(Line::from(human(r.total as f64)).right_aligned()),
             ])
         }),
-        [Constraint::Fill(1), Constraint::Length(12), Constraint::Length(12), Constraint::Length(10)],
+        [Constraint::Fill(1), Constraint::Length(10), Constraint::Length(12), Constraint::Length(12), Constraint::Length(10)],
     )
-    .header(header_row(&["Interface", "↑", "↓", "Total"]));
+    .header(header_row(&["Interface", "Kind", "↑", "↓", "Total"]));
     render_table(f, app, table, &ids, list);
 
     if let Some((idx, name)) = selected {

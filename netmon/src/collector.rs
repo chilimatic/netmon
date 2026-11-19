@@ -58,6 +58,8 @@ pub struct Collector {
     /// Total (tx, rx) bytes per second over all interfaces except loopback,
     /// oldest first.
     pub total_history: VecDeque<(f64, f64)>,
+    /// Interfaces the totals count. Empty: every interface but loopback.
+    pub counted: HashSet<u32>,
     expire_ticks: u32,
 }
 
@@ -72,7 +74,13 @@ pub fn addr(family: u8, raw: &[u8; 16], port: u16) -> SocketAddr {
 
 impl Collector {
     pub fn new(expire_ticks: u32) -> Self {
-        Collector { flows: HashMap::new(), ifaces: HashMap::new(), total_history: VecDeque::new(), expire_ticks }
+        Collector {
+            flows: HashMap::new(),
+            ifaces: HashMap::new(),
+            total_history: VecDeque::new(),
+            counted: HashSet::new(),
+            expire_ticks,
+        }
     }
 
     /// Applies one snapshot of the kernel map taken `dt` seconds after the
@@ -152,7 +160,8 @@ impl Collector {
             st.tx_rate = dtx as f64 / dt;
             st.rx_rate = drx as f64 / dt;
             push(&mut st.history, (st.tx_rate + st.rx_rate) as u64);
-            if *idx != LOOPBACK_IFINDEX {
+            let counts = if self.counted.is_empty() { *idx != LOOPBACK_IFINDEX } else { self.counted.contains(idx) };
+            if counts {
                 total.0 += st.tx_rate;
                 total.1 += st.rx_rate;
             }
@@ -321,6 +330,11 @@ mod tests {
         c.ingest([(key(1, LOOPBACK_IFINDEX), stats(0, 0)), (key(2, 2), stats(0, 0))], 1.0);
         c.ingest([(key(1, LOOPBACK_IFINDEX), stats(500, 500)), (key(2, 2), stats(7, 9))], 1.0);
         assert_eq!(c.total_history.back(), Some(&(7.0, 9.0)));
+        // With physical interfaces known, only they count.
+        c.counted = HashSet::from([3]);
+        c.ingest([(key(2, 2), stats(14, 18)), (key(3, 3), stats(0, 0))], 1.0);
+        c.ingest([(key(2, 2), stats(20, 20)), (key(3, 3), stats(5, 6))], 1.0);
+        assert_eq!(c.total_history.back(), Some(&(5.0, 6.0)));
     }
 
     #[test]

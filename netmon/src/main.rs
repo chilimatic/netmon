@@ -190,7 +190,8 @@ impl<K: Kernel> Monitor<K> {
         }
         let mut names = Names::default();
         names.update(&ifs);
-        let collector = Collector::new(args.expire_ticks());
+        let mut collector = Collector::new(args.expire_ticks());
+        collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
         let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new() };
         Ok((mon, errors))
@@ -263,6 +264,7 @@ impl<K: Kernel> Monitor<K> {
     fn rescan_ifaces(&mut self) -> Vec<String> {
         let ifs = ifaces::list();
         self.names.update(&ifs);
+        self.collector.counted = self.names.physical();
         self.probe.attach_new(&ifs)
     }
 
@@ -321,7 +323,7 @@ impl<K: Kernel> Monitor<K> {
                 Ok(Target::Interface { index: r.index, name: r.name.clone() })
             }
             Tab::Processes => {
-                let rows = app.proc_rows(c);
+                let rows = app.proc_rows(c, &self.names);
                 let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
                 let r = app.selected_in(&ids).map(|i| &rows[i]).ok_or("no process selected")?;
                 let pid = r.pid_num.ok_or("owner unknown: capture its connections instead")?;
@@ -712,7 +714,7 @@ impl<K: Kernel> Monitor<K> {
                 };
             }
             Action::ToggleBlockProcess => {
-                let rows = app.proc_rows(self.view());
+                let rows = app.proc_rows(self.view(), &self.names);
                 let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
                 app.status = match app.selected_in(&ids).map(|i| &rows[i]) {
                     Some(r) if !r.exe.is_empty() => self.toggle_block(BlockTarget::Exe(r.exe.clone())),

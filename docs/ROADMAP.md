@@ -309,8 +309,8 @@ lost; the app's own retry gets through. NFQUEUE may come later.
 
 ## Phase 6 – Container and namespace awareness
 
-**Status (2026-11-19): in progress.** Step 1 (container owners) done and
-tested live. Step 2 next.
+**Status (2026-11-19): done.** Container owners (`fdcc4a0`) and count once
+tested live.
 
 **Why.** Container traffic shows as `?` (or `unknown process` in ask mode)
 and is counted several times (veth, bridge, uplink). Seen live: Docker with

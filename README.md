@@ -88,10 +88,11 @@ Repeat the `install` and `setcap` lines after every rebuild.
 
 Without the TUI: `netmon --once 3` samples 3 s and prints a table.
 
-Keys: `←`/`→` (or `Tab`, `1-5`) switch view, `b`/`B` block remote IP/port, `Esc` clear filter, `Enter` capture the selected row, `r`/`t`/`n` sort by rate/total/name, `/` filter, `h` hostnames or addresses,
+Keys: `←`/`→` (or `Tab`, `1-5`) switch view, `b`/`B` block remote IP/port, `Esc` clear filter, `Enter` capture the selected row, `r`/`t`/`n` sort by rate/total/name, `/` filter, `h` hostnames or addresses, `v` show veth/bridge rows,
 `p` pause the view (counting goes on), `g` toggle the traffic graph, `↑↓` select, `q` quit.
 
-The graph on top shows total traffic of all interfaces except `lo` for the
+The graph on top shows the total traffic of the physical interfaces (those
+with a `device` in `/sys/class/net`; all but `lo` if there are none) for the
 last 120 samples: download above the zero line, upload below. Each half has
 its own scale (shown on the y axis).
 
@@ -332,8 +333,12 @@ sources:
 
 Counting:
 
-- Traffic that crosses several interfaces (veth, bridge, uplink) is counted
-  once per interface. The header total skips `lo` but counts the rest.
+- Traffic that crosses several interfaces (veth, bridge, uplink) is seen
+  once per interface. The header total and the graph count physical
+  interfaces only, so each byte counts once; VPN (tun) traffic counts as
+  its encrypted packets on the uplink. Connections and Processes hide rows
+  of bridges and veth/vlan interfaces; `v` shows them. The Interfaces tab
+  lists every interface with its kind.
 - Forwarded traffic (router, bridge) is shown as if the host sent it: on
   egress the source is taken as local.
 - Up to 2 VLAN tags and 6 IPv6 extension headers are followed. Fragments
