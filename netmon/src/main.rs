@@ -3,6 +3,7 @@ mod capture;
 mod collector;
 mod decode;
 mod ifaces;
+mod linkwatch;
 mod probe;
 mod procmap;
 mod rules;
@@ -23,6 +24,7 @@ use crate::{
     capture::{Capture, Captured, Target},
     collector::Collector,
     ifaces::Names,
+    linkwatch::LinkWatch,
     probe::{Kernel, Probe},
     procmap::{Listeners, Owner, OwnerCache, ProcCache, SocketTable, read_details},
     rules::{BlockTarget, Rules, guard_endpoints},
@@ -60,6 +62,8 @@ impl Args {
 const CAPTURE_POLL: Duration = Duration::from_millis(50);
 /// Max packets taken from the ring buffer per poll, so the UI stays responsive.
 const DRAIN_BATCH: usize = 4_096;
+/// How often the TUI loop checks for interface events between ticks.
+const LINK_POLL: Duration = Duration::from_millis(200);
 
 /// The main loop's state. Generic over the kernel side so tests can run it
 /// with a fake.
@@ -76,6 +80,8 @@ struct Monitor<K: Kernel = Probe> {
     owners: OwnerCache,
     procs: ProcCache,
     rules: Rules,
+    /// Interface events. None: fall back to a rescan every 2 ticks.
+    links: Option<LinkWatch>,
 }
 
 impl Monitor {
@@ -84,8 +90,12 @@ impl Monitor {
         let hook_errors = probe.hook_errors.clone();
         let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
         probe.set_guard(&guard_endpoints(ssh_connection().as_deref(), &resolv))?;
-        let (mon, mut errors) = Monitor::with_kernel(probe, args)?;
+        let (mut mon, mut errors) = Monitor::with_kernel(probe, args)?;
         errors.extend(hook_errors);
+        match LinkWatch::open() {
+            Ok(w) => mon.links = Some(w),
+            Err(e) => errors.push(format!("interface events off, polling instead: {e}")),
+        }
         Ok((mon, errors))
     }
 }
@@ -100,7 +110,7 @@ impl<K: Kernel> Monitor<K> {
         let mut names = Names::default();
         names.update(&ifs);
         let collector = Collector::new(args.expire_ticks());
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None };
         Ok((mon, errors))
     }
 
@@ -122,13 +132,12 @@ impl<K: Kernel> Monitor<K> {
     }
 
     fn tick_at(&mut self, now: Instant) -> Vec<String> {
-        let mut errors = Vec::new();
-        // Interface hot-plug check every 2 ticks.
-        if self.ticks.is_multiple_of(2) {
-            let ifs = ifaces::list();
-            self.names.update(&ifs);
-            errors = self.probe.attach_new(&ifs);
-        }
+        let mut errors = match self.links {
+            Some(_) => self.check_links(),
+            // No interface events: hot-plug check every 2 ticks.
+            None if self.ticks.is_multiple_of(2) => self.rescan_ifaces(),
+            None => Vec::new(),
+        };
         let dt = now.duration_since(self.last).as_secs_f64();
         self.last = now;
         let expired = self.collector.ingest(self.probe.snapshot(), dt);
@@ -151,6 +160,17 @@ impl<K: Kernel> Monitor<K> {
             errors.push(format!("capture: {e:#}"));
         }
         errors
+    }
+
+    /// Attaches to interfaces that appeared since the last check.
+    fn check_links(&mut self) -> Vec<String> {
+        if self.links.as_ref().is_some_and(|l| l.changed()) { self.rescan_ifaces() } else { Vec::new() }
+    }
+
+    fn rescan_ifaces(&mut self) -> Vec<String> {
+        let ifs = ifaces::list();
+        self.names.update(&ifs);
+        self.probe.attach_new(&ifs)
     }
 
     /// A process capture follows the process: new flows join, closed ones leave.
@@ -413,6 +433,9 @@ fn run_tui(mon: &mut Monitor, args: &Args, status: String) -> anyhow::Result<()>
             if mon.capture.as_ref().is_some_and(|c| c.running) {
                 timeout = timeout.min(CAPTURE_POLL);
             }
+            if mon.links.is_some() {
+                timeout = timeout.min(LINK_POLL);
+            }
             if event::poll(timeout).context("poll terminal events")?
                 && let Event::Key(k) = event::read()?
                 && k.kind == KeyEventKind::Press
@@ -423,6 +446,9 @@ fn run_tui(mon: &mut Monitor, args: &Args, status: String) -> anyhow::Result<()>
             }
             mon.set_paused(app.paused);
             mon.drain_capture(DRAIN_BATCH);
+            if let Some(e) = mon.check_links().first() {
+                app.status = e.clone();
+            }
             if Instant::now() >= next {
                 next += interval;
                 let errs = mon.tick();

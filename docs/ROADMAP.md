@@ -98,8 +98,9 @@ stable kernel API):
 
 ## Phase 2 – Block from the UI
 
-**Status (2026-11-19): in progress.** Steps 1 (`77aff1e`), 2 (`dba8c36`)
-and 3 (`755c7c3`, process blocks by exe) done and tested live. Step 4 open.
+**Status (2026-11-19): done.** Steps 1 (`77aff1e`), 2 (`dba8c36`),
+3 (`755c7c3`, process blocks by exe) and 4 (rtnetlink link events) done and
+tested live.
 
 **Why.** The first firewall feature.
 

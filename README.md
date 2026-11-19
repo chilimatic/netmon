@@ -11,8 +11,9 @@ one, the interface it uses, and live upload/download rates. Linux only.
 - Userspace (`netmon`) reads the map once per refresh interval (default 1 s,
   `--interval-ms`), computes rates, and maps each flow to a process with
   `/proc/net/{tcp,udp}{,6}` and `/proc/<pid>/fd`.
-- New interfaces (containers, VPNs) are found and attached every second
-  refresh interval.
+- New interfaces (containers, VPNs) are attached within 200 ms: netmon
+  listens for rtnetlink link events. If that socket cannot be opened, it
+  falls back to a rescan every second refresh interval.
 
 ## Requirements
 
