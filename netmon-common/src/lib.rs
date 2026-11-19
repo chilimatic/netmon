@@ -344,10 +344,16 @@ pub struct SockOwner {
 /// Kinds of name events.
 pub const NAME_DNS: u8 = 1;
 pub const NAME_TLS: u8 = 2;
-/// Payload bytes kept per name event.
-pub const NAME_DATA: usize = 1500;
+/// The next segment of a ClientHello longer than its first segment.
+pub const NAME_TLS_CONT: u8 = 3;
+/// Payload bytes kept per name event. Egress packets are often GSO
+/// super-packets: a ClientHello with post-quantum key shares (~1.8 KB) is
+/// then one packet here.
+pub const NAME_DATA: usize = 4096;
 /// Size of the always-on name event ring buffer.
-pub const NAME_RING_BYTES: u32 = 1024 * 1024;
+pub const NAME_RING_BYTES: u32 = 4 * 1024 * 1024;
+/// Connections whose ClientHello continues in the next segment.
+pub const MAX_HELLO_PENDING: u32 = 1024;
 
 /// A packet that may carry a hostname: a DNS answer (ingress from port 53)
 /// or a TLS ClientHello (egress). Only the L4 payload is kept.

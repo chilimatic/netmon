@@ -152,6 +152,11 @@ pub fn client_hello_sni(p: &[u8]) -> Option<String> {
     None
 }
 
+/// Is this the start of a TLS record longer than the bytes we have?
+pub fn record_continues(p: &[u8]) -> bool {
+    u16_at(p, 3).is_some_and(|len| 5 + len as usize > p.len())
+}
+
 /// The bytes as a lowercase hostname, if they are one.
 fn hostname(b: &[u8]) -> Option<String> {
     let ok = !b.is_empty()
@@ -325,6 +330,21 @@ mod tests {
         let mut other = vec![0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d, 0x00, 0x15, 0x01, 0x2c];
         other.extend_from_slice(&[0; 300]);
         assert_eq!(client_hello_sni(&client_hello(&other)).as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn sni_in_the_second_segment() {
+        // Chrome-like: a large key share before SNI pushes SNI past 1400 bytes.
+        let mut big = vec![0x00, 0x33, 0x05, 0xdc];
+        big.extend_from_slice(&[0x42; 1500]);
+        let hello = client_hello(&big);
+        let (first, second) = hello.split_at(1400);
+        assert_eq!(client_hello_sni(first), None);
+        assert!(record_continues(first));
+        assert!(!record_continues(&hello));
+        let mut joined = first.to_vec();
+        joined.extend_from_slice(second);
+        assert_eq!(client_hello_sni(&joined).as_deref(), Some("example.com"));
     }
 
     #[test]

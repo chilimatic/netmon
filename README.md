@@ -114,10 +114,12 @@ from, and `/` also finds hostnames.
   started show addresses until the next lookup of that name.
 - Encrypted DNS (DNS over TLS/HTTPS, e.g. in browsers) gives no DNS
   names; SNI still names their TLS connections.
-- No SNI for QUIC (HTTP/3, encrypted ClientHello) and ECH. A ClientHello
-  longer than one segment (large post-quantum key shares) is read only
-  as far as the first segment goes; if SNI comes later, the DNS name is
-  shown.
+- No SNI for QUIC (HTTP/3, encrypted ClientHello). With Encrypted Client
+  Hello (ECH) the name shown is the outer one, e.g. `cloudflare-ech.com`.
+- Browsers' ClientHellos (post-quantum key shares, ~1.8 KB) span two
+  segments. netmon reads up to 4 KiB per packet, which covers GSO
+  super-packets, and otherwise also reads the next segment of the
+  connection and joins both.
 - DNS packets are untrusted input: the parser bounds every read and gives
   up on malformed answers.
 

@@ -221,9 +221,8 @@ conditions ("curl may only reach port 443").
 
 ## Phase 4 – Hostnames: DNS answers and TLS SNI
 
-**Status (2026-11-19): in progress.** Step 1 (DNS names) done and tested
-live. Step 2 (TLS SNI) done and tested live with curl; browsers often
-put SNI in a second segment (see Limits).
+**Status (2026-11-19): done.** DNS names (`cca2146`), TLS SNI (`ef66ce6`)
+and two-segment ClientHellos tested live (curl, Chrome, Firefox).
 
 **Why.** `151.101.1.91` says little; `reddit.com` says a lot. Also needed for
 rules by hostname later.
@@ -247,12 +246,15 @@ rules by hostname later.
 1. **DNS names.** Name ring, payload offset, DNS answer parser, name
    cache, Remote column, `h`.
 2. **TLS SNI.** ClientHello check in the kernel, SNI parser, per-flow name.
+3. **Two-segment ClientHello.** Browsers send ~1.8 KB ClientHellos
+   (post-quantum key shares) and Chrome shuffles extensions, so SNI is often
+   in the second segment. Name events copy up to 4 KiB (GSO super-packets
+   hold the whole ClientHello); without GSO a `HELLO_PENDING` map sends the
+   next segment and userspace joins both.
 
 **Limits.**
 - DNS over TLS/HTTPS (encrypted DNS) gives no names; SNI still does.
 - QUIC (HTTP/3) encrypts its ClientHello: those flows show DNS names only.
-- A ClientHello larger than one segment (post-quantum key shares) may put
-  SNI in the second segment, which is not read: DNS names cover it.
 
 **Acceptance.**
 - `curl https://example.com` shows `example.com` as remote within one refresh.

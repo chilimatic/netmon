@@ -68,6 +68,8 @@ impl Args {
 const CAPTURE_POLL: Duration = Duration::from_millis(50);
 /// Max packets taken from the ring buffer per poll, so the UI stays responsive.
 const DRAIN_BATCH: usize = 4_096;
+/// ClientHello first segments waiting for their second one.
+const MAX_HELLO_PARTS: usize = 256;
 /// Most name events read per refresh; the rest wait in the ring.
 const NAME_BATCH: usize = 4_096;
 /// How often the TUI loop checks for interface events between ticks.
@@ -96,6 +98,8 @@ struct Monitor<K: Kernel = Probe> {
     hosts: names::HostNames,
     /// TLS server name per connection, from its ClientHello.
     sni: HashMap<netmon_common::FlowKey, String>,
+    /// First segments of ClientHellos that continue in the next segment.
+    hello_parts: HashMap<netmon_common::FlowKey, Vec<u8>>,
 }
 
 impl Monitor {
@@ -127,7 +131,7 @@ impl<K: Kernel> Monitor<K> {
         let mut names = Names::default();
         names.update(&ifs);
         let collector = Collector::new(args.expire_ticks());
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), sni: HashMap::new() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, frozen: None, owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), sni: HashMap::new(), hello_parts: HashMap::new() };
         Ok((mon, errors))
     }
 
@@ -289,7 +293,7 @@ impl<K: Kernel> Monitor<K> {
     /// remote end. The TLS server name wins: it is what the client asked
     /// this server for, while one address can serve many DNS names.
     fn refresh_hosts(&mut self, now: Instant) {
-        let (hosts, sni) = (&mut self.hosts, &mut self.sni);
+        let (hosts, sni, parts) = (&mut self.hosts, &mut self.sni, &mut self.hello_parts);
         self.probe.drain_names(NAME_BATCH, |ev| {
             let data = &ev.data[..(ev.len as usize).min(ev.data.len())];
             match ev.kind {
@@ -298,9 +302,24 @@ impl<K: Kernel> Monitor<K> {
                         hosts.insert(ip, name, now);
                     }
                 }
-                netmon_common::NAME_TLS => {
-                    if let Some(name) = names::client_hello_sni(data) {
+                netmon_common::NAME_TLS => match names::client_hello_sni(data) {
+                    Some(name) => {
                         sni.insert(ev.key, name);
+                    }
+                    None if names::record_continues(data) => {
+                        if parts.len() >= MAX_HELLO_PARTS {
+                            parts.clear();
+                        }
+                        parts.insert(ev.key, data.to_vec());
+                    }
+                    None => {}
+                },
+                netmon_common::NAME_TLS_CONT => {
+                    if let Some(mut hello) = parts.remove(&ev.key) {
+                        hello.extend_from_slice(data);
+                        if let Some(name) = names::client_hello_sni(&hello) {
+                            sni.insert(ev.key, name);
+                        }
                     }
                 }
                 _ => {}
@@ -309,6 +328,7 @@ impl<K: Kernel> Monitor<K> {
         // Names of connections that are gone.
         let flows = &self.collector.flows;
         self.sni.retain(|k, _| flows.contains_key(k));
+        self.hello_parts.retain(|k, _| flows.contains_key(k));
         for (k, f) in self.collector.flows.iter_mut() {
             // Dual-stack sockets show IPv4 peers as ::ffff:a.b.c.d.
             let ip = procmap::normalize(f.remote).ip();

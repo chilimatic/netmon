@@ -18,7 +18,7 @@ use netmon_common::{
     ACTION_ALLOW, ACTION_DENY, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
-    ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
+    ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
     MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
     RuleEntry, SockOwner, TraceCfg, is_dhcp, is_loopback, parse_packet, rule_matches,
     unmap_v4_in_place,
@@ -50,6 +50,11 @@ static PACKETS: RingBuf = RingBuf::with_byte_size(CAPTURE_RING_BYTES, 0);
 /// the event is dropped and that name is missed.
 #[map]
 static NAMES: RingBuf = RingBuf::with_byte_size(NAME_RING_BYTES, 0);
+
+/// Connections whose ClientHello did not fit its first segment: their next
+/// egress data segment goes to NAMES too.
+#[map]
+static HELLO_PENDING: LruHashMap<FlowKey, u8> = LruHashMap::with_max_entries(MAX_HELLO_PENDING, 0);
 
 /// Packets lost because the ring buffer was full. Index 0 only.
 #[map]
@@ -325,14 +330,23 @@ fn parse_key(ctx: &TcContext, l3: u32, ethertype: u16, egress: bool, out: &mut F
     }
 }
 
-/// Does the TCP payload at `off` start like a TLS ClientHello? Record type
-/// handshake (0x16), version 3.x, handshake type ClientHello (1). Pure ACKs
-/// have no payload, so the read fails and costs nothing more.
+/// Sends ClientHellos of egress TCP segments to userspace. A payload that
+/// starts like a ClientHello (record type handshake 0x16, version 3.x,
+/// handshake type 1) is sent; if its record is longer than the segment, the
+/// connection's next data segment is sent too. Pure ACKs have no payload,
+/// so the read fails and costs nothing more.
 #[inline(never)]
-fn client_hello(ctx: &TcContext, off: u32) -> bool {
-    match ctx.load::<[u8; 6]>(off as usize) {
-        Ok(b) => b[0] == 0x16 && b[1] == 0x03 && b[5] == 0x01,
-        Err(_) => false,
+fn tls_names(ctx: &TcContext, key: &FlowKey, off: u32) {
+    let Ok(b) = ctx.load::<[u8; 6]>(off as usize) else { return };
+    if b[0] == 0x16 && b[1] == 0x03 && b[5] == 0x01 {
+        name_event(ctx, key, off, NAME_TLS);
+        let record = 5 + u16::from_be_bytes([b[3], b[4]]) as u32;
+        if record > ctx.len() - off {
+            let _ = HELLO_PENDING.insert(key, &1, 0);
+        }
+    } else if unsafe { HELLO_PENDING.get(key) }.is_some() {
+        name_event(ctx, key, off, NAME_TLS_CONT);
+        let _ = HELLO_PENDING.remove(key);
     }
 }
 
@@ -392,8 +406,8 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
         if !egress && key.proto == IPPROTO_UDP && key.remote_port == 53 {
             name_event(ctx, key, payload as u32, NAME_DNS);
         }
-        if egress && key.proto == IPPROTO_TCP && payload > 0 && client_hello(ctx, payload as u32) {
-            name_event(ctx, key, payload as u32, NAME_TLS);
+        if egress && key.proto == IPPROTO_TCP && payload > 0 {
+            tls_names(ctx, key, payload as u32);
         }
         // Unparsed packets have no key and pass (fail-open).
         if ifindex != LOOPBACK_IFINDEX && packet_denied(key, egress, packet_tgid(ctx, egress)) {
