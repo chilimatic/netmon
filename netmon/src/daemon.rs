@@ -73,9 +73,15 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WAIT: Duration = Duration::from_millis(500);
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static HUP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
+}
+
+/// SIGHUP (a closed terminal, `kill -HUP`) must not remove the rules.
+extern "C" fn on_hup(_: libc::c_int) {
+    HUP.store(true, Ordering::Relaxed);
 }
 
 /// Lines waiting for one client.
@@ -178,10 +184,12 @@ pub fn run() -> anyhow::Result<()> {
         eprintln!("netmond: {w}");
     }
     eprintln!("netmond: listening on {}", args.socket.display());
-    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+    for sig in [libc::SIGTERM, libc::SIGINT] {
         // SAFETY: the handler only stores to an atomic.
         unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
     }
+    // SAFETY: as above.
+    unsafe { libc::signal(libc::SIGHUP, on_hup as *const () as libc::sighandler_t) };
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE);
     let count = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || accept(listener, gid, tx, count));
@@ -198,6 +206,9 @@ pub fn run() -> anyhow::Result<()> {
 fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> anyhow::Result<()> {
     let mut clients: HashMap<u64, Arc<Outbox>> = HashMap::new();
     while !STOP.load(Ordering::Relaxed) {
+        if HUP.swap(false, Ordering::Relaxed) {
+            eprintln!("netmond: SIGHUP ignored: the rules stay; systemctl restart netmond reloads the rules file");
+        }
         let mut next = rx.recv_timeout(engine.wait().min(MAX_WAIT));
         // Requests that wait together get one snapshot, not one each.
         let mut changed = false;

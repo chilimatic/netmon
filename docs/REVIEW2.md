@@ -41,7 +41,7 @@ Status column: `open` for all items at the time of writing.
 | K5 | Medium | A remote host can evict `CONNS` entries (65 536, LRU) with spoofed new flows: every inbound 5-tuple is inserted, also when denied. An evicted outbound connection is decided again as inbound on its next reply and denied. | `netmon-ebpf/src/main.rs:276`, `:282-284` | A, S | fixed (step 3) |
 | K6 | Medium | `SOCK_OWNER` (16 384) and `LISTENERS` (4096) are LRU maps but feed the verdict. A local process that opens many sockets or binds many ports evicts other owners. After a rule change those connections are decided with tgid 0, so exe rules no longer apply to them. | `netmon-ebpf/src/main.rs:63-70` | A, S | fixed (step 3) |
 | K7 | Medium | Names in the ask prompt come from any UDP packet with source port 53, also dropped and unsolicited ones. A remote host can make an address show as a trusted name and lead the user to allow it. | `netmon-ebpf/src/main.rs:456`; `netmon/src/monitor.rs:583`, `:662` | S | fixed (step 8) |
-| K8 | Low | Back-to-back rule updates can rewrite the half a CPU still walks. `CFG_DEFAULT` is written before `CFG_ACTIVE`. One packet can see a mixed table. | `netmon/src/probe.rs:629-635` | A | open |
+| K8 | Low | Back-to-back rule updates can rewrite the half a CPU still walks. `CFG_DEFAULT` is written before `CFG_ACTIVE`. One packet can see a mixed table. | `netmon/src/probe.rs:629-635` | A | fixed (step 9) |
 | K9 | Low | Suspected race: the kernel reads an unanswered entry, `set_verdict` writes the answer, the kernel's later insert overwrites it, and the user gets the question again. | `netmon-ebpf/src/main.rs:282-284` | A | suspected |
 
 ## Lifecycle: restart, crash, rules file
@@ -52,8 +52,8 @@ Status column: `open` for all items at the time of writing.
 | L2 | High | A rules file that fails part-way leaves its first rules and its default in memory: `change_rules` does not restore the old rules when the edit fails. The status says "no file rules loaded", and the next rule change writes the half-loaded rules and the default to the kernel. `rulefile::parse` checks neither duplicates nor the 256 limit. | `netmon/src/monitor.rs:721-723`, `:756-765`; `netmon/src/rulefile.rs:120-135` | C | fixed (step 1) |
 | L3 | Medium | Any error in the rules file starts the daemon with no file rules and default allow. A member of group `netmon` can save a rule the file parser refuses (`Match::check` does not reject host bits, the file parser does) and so turn `default = "deny"` into allow at the next start. | `netmon/src/monitor.rs:740-770`; `netmon/src/rules.rs:125-150`; `netmon/src/rulefile.rs:186-205` | S | fixed (step 4) |
 | L4 | High (kernel < 6.6) | Before tcx, TC filters are netlink filters: they stay after a crash, the restart adds another one, and `rm -r /sys/fs/bpf/netmon` does not remove them. The old filter keeps its frozen rules and nobody drains its ASKS ring. | `netmon/src/probe.rs:253-256` | A | fixed (step 4) |
-| L5 | Low | After a crash, new interfaces (VPN, veth) get no TC programs until the restart. An ifindex removed and reused between two scans is never attached. | `netmon/src/probe.rs:473` | A | open |
-| L6 | Low | `SIGHUP` is a clean stop with exit code 0: the rules end and `Restart=on-failure` does not restart. | `netmon/src/daemon.rs:100` | C | open |
+| L5 | Low | After a crash, new interfaces (VPN, veth) get no TC programs until the restart. An ifindex removed and reused between two scans is never attached. | `netmon/src/probe.rs:473` | A | fixed (step 9) |
+| L6 | Low | `SIGHUP` is a clean stop with exit code 0: the rules end and `Restart=on-failure` does not restart. | `netmon/src/daemon.rs:100` | C | fixed (step 9) |
 
 ## Daemon and socket
 

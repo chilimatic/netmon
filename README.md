@@ -694,6 +694,8 @@ questions and the capture itself are shared.
 
 - A clean stop (`systemctl stop netmond`, `SIGTERM`, `Ctrl-C`) removes the
   socket and all programs. No rule is in force after a clean stop.
+- `SIGHUP` does not stop `netmond`. It writes a line to the journal, and the
+  rules stay.
 - `systemctl restart netmond` is a clean stop and a new start. For a short
   time no rule is in force. Then the rules file loads. Rules that were not
   saved are lost.
@@ -707,6 +709,8 @@ attached when the process ends, and it keeps its program and maps. Thus if
   outbound connections that no rule decides are dropped.
 - Rules that were not saved also stay until the next start.
 - Counting and hostnames stop, because nothing reads the maps.
+- An interface that comes up in this time (VPN, container veth) gets no
+  programs until `netmond` runs again, 2 s later with systemd.
 
 systemd starts `netmond` again 2 s after a crash (`Restart=on-failure`).
 The start keeps the old rules in force until the new ones are ready:

@@ -97,12 +97,14 @@ pub const DIR_IN: u8 = 2;
 pub const CFG_ACTIVE: u32 = 0;
 /// Rule count of half 0; half 1 follows.
 pub const CFG_COUNT: u32 = 1;
-/// Action for TCP and UDP traffic no rule matches. 0 means allow.
+/// Action for TCP and UDP traffic no rule matches, of half 0; half 1
+/// follows. 0 means allow. Per half, so a packet that walks one half
+/// never sees the default of the other.
 pub const CFG_DEFAULT: u32 = 3;
 /// Bumped on every table rewrite: cached connection verdicts of an older
 /// generation are decided again.
-pub const CFG_GEN: u32 = 4;
-pub const CFG_LEN: u32 = 5;
+pub const CFG_GEN: u32 = 5;
+pub const CFG_LEN: u32 = 6;
 
 /// Connections whose direction and verdict the kernel remembers.
 pub const MAX_CONNS: u32 = 65_536;

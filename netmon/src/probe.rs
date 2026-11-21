@@ -71,6 +71,10 @@ pub struct Probe {
     rule_cfg: Array<MapData, u32>,
     /// Live table half, as last written to RULE_CFG.
     active: u32,
+    /// When the live half last changed.
+    flipped: Option<std::time::Instant>,
+    /// Ids of tc_ingress and tc_egress, to find them on an interface.
+    tc_ids: Option<(u32, u32)>,
     generation: u32,
     conns: HashMap<MapData, ConnKey, ConnState>,
     guard: HashMap<MapData, GuardKey, u8>,
@@ -102,6 +106,9 @@ pub struct Probe {
 /// process ends, with its program and the maps the program uses: the
 /// rules stay in force after a crash. Removing the files detaches them.
 pub const PIN_DIR: &str = "/sys/fs/bpf/netmon";
+
+/// Time after a table flip before the old half is written again.
+const FLIP_GRACE: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Magic number of the BPF file system (statfs f_type).
 const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
@@ -180,6 +187,11 @@ impl Probe {
                 .try_into()?;
             prog.load().with_context(|| format!("load {name}"))?;
         }
+        let tc_id = |ebpf: &mut Ebpf, name: &str| -> Option<u32> {
+            let prog: &mut SchedClassifier = ebpf.program_mut(name)?.try_into().ok()?;
+            prog.info().ok().map(|i| i.id())
+        };
+        let tc_ids = tc_id(&mut ebpf, "tc_ingress").zip(tc_id(&mut ebpf, "tc_egress"));
         let flows = PerCpuHashMap::try_from(ebpf.take_map("FLOWS").context("map FLOWS missing")?)?;
         let l3_offset = HashMap::try_from(ebpf.take_map("L3_OFFSET").context("map L3_OFFSET missing")?)?;
         let mut take = |name: &str| ebpf.take_map(name).with_context(|| format!("map {name} missing"));
@@ -233,6 +245,8 @@ impl Probe {
             rule_table,
             rule_cfg,
             active: 0,
+            flipped: None,
+            tc_ids,
             generation: 0,
             conns,
             guard,
@@ -276,6 +290,18 @@ impl Probe {
         if let Some(dir) = self.pins.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// Are both TC programs attached to the interface? Only tcx can be
+    /// asked; before kernel 6.6 the answer is always yes.
+    fn has_programs(&self, name: &str) -> bool {
+        let Some((ingress, egress)) = self.tc_ids else { return true };
+        if needs_clsact() {
+            return true;
+        }
+        [(TcAttachType::Ingress, ingress), (TcAttachType::Egress, egress)].into_iter().all(|(ty, id)| {
+            SchedClassifier::query_tcx(name, ty).map(|(_, progs)| progs.iter().any(|p| p.id() == id)).unwrap_or(true)
+        })
     }
 
     fn tc_pin_name(ifindex: u32, ty: TcAttachType) -> String {
@@ -600,6 +626,13 @@ impl Kernel for Probe {
         }
         self.attached.retain(|i| live.contains(i));
         self.failed.retain(|i| live.contains(i));
+        // An index removed and reused between two scans stays in
+        // `attached`, but the new device has no programs: attach again.
+        let lost: Vec<u32> =
+            ifaces.iter().filter(|i| self.attached.contains(&i.index) && !self.has_programs(&i.name)).map(|i| i.index).collect();
+        for i in lost {
+            self.attached.remove(&i);
+        }
         for iface in ifaces {
             if self.attached.contains(&iface.index) || self.failed.contains(&iface.index) {
                 continue;
@@ -728,6 +761,12 @@ impl Kernel for Probe {
                 self.exe_id_map.insert(exe_key(path)?, *id, 0)?;
             }
         }
+        // A CPU can still walk the half that was live until the last
+        // flip. A program run takes microseconds: after FLIP_GRACE none
+        // does.
+        if let Some(t) = self.flipped {
+            std::thread::sleep(FLIP_GRACE.saturating_sub(t.elapsed()));
+        }
         let half = 1 - self.active;
         let base = half * MAX_RULES;
         for (i, r) in rules.iter().enumerate() {
@@ -735,9 +774,10 @@ impl Kernel for Probe {
             self.rule_hits.set(base + i as u32, PerCpuValues::try_from(vec![0u64; self.cpus])?, 0)?;
         }
         self.rule_cfg.set(CFG_COUNT + half, rules.len() as u32, 0)?;
-        self.rule_cfg.set(CFG_DEFAULT, default as u32, 0)?;
+        self.rule_cfg.set(CFG_DEFAULT + half, default as u32, 0)?;
         self.rule_cfg.set(CFG_ACTIVE, half, 0)?;
         self.active = half;
+        self.flipped = Some(std::time::Instant::now());
         // Cached verdicts are stale now. Bumped last, so no packet caches a
         // verdict of the old table under the new generation.
         self.generation = self.generation.wrapping_add(1);

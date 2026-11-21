@@ -137,8 +137,9 @@ fn live_rules() -> (u32, u32) {
 /// and no connection state is kept.
 #[inline(always)]
 fn rules_active() -> bool {
-    let d = cfg(CFG_DEFAULT);
-    live_rules().0 != 0 || d == ACTION_DENY as u32 || d == ACTION_ASK as u32
+    let (count, half) = live_rules();
+    let d = cfg(CFG_DEFAULT + half);
+    count != 0 || d == ACTION_DENY as u32 || d == ACTION_ASK as u32
 }
 
 /// Outbound connections waiting for the user's answer (ask mode).
@@ -246,7 +247,7 @@ fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
         return ACTION_ALLOW;
     }
     if scan.count == 0 {
-        return default_action(c.family, c.proto, dir);
+        return default_action(c.family, c.proto, dir, half);
     }
     if tgid != 0 {
         scan.exe = unsafe { TGID_EXE.get(&tgid) }.copied().unwrap_or(0);
@@ -254,20 +255,20 @@ fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
     unsafe {
         bpf_loop(scan.count, scan_rule as *mut c_void, &mut scan as *mut Scan as *mut c_void, 0);
     }
-    if scan.action == 0 { default_action(scan.guard.family, scan.proto, scan.dir) } else { scan.action }
+    if scan.action == 0 { default_action(scan.guard.family, scan.proto, scan.dir, half) } else { scan.action }
 }
 
 /// Action when no rule matches: the configured default for TCP and UDP
 /// (ask only outbound; unmatched inbound is denied), allow otherwise.
 /// Computed after the rule walk so it takes no stack across bpf_loop.
 #[inline(always)]
-fn default_action(family: u8, proto: u8, dir: u8) -> u8 {
+fn default_action(family: u8, proto: u8, dir: u8, half: u32) -> u8 {
     // An IPv6 packet whose upper header the parser did not reach could be
     // TCP or UDP: it gets their default, not a free pass.
     if proto != IPPROTO_TCP && proto != IPPROTO_UDP && !is_unparsed(family, proto) {
         return ACTION_ALLOW;
     }
-    let d = cfg(CFG_DEFAULT);
+    let d = cfg(CFG_DEFAULT + half);
     if d == ACTION_DENY as u32 {
         ACTION_DENY
     } else if d == ACTION_ASK as u32 {
