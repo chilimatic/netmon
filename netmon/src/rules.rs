@@ -127,6 +127,11 @@ impl Match {
         {
             return Err(format!("exe {p:?}: needs an absolute path under {MAX_EXE_PATH} bytes"));
         }
+        if let Some(p) = &self.exe
+            && p.chars().any(char::is_control)
+        {
+            return Err(format!("exe {p:?}: control characters"));
+        }
         if let Some((ip, len)) = self.net {
             let max = if ip.is_ipv4() { 32 } else { 128 };
             if len > max {
@@ -227,6 +232,10 @@ impl Rules {
             return Err("ask is only a default action, not a rule action".into());
         }
         m.check()?;
+        // Other admins see the comment in their Rules tab.
+        if comment.chars().any(char::is_control) {
+            return Err("comment: control characters".into());
+        }
         if self.rules.iter().any(|r| r.action == action && r.m == m) {
             return Err(format!("{action} {m} already exists"));
         }
@@ -411,6 +420,17 @@ mod tests {
         r.block(BlockTarget::Port(IPPROTO_TCP, 25)).unwrap();
         assert!(r.denies(IPPROTO_TCP, sa("9.9.9.9:25"), "", Dir::Out));
         assert!(!r.denies(IPPROTO_UDP, sa("9.9.9.9:25"), "", Dir::Out));
+    }
+
+    #[test]
+    fn client_input_is_checked_like_the_file() {
+        let mut r = Rules::default();
+        let net = |ip: &str, len| Match { net: Some((ip.parse().unwrap(), len)), ..Match::default() };
+        assert!(r.insert(0, Action::Deny, net("10.1.0.0", 8), "").unwrap_err().contains("host bits"));
+        r.insert(0, Action::Deny, net("10.0.0.0", 8), "").unwrap();
+        let exe = Match { exe: Some("/usr/bin/x\u{1b}[2J".into()), ..Match::default() };
+        assert!(r.insert(0, Action::Deny, exe, "").unwrap_err().contains("control"));
+        assert!(r.insert(0, Action::Deny, net("10.0.0.0", 16), "a\nb").unwrap_err().contains("control"));
     }
 
     #[test]

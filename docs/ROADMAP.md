@@ -442,6 +442,51 @@ Small, independent features after the firewall core:
 - **Follow stream**: rebuild one TCP stream and show its plaintext.
 - **History**: per-process daily totals in SQLite.
 
+## Phase 9 – Connection graph
+
+A new tab shows the communication as an animated graph in the terminal.
+Only the UI changes. The daemon and the protocol stay the same: the graph
+uses the flows, owners and verdicts that the snapshot already contains.
+
+Layout:
+
+- The host is in the middle.
+- Processes (or containers) are on a ring around the host.
+- Remote endpoints (hostname, else the IP address) are on an outer ring.
+  Endpoints with little traffic go into one node per process ("+12 more").
+
+Drawing:
+
+1. The tab uses the ratatui `Canvas` widget with Braille markers. Braille
+   gives 2x4 dots per character cell.
+2. Each connection is a line from its process to its endpoint. The color
+   shows the verdict: green allow, yellow ask, red deny. Gray is idle.
+3. Dots move along each line in the direction of the traffic. Their speed
+   and count follow the rate in bytes per second, on a log scale. Upload
+   and download move in opposite directions on the same line.
+4. The UI redraws every 100 ms while the tab is open. Positions between two
+   snapshots are interpolated, so the motion stays smooth at a 1 s tick.
+
+Interaction:
+
+- The arrow keys move the selection between nodes. A box shows the selected
+  node: rate, totals, connections, process details.
+- Enter opens the Connections tab, filtered to the selected node.
+- `b` blocks the selected process or endpoint, as in the other tabs.
+- `z` switches the level: processes, containers, or whole hosts.
+- Paused (`p`), the graph freezes.
+
+Tests:
+
+- The layout is a pure function from the snapshot to node positions, with
+  tests: stable positions between ticks, no overlap, the "+n more" node.
+- The rate-to-speed scale has tests.
+- A render test draws the tab into a `TestBackend` buffer.
+
+Limits: about 40 nodes fit on a 200x50 terminal. More nodes go into the
+"+n more" nodes. The animation costs CPU only in the UI process, and only
+while the tab is visible.
+
 ---
 
 ## Rules for every phase

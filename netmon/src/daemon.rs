@@ -3,23 +3,25 @@
 //! One JSON object per line (see proto). The socket is root:netmon 0660;
 //! each peer is checked again with SO_PEERCRED: root or a member of the
 //! group. The main thread owns the Monitor; one thread per client reads
-//! its requests, another writes to it through a bounded queue. A client
-//! that does not keep up is dropped, so it can never stall the monitor.
+//! its requests, another writes to it from an `Outbox`. A new snapshot
+//! replaces an unsent one, so a slow client costs one snapshot of memory.
+//! A client whose other lines pile up, or that does not read for
+//! WRITE_TIMEOUT, is dropped: it can never stall the monitor.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::CString,
     io::{BufRead, BufReader, Read, Write},
     os::unix::{
         fs::{FileTypeExt, PermissionsExt},
-        io::AsRawFd,
+        io::{AsRawFd, FromRawFd, OwnedFd},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     },
     time::{Duration, Instant},
 };
@@ -53,9 +55,18 @@ struct DaemonArgs {
 const DEFAULT_GUARD_PORT: u16 = 22;
 /// UIs connected at most; more are refused.
 const MAX_CLIENTS: usize = 16;
-/// Lines queued per client. A snapshot each tick and packets every 50 ms:
-/// a client this far behind is stuck.
+/// Lines other than snapshots queued per client (packets every 50 ms,
+/// replies, status): a client this far behind is stuck.
 const CLIENT_QUEUE: usize = 256;
+/// Bytes of those lines queued per client at most.
+const CLIENT_BYTES: usize = 16 << 20;
+/// A client that takes no data for this long is dropped.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Requests and client events waiting for the main loop. A client that
+/// sends faster waits: its reader thread blocks.
+const REQUEST_QUEUE: usize = 64;
+/// Requests carried out before one snapshot goes out.
+const REQUEST_BATCH: usize = 32;
 /// Longest wait for a client's hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest the main loop sleeps, so a stop signal is seen soon.
@@ -67,8 +78,71 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+/// Lines waiting for one client.
+#[derive(Default)]
+struct Outbox {
+    state: Mutex<OutState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct OutState {
+    /// The line and whether it is a snapshot.
+    lines: VecDeque<(Arc<str>, bool)>,
+    /// Bytes of the lines that are not snapshots.
+    bytes: usize,
+    closed: bool,
+}
+
+impl Outbox {
+    /// Queues a line. A snapshot replaces an unsent older snapshot. False
+    /// if the client is gone or too far behind: drop it.
+    fn push(&self, line: Arc<str>, snapshot: bool) -> bool {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.closed {
+            return false;
+        }
+        if snapshot {
+            s.lines.retain(|(_, snap)| !snap);
+        } else {
+            let others = s.lines.iter().filter(|(_, snap)| !snap).count();
+            if others >= CLIENT_QUEUE || s.bytes + line.len() > CLIENT_BYTES {
+                return false;
+            }
+            s.bytes += line.len();
+        }
+        s.lines.push_back((line, snapshot));
+        self.ready.notify_one();
+        true
+    }
+
+    /// The next line. Waits for one. None after `close`.
+    fn pop(&self) -> Option<Arc<str>> {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if s.closed {
+                return None;
+            }
+            if let Some((line, snapshot)) = s.lines.pop_front() {
+                if !snapshot {
+                    s.bytes -= line.len();
+                }
+                return Some(line);
+            }
+            s = self.ready.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.closed = true;
+        s.lines.clear();
+        self.ready.notify_all();
+    }
+}
+
 enum Incoming {
-    Joined { id: u64, out: SyncSender<Arc<str>> },
+    Joined { id: u64, out: Arc<Outbox> },
     Request { id: u64, req: Request },
     Left(u64),
 }
@@ -108,7 +182,7 @@ pub fn run() -> anyhow::Result<()> {
         // SAFETY: the handler only stores to an atomic.
         unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
     }
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE);
     let count = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || accept(listener, gid, tx, count));
     let mut engine = Engine::new(mon, args.monitor.interval());
@@ -122,33 +196,46 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> anyhow::Result<()> {
-    let mut clients: HashMap<u64, SyncSender<Arc<str>>> = HashMap::new();
+    let mut clients: HashMap<u64, Arc<Outbox>> = HashMap::new();
     while !STOP.load(Ordering::Relaxed) {
-        match rx.recv_timeout(engine.wait().min(MAX_WAIT)) {
-            Ok(Incoming::Joined { id, out }) => {
-                let hello = ToClient::Hello {
-                    version: proto::VERSION,
-                    interval_ms: engine.interval().as_millis() as u64,
-                    warnings: warnings.to_vec(),
-                };
-                for m in [hello, engine.snapshot()] {
-                    let _ = out.try_send(proto::line(&m).into());
+        let mut next = rx.recv_timeout(engine.wait().min(MAX_WAIT));
+        // Requests that wait together get one snapshot, not one each.
+        let mut changed = false;
+        for _ in 0..REQUEST_BATCH {
+            match next {
+                Ok(Incoming::Joined { id, out }) => {
+                    let hello = ToClient::Hello {
+                        version: proto::VERSION,
+                        interval_ms: engine.interval().as_millis() as u64,
+                        warnings: warnings.to_vec(),
+                    };
+                    out.push(proto::line(&hello).into(), false);
+                    out.push(proto::line(&engine.snapshot()).into(), true);
+                    clients.insert(id, out);
                 }
-                clients.insert(id, out);
-            }
-            Ok(Incoming::Request { id, req }) => {
-                for m in engine.request(req) {
-                    match m {
-                        ToClient::Reply { .. } => send(&mut clients, Some(id), &m),
-                        _ => send(&mut clients, None, &m),
+                Ok(Incoming::Request { id, req }) => {
+                    changed = true;
+                    for m in engine.request_quiet(req) {
+                        let to = matches!(m, ToClient::Reply { .. }).then_some(id);
+                        send(&mut clients, to, &m);
                     }
                 }
+                Ok(Incoming::Left(id)) => {
+                    if let Some(out) = clients.remove(&id) {
+                        out.close();
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => bail!("socket listener stopped"),
             }
-            Ok(Incoming::Left(id)) => {
-                clients.remove(&id);
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => bail!("socket listener stopped"),
+            next = match rx.try_recv() {
+                Ok(m) => Ok(m),
+                Err(TryRecvError::Empty) => Err(RecvTimeoutError::Timeout),
+                Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
+            };
+        }
+        if changed {
+            send(&mut clients, None, &engine.snapshot());
         }
         let msgs = engine.step(Instant::now());
         let t = Instant::now();
@@ -162,27 +249,30 @@ fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> a
             engine.mon.prof.add("send to clients (JSON)", t);
         }
     }
+    for out in clients.values() {
+        out.close();
+    }
     Ok(())
 }
 
-/// Sends to one client or all. Drops clients whose queue is full or gone.
-fn send(clients: &mut HashMap<u64, SyncSender<Arc<str>>>, to: Option<u64>, msg: &ToClient) {
+/// Sends to one client or all. Drops clients that are gone or too far
+/// behind.
+fn send(clients: &mut HashMap<u64, Arc<Outbox>>, to: Option<u64>, msg: &ToClient) {
     if clients.is_empty() {
         return;
     }
     let line: Arc<str> = proto::line(msg).into();
+    let snapshot = matches!(msg, ToClient::Snapshot(_));
     clients.retain(|id, out| {
         if to.is_some_and(|t| t != *id) {
             return true;
         }
-        match out.try_send(line.clone()) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => {
-                eprintln!("netmond: client {id} too slow, dropped");
-                false
-            }
-            Err(TrySendError::Disconnected(_)) => false,
+        if out.push(line.clone(), snapshot) {
+            return true;
         }
+        eprintln!("netmond: client {id} gone or too slow, dropped");
+        out.close();
+        false
     });
 }
 
@@ -208,10 +298,41 @@ fn bind(path: &Path, gid: Option<u32>) -> anyhow::Result<UnixListener> {
     unsafe { libc::umask(old) };
     let listener = bound.with_context(|| format!("bind {}", path.display()))?;
     if let Some(gid) = gid {
-        std::os::unix::fs::chown(path, Some(0), Some(gid)).with_context(|| format!("chown {}", path.display()))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+        open_group(path, gid)?;
     }
     Ok(listener)
+}
+
+/// Gives the group access to the socket just bound at `path`. Works on
+/// the file itself, never through a symlink: with --socket in a directory
+/// others can write, a swapped path must not hand some other file to the
+/// group.
+fn open_group(path: &Path, gid: u32) -> anyhow::Result<()> {
+    let c = CString::new(path.as_os_str().as_encoded_bytes())?;
+    // SAFETY: valid C string. O_PATH opens without reading or following.
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("open {}", path.display()));
+    }
+    // SAFETY: fd is a new descriptor that nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: zeroed stat buffer, valid fd.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("fstat socket");
+    }
+    // Our socket is root's: anything else was put there by someone else.
+    if st.st_mode & libc::S_IFMT != libc::S_IFSOCK || st.st_uid != 0 {
+        bail!("{} changed after bind: not netmond's socket", path.display());
+    }
+    // SAFETY: valid fd and empty C string with AT_EMPTY_PATH.
+    if unsafe { libc::fchownat(fd.as_raw_fd(), c"".as_ptr(), 0, gid, libc::AT_EMPTY_PATH) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("chown {}", path.display()));
+    }
+    // chmod through the descriptor: /proc/self/fd/N names this inode.
+    std::fs::set_permissions(format!("/proc/self/fd/{}", fd.as_raw_fd()), std::fs::Permissions::from_mode(0o660))
+        .with_context(|| format!("chmod {}", path.display()))?;
+    Ok(())
 }
 
 fn group_id(name: &str) -> Option<u32> {
@@ -224,7 +345,7 @@ fn group_id(name: &str) -> Option<u32> {
     (!g.is_null()).then(|| unsafe { (*g).gr_gid })
 }
 
-fn accept(listener: UnixListener, gid: Option<u32>, tx: Sender<Incoming>, count: Arc<AtomicUsize>) {
+fn accept(listener: UnixListener, gid: Option<u32>, tx: SyncSender<Incoming>, count: Arc<AtomicUsize>) {
     let mut next_id = 0u64;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -240,12 +361,12 @@ fn accept(listener: UnixListener, gid: Option<u32>, tx: Sender<Incoming>, count:
 
 /// Serves one connection: checks the peer, reads its hello, starts its
 /// writer, then forwards its requests until it leaves.
-fn client(stream: UnixStream, id: u64, gid: Option<u32>, tx: &Sender<Incoming>, count: &AtomicUsize) -> anyhow::Result<()> {
+fn client(stream: UnixStream, id: u64, gid: Option<u32>, tx: &SyncSender<Incoming>, count: &AtomicUsize) -> anyhow::Result<()> {
     let refuse = |mut s: &UnixStream, why: &str| {
         let _ = s.write_all(proto::line(&ToClient::Error(why.into())).as_bytes());
     };
     let cred = peer_cred(&stream)?;
-    if !allowed(&cred, gid) {
+    if !allowed(&cred, &peer_groups(&stream)?, gid) {
         refuse(&stream, "not allowed: root or group netmon only");
         bail!("refused uid {} pid {}", cred.uid, cred.pid);
     }
@@ -260,7 +381,7 @@ fn client(stream: UnixStream, id: u64, gid: Option<u32>, tx: &Sender<Incoming>, 
     result
 }
 
-fn session(stream: UnixStream, id: u64, tx: &Sender<Incoming>) -> anyhow::Result<()> {
+fn session(stream: UnixStream, id: u64, tx: &SyncSender<Incoming>) -> anyhow::Result<()> {
     let mut lines = BufReader::new(stream.try_clone()?);
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     match read_request(&mut lines)? {
@@ -273,9 +394,11 @@ fn session(stream: UnixStream, id: u64, tx: &Sender<Incoming>) -> anyhow::Result
         _ => bail!("no hello"),
     }
     stream.set_read_timeout(None)?;
-    let (out, queue) = mpsc::sync_channel::<Arc<str>>(CLIENT_QUEUE);
+    let out = Arc::new(Outbox::default());
     let writer = stream.try_clone()?;
-    std::thread::spawn(move || write_lines(writer, queue));
+    writer.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    let queue = out.clone();
+    std::thread::spawn(move || write_lines(writer, &queue));
     tx.send(Incoming::Joined { id, out })?;
     while let Some(msg) = read_request(&mut lines)? {
         match msg {
@@ -286,14 +409,16 @@ fn session(stream: UnixStream, id: u64, tx: &Sender<Incoming>) -> anyhow::Result
     Ok(())
 }
 
-/// Writes queued lines until the queue closes (client dropped) or the
-/// socket fails; then shuts the socket so the reader ends too.
-fn write_lines(mut stream: UnixStream, queue: Receiver<Arc<str>>) {
-    for line in queue {
+/// Writes queued lines until the outbox closes (client dropped) or the
+/// socket fails or times out; then shuts the socket so the reader ends
+/// too, and the main loop drops the client.
+fn write_lines(mut stream: UnixStream, out: &Outbox) {
+    while let Some(line) = out.pop() {
         if stream.write_all(line.as_bytes()).is_err() {
             break;
         }
     }
+    out.close();
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
@@ -330,26 +455,37 @@ fn peer_cred(s: &UnixStream) -> anyhow::Result<libc::ucred> {
     Ok(cred)
 }
 
-/// Root, or a member of the group: primary group from the credentials,
-/// supplementary groups from /proc/<pid>/status. The socket's file mode
-/// already enforces the same; this is the second check.
-fn allowed(cred: &libc::ucred, gid: Option<u32>) -> bool {
+/// Groups of the peer when it connected (SO_PEERGROUPS, kernel 4.13).
+/// Taken from the socket, not from /proc: no pid reuse race.
+fn peer_groups(s: &UnixStream) -> anyhow::Result<Vec<u32>> {
+    let mut groups = vec![0 as libc::gid_t; 64];
+    loop {
+        let mut len = (groups.len() * size_of::<libc::gid_t>()) as libc::socklen_t;
+        // SAFETY: valid socket fd; groups and len describe the buffer.
+        let r = unsafe {
+            libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERGROUPS, groups.as_mut_ptr().cast(), &mut len)
+        };
+        if r == 0 {
+            groups.truncate(len as usize / size_of::<libc::gid_t>());
+            return Ok(groups);
+        }
+        let e = std::io::Error::last_os_error();
+        // ERANGE: len holds the size needed.
+        if e.raw_os_error() != Some(libc::ERANGE) || groups.len() >= 65_536 {
+            return Err(e).context("SO_PEERGROUPS");
+        }
+        groups.resize((len as usize / size_of::<libc::gid_t>()).max(groups.len() * 2), 0);
+    }
+}
+
+/// Root, or a member of the group (primary or supplementary). The
+/// socket's file mode already enforces the same; this is the second check.
+fn allowed(cred: &libc::ucred, groups: &[u32], gid: Option<u32>) -> bool {
     if cred.uid == 0 {
         return true;
     }
     let Some(gid) = gid else { return false };
-    if cred.gid == gid {
-        return true;
-    }
-    let status = std::fs::read_to_string(format!("/proc/{}/status", cred.pid)).unwrap_or_default();
-    in_groups(&status, gid)
-}
-
-fn in_groups(status: &str, gid: u32) -> bool {
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("Groups:"))
-        .is_some_and(|g| g.split_whitespace().any(|x| x.parse() == Ok(gid)))
+    cred.gid == gid || groups.contains(&gid)
 }
 
 #[cfg(test)]
@@ -358,14 +494,32 @@ mod tests {
 
     #[test]
     fn supplementary_groups() {
-        let status = "Name:\tbash\nGid:\t1000\t1000\t1000\t1000\nGroups:\t10 973 1000 \n";
-        assert!(in_groups(status, 973));
-        assert!(!in_groups(status, 97));
-        assert!(!in_groups("Name:\tx\n", 973));
         let me = libc::ucred { pid: std::process::id() as i32, uid: 1000, gid: 1000 };
-        assert!(!allowed(&me, None), "no group: root only");
-        assert!(allowed(&me, Some(1000)));
-        assert!(allowed(&libc::ucred { uid: 0, ..me }, None));
+        assert!(!allowed(&me, &[973], None), "no group: root only");
+        assert!(allowed(&me, &[], Some(1000)), "primary group");
+        assert!(allowed(&me, &[10, 973], Some(973)), "supplementary group");
+        assert!(!allowed(&me, &[10, 973], Some(97)));
+        assert!(allowed(&libc::ucred { uid: 0, ..me }, &[], None));
+        let (a, _b) = UnixStream::pair().unwrap();
+        peer_groups(&a).expect("SO_PEERGROUPS works on a socket pair");
+    }
+
+    #[test]
+    fn outbox_keeps_one_snapshot_and_limits_the_rest() {
+        let out = Outbox::default();
+        assert!(out.push("s1".into(), true));
+        assert!(out.push("p1".into(), false));
+        assert!(out.push("s2".into(), true));
+        assert_eq!(out.pop().as_deref(), Some("p1"));
+        assert_eq!(out.pop().as_deref(), Some("s2"), "older snapshot replaced");
+        for _ in 0..CLIENT_QUEUE {
+            assert!(out.push("p".into(), false));
+        }
+        assert!(!out.push("p".into(), false), "too far behind");
+        assert!(out.push("s3".into(), true), "a snapshot always fits");
+        out.close();
+        assert_eq!(out.pop(), None);
+        assert!(!out.push("p".into(), false), "closed");
     }
 
     #[test]

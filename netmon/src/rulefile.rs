@@ -378,7 +378,7 @@ remote = "2001:db8::1"
             rules.insert(usize::MAX, f.action, f.m, &f.comment).unwrap();
         }
         let m = Match { dir: Some(Dir::In), ports: Some((22, 22)), proto: Some(IPPROTO_TCP), ..Match::default() };
-        rules.insert(0, Action::Allow, m, "say \"hi\"\nnext line").unwrap();
+        rules.insert(0, Action::Allow, m, "say \"hi\" C:\\dir").unwrap();
         let text = render(&rules);
         let back = parse(&text).unwrap();
         assert_eq!(back.default, Some(Action::Deny));

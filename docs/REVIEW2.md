@@ -59,14 +59,14 @@ Status column: `open` for all items at the time of writing.
 
 | # | Sev | Finding | Where | Src | Status |
 |---|-----|---------|-------|-----|--------|
-| D1 | Medium | Memory: each snapshot is the full collector as JSON (MBs with 30 000 flows), and each client can queue 256 lines. A client stopped with Ctrl-Z holds GBs. The request channel is unbounded and each request makes a snapshot, so a group member can grow the root daemon's memory without limit. | `netmon/src/daemon.rs:53`, `:104`; `netmon/src/engine.rs:63-82` | A, S | open |
-| D2 | Medium | `write_lines` has no write timeout: a client that never reads blocks its writer thread and keeps its slot. 16 such clients lock out every UI, root included. | `netmon/src/daemon.rs:284-290` | S | open |
-| D3 | Medium | Group `netmon` can do more than the README says: remove any rule and save, capture any interface (also `lo`) and any process of any user. It is a host-wide sniffer plus firewall admin. | README; `netmon/src/monitor.rs` (`request`) | S | open (document) |
-| D4 | Low | With `--socket` in a directory an attacker can write, `chown`/`chmod` after `bind` follow a swapped symlink. Use `RuntimeDirectory=netmon` (0750 root:netmon). | `netmon/src/daemon.rs:204-205` | S | open |
-| D5 | Low | The second peer check reads `/proc/<pid>/status` (pid reuse race). It adds nothing beyond the 0660 socket mode. Use `SO_PEERGROUPS`. | `netmon/src/daemon.rs` (`allowed`) | S | open |
-| D6 | Low | `prepare_pins` creates the pin directory without a mode or owner check. | `netmon/src/probe.rs:108-120` | S | open |
-| D7 | Low | Exe strings from a client are not checked for control characters; they show in other admins' Rules tab. | `netmon/src/rules.rs` (`Match::check`) | S | open |
-| D8 | Medium | systemd hardening is thin for a root daemon that parses network data: no `CapabilityBoundingSet`, `ProtectSystem=full` not `strict`, no `RestrictAddressFamilies`, `SystemCallFilter`, `MemoryMax`, `TasksMax`. Each directive must be tested with the eBPF load. | `dist/netmond.service` | S | open |
+| D1 | Medium | Memory: each snapshot is the full collector as JSON (MBs with 30 000 flows), and each client can queue 256 lines. A client stopped with Ctrl-Z holds GBs. The request channel is unbounded and each request makes a snapshot, so a group member can grow the root daemon's memory without limit. | `netmon/src/daemon.rs:53`, `:104`; `netmon/src/engine.rs:63-82` | A, S | fixed (step 6) |
+| D2 | Medium | `write_lines` has no write timeout: a client that never reads blocks its writer thread and keeps its slot. 16 such clients lock out every UI, root included. | `netmon/src/daemon.rs:284-290` | S | fixed (step 6) |
+| D3 | Medium | Group `netmon` can do more than the README says: remove any rule and save, capture any interface (also `lo`) and any process of any user. It is a host-wide sniffer plus firewall admin. | README; `netmon/src/monitor.rs` (`request`) | S | fixed (step 6) |
+| D4 | Low | With `--socket` in a directory an attacker can write, `chown`/`chmod` after `bind` follow a swapped symlink. Use `RuntimeDirectory=netmon` (0750 root:netmon). | `netmon/src/daemon.rs:204-205` | S | fixed (step 6) |
+| D5 | Low | The second peer check reads `/proc/<pid>/status` (pid reuse race). It adds nothing beyond the 0660 socket mode. Use `SO_PEERGROUPS`. | `netmon/src/daemon.rs` (`allowed`) | S | fixed (step 6) |
+| D6 | Low | `prepare_pins` creates the pin directory without a mode or owner check. | `netmon/src/probe.rs:108-120` | S | fixed (step 6) |
+| D7 | Low | Exe strings from a client are not checked for control characters; they show in other admins' Rules tab. | `netmon/src/rules.rs` (`Match::check`) | S | fixed (step 6) |
+| D8 | Medium | systemd hardening is thin for a root daemon that parses network data: no `CapabilityBoundingSet`, `ProtectSystem=full` not `strict`, no `RestrictAddressFamilies`, `SystemCallFilter`, `MemoryMax`, `TasksMax`. Each directive must be tested with the eBPF load. | `dist/netmond.service` | S | fixed (step 6) |
 
 ## UI and README
 

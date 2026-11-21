@@ -48,9 +48,18 @@ impl<K: Kernel> Engine<K> {
     /// Carries out a request. The messages are, in order: new packets, a
     /// snapshot for every client, the reply for the asking client.
     pub(crate) fn request(&mut self, req: Request) -> Vec<ToClient> {
+        let mut out = self.request_quiet(req);
+        let reply = out.pop();
+        out.push(self.snapshot());
+        out.extend(reply);
+        out
+    }
+
+    /// Like `request`, without the snapshot: netmond sends one snapshot
+    /// for a batch of requests. In order: new packets, the reply.
+    pub(crate) fn request_quiet(&mut self, req: Request) -> Vec<ToClient> {
         let msg = self.mon.request(req.clone());
         let mut out = self.packets();
-        out.push(self.snapshot());
         out.push(ToClient::Reply { req, msg });
         out
     }

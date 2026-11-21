@@ -630,9 +630,21 @@ Keys: `↑` `↓` `PgUp` `PgDn` `Home` select, `End` or `f` follow new packets,
 ### Socket and access
 
 `netmond` listens on `/run/netmon.sock`. The socket belongs to `root:netmon`
-and has mode 0660. The daemon also identifies each client with `SO_PEERCRED`:
-only root and members of the group can connect. If the group does not exist, only
-root can connect.
+and has mode 0660. The daemon also identifies each client with `SO_PEERCRED`
+and `SO_PEERGROUPS`: only root and members of the group can connect. If the
+group does not exist, only root can connect.
+
+Membership in group `netmon` gives full control of the firewall and of the
+capture. A member can:
+
+1. Add and remove every rule, also the rules of the rules file, and save
+   them to `/etc/netmon/rules.toml`.
+2. Change the default action.
+3. Answer every question.
+4. Capture the packets of every interface, `lo` included, and of every
+   process of every user.
+
+Thus give the group only to users who are allowed to administer the host.
 
 The protocol is one JSON object per line (`netmon/src/proto.rs`):
 
@@ -645,9 +657,15 @@ The protocol is one JSON object per line (`netmon/src/proto.rs`):
    and stop a capture. Each reply goes to the client that asked.
 
 A request line can be 64 KiB at most. A malformed line, a second `Hello` or
-a wrong version ends the connection. Each client has a send queue of 256
-lines. The daemon drops a client that does not read fast enough, so a slow
-client never stops the monitor. Up to 16 clients can connect.
+a wrong version ends the connection. Up to 16 clients can connect. A slow
+client never stops the monitor, and its memory has a limit:
+
+- A new snapshot replaces a snapshot that the client did not read yet.
+- Other lines (packets, replies, status) queue up to 256 lines or 16 MiB.
+  Over that, the daemon drops the client.
+- A client that reads nothing for 10 s is dropped.
+- Requests wait in a queue of 64. A client that sends faster waits. The
+  requests that wait together get one snapshot.
 
 Pause, filter, sort and the capture view belong to each UI. Rules,
 questions and the capture itself are shared.
@@ -714,9 +732,15 @@ rules end.
 - needs `/sys/fs/bpf` (`RequiresMountsFor`)
 - restarts 2 s after a crash, but not after exit code 78 (error in the
   rules file)
-- runs with `NoNewPrivileges`, `ProtectSystem=full`,
-  `ProtectHome=read-only` and `PrivateTmp`. `/etc/netmon` stays writable
-  for `s` in the Rules tab.
+- runs as root with only the capabilities it needs (`CAP_BPF`,
+  `CAP_PERFMON`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, `CAP_DAC_READ_SEARCH`,
+  `CAP_SYS_RESOURCE`, `CAP_CHOWN`, `CAP_FOWNER`). Kernels before 5.8 also
+  need `CAP_SYS_ADMIN`.
+- runs with `ProtectSystem=strict`. Only `/run`, `/sys/fs/bpf` and
+  `/etc/netmon` (for `s` in the Rules tab) are writable.
+- has a system call filter (`@system-service`, `bpf`, `perf_event_open`),
+  `RestrictAddressFamilies`, `MemoryMax=1G`, `TasksMax=64` and the other
+  `Protect*` and `Restrict*` settings in the file.
 
 The log is in the journal: `journalctl -u netmond`.
 

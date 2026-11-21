@@ -2,6 +2,7 @@
 //! hooks, and reads the maps.
 
 use std::{
+    os::unix::fs::DirBuilderExt,
     collections::{BTreeMap, HashSet},
     fs::File,
     net::SocketAddr,
@@ -129,7 +130,11 @@ fn prepare_pins(dir: &Path) -> Result<PathBuf, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("remove old pins {}: {e}", staging.display())),
     }
-    std::fs::create_dir(&staging).map_err(|e| format!("create {}: {e}", staging.display()))?;
+    // Root only: whoever can remove a pin detaches a program.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .map_err(|e| format!("create {}: {e}", staging.display()))?;
     Ok(staging)
 }
 
