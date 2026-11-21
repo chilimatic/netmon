@@ -54,6 +54,7 @@ pub struct Probe {
     ebpf: Ebpf,
     flows: PerCpuHashMap<MapData, FlowKey, FlowStats>,
     l3_offset: HashMap<MapData, u32, u32>,
+    transit: HashMap<MapData, u32, u8>,
     capture_cfg: Array<MapData, CaptureConfig>,
     capture_keys: HashMap<MapData, FlowKey, u8>,
     capture_set: HashSet<FlowKey>,
@@ -172,6 +173,7 @@ impl Probe {
         let flows = PerCpuHashMap::try_from(ebpf.take_map("FLOWS").context("map FLOWS missing")?)?;
         let l3_offset = HashMap::try_from(ebpf.take_map("L3_OFFSET").context("map L3_OFFSET missing")?)?;
         let mut take = |name: &str| ebpf.take_map(name).with_context(|| format!("map {name} missing"));
+        let transit = HashMap::try_from(take("TRANSIT_IFACES")?)?;
         let capture_cfg = Array::try_from(take("CAPTURE_CFG")?)?;
         let capture_keys = HashMap::try_from(take("CAPTURE_KEYS")?)?;
         let packets = RingBuf::try_from(take("PACKETS")?)?;
@@ -206,6 +208,7 @@ impl Probe {
             ebpf,
             flows,
             l3_offset,
+            transit,
             capture_cfg,
             capture_keys,
             capture_set: HashSet::new(),
@@ -273,6 +276,13 @@ impl Probe {
             self.l3_offset.insert(iface.index, iface.l3_offset, 0)?;
         } else {
             let _ = self.l3_offset.remove(&iface.index);
+        }
+        // Containers and VMs send through bridges and veths: the kernel
+        // passes forwarded packets there and decides them where they leave.
+        if iface.kind.is_virtual() {
+            self.transit.insert(iface.index, 1, 0)?;
+        } else {
+            let _ = self.transit.remove(&iface.index);
         }
         if needs_clsact() {
             // Fails if the qdisc exists, which is fine. A real failure shows
@@ -509,6 +519,7 @@ impl Kernel for Probe {
         // with their L3 offset.
         for gone in self.attached.iter().chain(&self.failed).filter(|i| !live.contains(i)) {
             let _ = self.l3_offset.remove(gone);
+            let _ = self.transit.remove(gone);
             // The kernel detached the links with the device.
             if let Some(dir) = &self.pins {
                 for ty in [TcAttachType::Ingress, TcAttachType::Egress] {

@@ -3,11 +3,11 @@
 
 use aya_ebpf::{
     EbpfContext,
-    bindings::{BPF_NOEXIST, TC_ACT_SHOT, TC_ACT_UNSPEC, __sk_buff},
+    bindings::{BPF_NOEXIST, TC_ACT_SHOT, TC_ACT_UNSPEC, __sk_buff, bpf_fib_lookup as FibParams},
     cty::c_void,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_get_current_uid_gid, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_loop,
+        bpf_fib_lookup, bpf_get_current_uid_gid, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_loop,
         bpf_probe_read_kernel_str_bytes, bpf_skb_load_bytes,
     },
     macros::{cgroup_sock, cgroup_sock_addr, classifier, map, tracepoint},
@@ -20,7 +20,7 @@ use netmon_common::{
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
     CLONE_THREAD, MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
-    RuleEntry, SockOwner, TraceCfg, is_dhcp, is_loopback, is_unparsed, keep_answer, parse_packet, rule_matches,
+    RuleEntry, SockOwner, TraceCfg, fib_forwarded, is_dhcp, is_loopback, is_unparsed, keep_answer, parse_packet, rule_matches,
     unmap_v4_in_place,
 };
 
@@ -33,6 +33,13 @@ static FLOWS: LruPerCpuHashMap<FlowKey, FlowStats> =
 /// without a link-layer header (tun, wireguard). Missing means 14 (Ethernet).
 #[map]
 static L3_OFFSET: HashMap<u32, u32> = HashMap::with_max_entries(MAX_IFACES, 0);
+
+/// Bridges and veth/vlan devices (any value). Containers and VMs send
+/// through them: a packet there is the host's only if it comes from a
+/// host socket or goes to a host address. Forwarded packets are decided at
+/// the interface where they leave the host.
+#[map]
+static TRANSIT_IFACES: HashMap<u32, u8> = HashMap::with_max_entries(MAX_IFACES, 0);
 
 /// What to capture. Index 0 only. Mode CAPTURE_OFF costs one lookup.
 #[map]
@@ -465,6 +472,46 @@ fn name_event(ctx: &TcContext, key: &FlowKey, off: u32, kind: u8) {
     entry.submit(0);
 }
 
+/// A packet that only passes through the host on a bridge or veth (a
+/// container's connection to the internet, or to another container). It
+/// is decided where it leaves the host, not here: on this side of the NAT
+/// its direction is reversed.
+#[inline(never)]
+fn forwarded(ctx: &TcContext, key: &FlowKey, egress: bool) -> bool {
+    if unsafe { TRANSIT_IFACES.get(&key.ifindex) }.is_none() {
+        return false;
+    }
+    if egress {
+        // Sent by a host socket, or forwarded (no socket).
+        return unsafe { bpf_get_socket_cookie(ctx.as_ptr()) } == 0;
+    }
+    // On ingress the destination is the local side of the key.
+    let mut p: FibParams = unsafe { core::mem::zeroed() };
+    p.l4_protocol = key.proto;
+    p.sport = key.remote_port.to_be();
+    p.dport = key.local_port.to_be();
+    p.ifindex = key.ifindex;
+    if key.family == 4 {
+        p.family = 2; // AF_INET
+        p.__bindgen_anon_3.ipv4_src = u32::from_ne_bytes([key.remote_addr[0], key.remote_addr[1], key.remote_addr[2], key.remote_addr[3]]);
+        p.__bindgen_anon_4.ipv4_dst = u32::from_ne_bytes([key.local_addr[0], key.local_addr[1], key.local_addr[2], key.local_addr[3]]);
+    } else {
+        p.family = 10; // AF_INET6
+        let mut i = 0;
+        while i < 4 {
+            let r = &key.remote_addr[i * 4..i * 4 + 4];
+            let l = &key.local_addr[i * 4..i * 4 + 4];
+            unsafe {
+                p.__bindgen_anon_3.ipv6_src[i] = u32::from_ne_bytes([r[0], r[1], r[2], r[3]]);
+                p.__bindgen_anon_4.ipv6_dst[i] = u32::from_ne_bytes([l[0], l[1], l[2], l[3]]);
+            }
+            i += 1;
+        }
+    }
+    let ret = unsafe { bpf_fib_lookup(ctx.as_ptr(), &mut p, size_of::<FibParams>() as i32, 0) };
+    fib_forwarded(ret)
+}
+
 #[inline(always)]
 fn handle(ctx: &TcContext, egress: bool) -> i32 {
     let skb = ctx.as_ptr() as *const __sk_buff;
@@ -488,7 +535,7 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
             tls_names(ctx, key, payload as u32);
         }
         // Unparsed packets have no key and pass (fail-open).
-        if ifindex != LOOPBACK_IFINDEX && packet_denied(key, egress, packet_tgid(ctx, egress)) {
+        if ifindex != LOOPBACK_IFINDEX && !forwarded(ctx, key, egress) && packet_denied(key, egress, packet_tgid(ctx, egress)) {
             action = TC_ACT_SHOT;
         }
     }

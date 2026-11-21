@@ -172,6 +172,17 @@ impl ConnState {
     }
 }
 
+/// Whether a `bpf_fib_lookup` result means the kernel forwards the packet
+/// to another host (or container) instead of delivering it locally.
+/// NOT_FWDED (4, local, broadcast, multicast) and FWD_DISABLED (5, the host
+/// does not forward) mean local delivery. Errors (< 0) count as local too:
+/// the packet is then decided, not passed. Blackhole, unreachable and
+/// prohibit (1-3) are dropped by the kernel anyway.
+#[inline(always)]
+pub fn fib_forwarded(ret: i64) -> bool {
+    ret >= 0 && ret != 4 && ret != 5
+}
+
 /// The verdict to store after a new rule walk gave `decided`, and whether
 /// it is still an answer. An earlier answer (`prev_action` with
 /// `prev_answered` != 0) stays only if no rule decides the connection now
@@ -707,6 +718,15 @@ impl FlowKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_routed_packets_count_as_forwarded() {
+        assert!(fib_forwarded(0), "success: routed on");
+        assert!(fib_forwarded(7), "no neighbour yet: still routed");
+        assert!(!fib_forwarded(4), "local destination");
+        assert!(!fib_forwarded(5), "forwarding off: must be local");
+        assert!(!fib_forwarded(-22), "error: decide, do not pass");
+    }
 
     #[test]
     fn answers_hold_until_a_rule_decides() {

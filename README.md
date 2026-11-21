@@ -439,8 +439,15 @@ How a deny works:
 - A new connection or UDP send fails with `Operation not permitted`. The
   cgroup `connect` and `sendmsg` hooks refuse it.
 - Packets of existing connections and traffic without a local socket
-  (containers, forwarded traffic) are dropped by the TC programs on every
-  interface.
+  (containers, forwarded traffic) are dropped by the TC programs.
+- Container and VM traffic gets its verdict where it leaves the host. On
+  bridges and veth/vlan interfaces the TC programs decide only packets of
+  the host: egress with a host socket, and ingress to a host address
+  (`bpf_fib_lookup` says that the kernel does not forward it). A
+  container's connection to the internet passes the veth and the bridge.
+  The uplink egress then decides it as outbound, with the container's
+  destination. A container's connection to a service on the host is
+  inbound to the host.
 - An exe rule follows `exec` and `fork` through the tracepoints. A program
   started through a symlink (`python3` to `python3.13`) is found by the
   `/proc` scan instead, within 10 ticks (10 s by default).
