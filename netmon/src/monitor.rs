@@ -358,7 +358,9 @@ impl<K: Kernel> Monitor<K> {
         self.prof.add("process details", t);
         if self.ticks.is_multiple_of(self.exe_scan_every) {
             let t = Instant::now();
-            self.sync_exe_blocks();
+            if let Some(e) = self.sync_exe_blocks() {
+                errors.push(e);
+            }
             self.prof.add("exe marks (/proc scan)", t);
         }
         let t = Instant::now();
@@ -750,7 +752,9 @@ impl<K: Kernel> Monitor<K> {
         };
         match self.probe.set_rules(&self.rules.entries(), self.rules.exe_ids(), self.rules.default.kernel()) {
             Ok(()) => {
-                self.sync_exe_blocks();
+                if let Some(e) = self.sync_exe_blocks() {
+                    return format!("{msg}; {e}");
+                }
                 msg
             }
             Err(e) => {
@@ -798,16 +802,20 @@ impl<K: Kernel> Monitor<K> {
     /// Marks running processes of exes that rules name. The exec and fork
     /// tracepoints keep the marks current between refreshes; this catches
     /// processes that ran before the rule and any the tracepoints missed.
-    pub(crate) fn sync_exe_blocks(&mut self) {
+    /// Returns an error message if processes could not be marked: their
+    /// exe rules then do not apply to them.
+    pub(crate) fn sync_exe_blocks(&mut self) -> Option<String> {
         let exes = self.rules.exe_ids();
         if exes.is_empty() {
-            return;
+            return None;
         }
-        let Ok(procs) = procfs::process::all_processes() else { return };
+        let procs = procfs::process::all_processes().ok()?;
         let running = procs.flatten().filter_map(|p| Some((p.pid as u32, p.exe().ok()?.to_string_lossy().into_owned())));
+        let mut lost = 0;
         for (id, pids) in rules::pids_by_exe(running, exes) {
-            self.probe.mark_pids(id, &pids);
+            lost += self.probe.mark_pids(id, &pids);
         }
+        (lost > 0).then(|| format!("exe marks full: exe rules do not apply to {lost} processes"))
     }
 
 }
@@ -984,8 +992,9 @@ mod tests {
                 f(&ev);
             }
         }
-        fn mark_pids(&mut self, id: u32, pids: &[u32]) {
+        fn mark_pids(&mut self, id: u32, pids: &[u32]) -> usize {
             self.marked.extend(pids.iter().map(|p| (id, *p)));
+            0
         }
         fn rule_hits(&self, slot: usize) -> u64 {
             slot as u64 + 100

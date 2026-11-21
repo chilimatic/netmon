@@ -19,7 +19,7 @@ use netmon_common::{
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
-    MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
+    CLONE_THREAD, MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
     RuleEntry, SockOwner, TraceCfg, is_dhcp, is_loopback, is_unparsed, keep_answer, parse_packet, rule_matches,
     unmap_v4_in_place,
 };
@@ -280,6 +280,7 @@ fn packet_denied(key: &FlowKey, egress: bool, tgid: u32) -> bool {
     }
     let generation = cfg(CFG_GEN);
     let (mut prev_action, mut prev_answered) = (0u8, 0u8);
+    let mut tgid = tgid;
     if let Some(st) = unsafe { CONNS.get(&c) } {
         // Decide again after a rule change, or when the process is known
         // now but was not then (exe rules could not match).
@@ -289,8 +290,12 @@ fn packet_denied(key: &FlowKey, egress: bool, tgid: u32) -> bool {
         dir = st.dir;
         prev_action = st.action;
         prev_answered = st.answered;
+        // The owner map can have lost the socket (LRU): keep the process
+        // the connection was decided for.
+        if tgid == 0 {
+            tgid = st.tgid;
+        }
     }
-    let mut tgid = tgid;
     if tgid == 0 && dir == DIR_IN {
         tgid = listener_tgid(key);
     }
@@ -299,7 +304,12 @@ fn packet_denied(key: &FlowKey, egress: bool, tgid: u32) -> bool {
     if action == ACTION_ASK && !ask_event(&c, tgid) {
         return true;
     }
-    let st = ConnState { generation, dir, action, exe_known: (tgid != 0) as u8, answered };
+    // Denied inbound packets are not remembered: a remote host that sends
+    // many new flows must not push real connections out of the LRU map.
+    if dir == DIR_IN && action == ACTION_DENY {
+        return true;
+    }
+    let st = ConnState { generation, dir, action, exe_known: (tgid != 0) as u8, answered, tgid };
     let _ = CONNS.insert(&c, &st, 0);
     action != ACTION_ALLOW
 }
@@ -778,15 +788,21 @@ pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
     0
 }
 
-/// After fork: the child gets its parent's exe id. Clearing it for an
-/// unmarked parent removes stale entries of a reused pid.
+/// After fork: the new process gets its parent's exe id. Clearing it for
+/// an unmarked parent removes stale entries of a reused pid. Threads are
+/// skipped: rules look up processes (tgids), and thread ids would fill the
+/// map.
 #[tracepoint]
-pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
+pub fn task_newtask(ctx: TracePointContext) -> u32 {
     let Some(cfg) = TRACE_CFG.get(0) else { return 0 };
-    if cfg.fork_child_pid == 0 {
+    if cfg.newtask_pid == 0 {
         return 0;
     }
-    let Ok(child) = (unsafe { ctx.read_at::<u32>(cfg.fork_child_pid as usize) }) else { return 0 };
+    let Ok(flags) = (unsafe { ctx.read_at::<u32>(cfg.newtask_flags as usize) }) else { return 0 };
+    if flags & CLONE_THREAD != 0 {
+        return 0;
+    }
+    let Ok(child) = (unsafe { ctx.read_at::<u32>(cfg.newtask_pid as usize) }) else { return 0 };
     let parent = (bpf_get_current_pid_tgid() >> 32) as u32;
     match unsafe { TGID_EXE.get(&parent) } {
         Some(id) => {
@@ -796,6 +812,17 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
         None => {
             let _ = TGID_EXE.remove(&child);
         }
+    }
+    0
+}
+
+/// When a process ends (its main thread exits), its mark goes.
+#[tracepoint]
+pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
+    let id = bpf_get_current_pid_tgid();
+    let (tgid, tid) = ((id >> 32) as u32, id as u32);
+    if tgid == tid {
+        let _ = TGID_EXE.remove(&tgid);
     }
     0
 }

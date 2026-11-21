@@ -358,8 +358,8 @@ pub fn field_offset(format: &str, name: &str) -> Option<u32> {
     })
 }
 
-fn event_format(event: &str) -> std::io::Result<String> {
-    let rel = format!("events/sched/{event}/format");
+fn event_format(category: &str, event: &str) -> std::io::Result<String> {
+    let rel = format!("events/{category}/{event}/format");
     std::fs::read_to_string(format!("/sys/kernel/tracing/{rel}"))
         .or_else(|_| std::fs::read_to_string(format!("/sys/kernel/debug/tracing/{rel}")))
 }
@@ -369,17 +369,19 @@ fn event_format(event: &str) -> std::io::Result<String> {
 /// process can connect before the next refresh.
 fn attach_exec_tracking(ebpf: &mut Ebpf, mut cfg_map: Array<MapData, TraceCfg>, pins: Option<&Path>) -> Vec<String> {
     let r = (|| -> anyhow::Result<()> {
-        let exec = event_format("sched_process_exec").context("read sched_process_exec format")?;
-        let fork = event_format("sched_process_fork").context("read sched_process_fork format")?;
+        let exec = event_format("sched", "sched_process_exec").context("read sched_process_exec format")?;
+        let task = event_format("task", "task_newtask").context("read task_newtask format")?;
         let cfg = TraceCfg {
             exec_filename: field_offset(&exec, "filename").context("no filename field in sched_process_exec")?,
-            fork_child_pid: field_offset(&fork, "child_pid").context("no child_pid field in sched_process_fork")?,
+            newtask_pid: field_offset(&task, "pid").context("no pid field in task_newtask")?,
+            newtask_flags: field_offset(&task, "clone_flags").context("no clone_flags field in task_newtask")?,
+            _pad: 0,
         };
         cfg_map.set(0, cfg, 0)?;
-        for name in ["sched_process_exec", "sched_process_fork"] {
+        for (category, name) in [("sched", "sched_process_exec"), ("task", "task_newtask"), ("sched", "sched_process_exit")] {
             let prog: &mut TracePoint = ebpf.program_mut(name).context("missing")?.try_into()?;
             prog.load()?;
-            let id = prog.attach("sched", name)?;
+            let id = prog.attach(category, name)?;
             if let Some(dir) = pins {
                 pin(dir, name, prog.take_link(id)?)?;
             }
@@ -449,8 +451,9 @@ pub trait Kernel {
     /// Remote endpoints that are never blocked.
     /// Remote endpoints and local TCP ports that are never blocked.
     fn set_guard(&mut self, endpoints: &[SocketAddr], local_tcp_ports: &[u16]) -> anyhow::Result<()>;
-    /// Marks running processes with the exe id of their exe.
-    fn mark_pids(&mut self, exe_id: u32, pids: &[u32]);
+    /// Marks running processes with the exe id of their exe. Returns how
+    /// many did not fit into the map.
+    fn mark_pids(&mut self, exe_id: u32, pids: &[u32]) -> usize;
 }
 
 impl Kernel for Probe {
@@ -565,7 +568,9 @@ impl Kernel for Probe {
     }
 
     fn set_verdict(&mut self, key: &ConnKey, action: u8) -> anyhow::Result<()> {
-        let st = ConnState { generation: self.generation, dir: DIR_OUT, action, exe_known: 1, answered: 1 };
+        // Keep the process the kernel decided for.
+        let tgid = self.conns.get(key, 0).map(|s| s.tgid).unwrap_or(0);
+        let st = ConnState { generation: self.generation, dir: DIR_OUT, action, exe_known: 1, answered: 1, tgid };
         self.conns.insert(key, st, 0)?;
         Ok(())
     }
@@ -647,12 +652,10 @@ impl Kernel for Probe {
         Ok(())
     }
 
-    fn mark_pids(&mut self, exe_id: u32, pids: &[u32]) {
-        for pid in pids {
-            // A full map leaves the process unmarked: its exe rules do not
-            // match (fail-open).
-            let _ = self.tgid_exe.insert(pid, exe_id, 0);
-        }
+    fn mark_pids(&mut self, exe_id: u32, pids: &[u32]) -> usize {
+        // A full map leaves the process unmarked: its exe rules do not
+        // match. The caller reports it.
+        pids.iter().filter(|pid| self.tgid_exe.insert(*pid, exe_id, 0).is_err()).count()
     }
 
     fn listeners(&self) -> Vec<(u8, SocketAddr, SockOwner)> {

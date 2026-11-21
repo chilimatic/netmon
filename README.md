@@ -53,7 +53,8 @@ Contents:
                │                          │                         │
      cgroup socket hooks           TC programs, ingress       tracepoints
      (every process on the host)   and egress, on every       sched_process_exec
-                                   interface                  sched_process_fork
+                                   interface                  task_newtask
+                                                              sched_process_exit
 ```
 
 The kernel programs do the work that must happen at each packet or socket
@@ -64,8 +65,10 @@ call:
 - The cgroup socket hooks see every `connect`, `sendmsg`, `bind` and socket
   create of every process. They record which process owns which socket, and
   they refuse new connections that the rules deny.
-- The tracepoints see each `exec` and `fork`. They keep the map of "process
-  runs this exe" current, so that rules for an exe apply at once.
+- The tracepoints see each `exec`, each new process and each process exit.
+  They keep the map of "process runs this exe" current, so that rules for
+  an exe apply at once. New threads are not recorded: rules look up
+  processes, and thread ids would fill the map.
 
 `netmond` reads the maps once per tick (1 s by default), computes the
 rates, finds the owner of each connection, and sends a snapshot to each
@@ -424,7 +427,12 @@ stores the verdict and the direction in `CONNS` (up to 65 536 connections,
 the oldest are forgotten first). Later packets, replies included, use the
 same verdict. Thus `default = "deny"` with an allow rule for
 `direction = "out"` also allows the replies to your own connections. A rule
-change makes the kernel decide every connection again.
+change makes the kernel decide every connection again. The stored state
+also keeps the process that the connection was decided for, so a later
+decision still knows it when the socket owner map lost the socket.
+
+A denied inbound connection is not stored. Thus a remote host that sends
+many new flows cannot push your open connections out of `CONNS`.
 
 How a deny works:
 
@@ -727,7 +735,7 @@ other monitors) then never run.
 Any process can set its own name with `prctl`. A rule therefore names an
 exe path, which comes from `/proc/<pid>/exe`. The kernel gives each exe a
 number (`EXE_IDS`) and marks each process that runs it (`TGID_EXE`). The
-exec and fork tracepoints keep the marks current. Exe numbers are never
+exec, new-task and exit tracepoints keep the marks current. Exe numbers are never
 used again, so an old mark can never point to another exe.
 
 ### Owner sources, best first
@@ -874,6 +882,11 @@ Limits of the `/proc` sources:
 
 - A connection that `CONNS` forgot while it was open (map full) is decided
   again on its next packet. It can then count as opened by the other side.
+  Denied inbound flows do not fill the map, but allowed ones (for example
+  many new connections to a public server port) do.
+- If the map of marked processes is full (8192 processes of exes that
+  rules name), the status line says so, and the exe rules do not apply to
+  the processes that did not fit.
 - Only TCP and UDP get the default action. ICMP and other protocols pass.
 - An exe started through a symlink or a relative path is marked by the
   `/proc` scan, so it can connect for up to 10 ticks before its rule

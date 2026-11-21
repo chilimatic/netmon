@@ -48,7 +48,7 @@ pub struct FlowStats {
 }
 
 /// Entries in the socket owner map.
-pub const MAX_SOCK_OWNERS: u32 = 16_384;
+pub const MAX_SOCK_OWNERS: u32 = 65_536;
 /// Rules in the ordered rule table. The kernel walks the table for each
 /// packet and socket call, so this stays small.
 pub const MAX_RULES: u32 = 256;
@@ -156,6 +156,9 @@ pub struct ConnState {
     /// mode: once, or the deny after a timeout). After a rule change it
     /// stays only while no rule decides the connection.
     pub answered: u8,
+    /// The process the connection was decided for (0: unknown). A later
+    /// decision uses it when the socket owner map lost the socket (LRU).
+    pub tgid: u32,
 }
 
 impl ConnState {
@@ -320,9 +323,15 @@ pub fn unmap_v4(family: u8, addr: &[u8; 16]) -> (u8, [u8; 16]) {
 pub struct TraceCfg {
     /// sched_process_exec: offset of the `__data_loc char[] filename` word.
     pub exec_filename: u32,
-    /// sched_process_fork: offset of `pid_t child_pid`.
-    pub fork_child_pid: u32,
+    /// task_newtask: offset of `pid_t pid` (the new task).
+    pub newtask_pid: u32,
+    /// task_newtask: offset of `clone_flags` (the low 32 bits are read).
+    pub newtask_flags: u32,
+    pub _pad: u32,
 }
+
+/// clone() flag: the new task is a thread of the caller's process.
+pub const CLONE_THREAD: u32 = 0x0001_0000;
 
 /// A remote endpoint that is never blocked (SSH session, DNS resolver),
 /// or, with family 0, a local TCP port that is never blocked (sshd).
@@ -368,7 +377,7 @@ pub fn is_loopback(family: u8, addr: &[u8; 16]) -> bool {
 }
 
 /// Entries in the bound socket (listener) map.
-pub const MAX_LISTENERS: u32 = 4_096;
+pub const MAX_LISTENERS: u32 = 16_384;
 
 /// A bound local address: what `bind()` gave a socket. Wildcard binds have
 /// an all-zero address.
@@ -701,7 +710,7 @@ mod tests {
 
     #[test]
     fn answers_hold_until_a_rule_decides() {
-        let st = |generation, answered| ConnState { generation, dir: DIR_OUT, action: ACTION_ALLOW, exe_known: 1, answered };
+        let st = |generation, answered| ConnState { generation, dir: DIR_OUT, action: ACTION_ALLOW, exe_known: 1, answered, tgid: 7 };
         assert!(st(3, 1).current(3, 7), "answer of the current rules");
         assert!(!st(2, 1).current(3, 7), "rules changed: decide again");
         // After the change: no rule decides it (ask again) -> the answer stays.
