@@ -167,6 +167,14 @@ pub struct App {
     pub graph_labels: Vec<String>,
     /// Selected graph node.
     pub graph_sel: usize,
+    /// Block targets of the graph nodes as last drawn, for b.
+    pub graph_targets: Vec<crate::graph::Target>,
+    /// What the graph rings show (z).
+    pub graph_level: crate::graph::Level,
+    /// Dot motion per edge (process label, remote label).
+    pub graph_motion: HashMap<(String, String), crate::graph::Motion>,
+    /// `anim` at the last graph frame.
+    pub anim_drawn: f64,
     /// Typing a hostname to block (Hosts tab, a).
     pub editing_host: bool,
     pub host_input: String,
@@ -194,6 +202,10 @@ impl Default for App {
             anim: 0.0,
             graph_labels: Vec::new(),
             graph_sel: 0,
+            graph_targets: Vec::new(),
+            graph_level: crate::graph::Level::default(),
+            graph_motion: HashMap::new(),
+            anim_drawn: 0.0,
             editing_host: false,
             host_input: String::new(),
         }
@@ -243,6 +255,8 @@ pub enum Action {
     BlockHostOfRow,
     /// Remove the selected host block in the Hosts tab.
     RemoveHost,
+    /// Block what the selected graph node stands for.
+    BlockGraphNode,
     /// Write all rules to the rules file.
     SaveRules,
     /// Answer the shown ask-mode question.
@@ -348,6 +362,13 @@ impl App {
                     self.graph_sel = (self.graph_sel + 1) % n;
                     return None;
                 }
+                Key::Char('z') => {
+                    self.graph_level = self.graph_level.next();
+                    self.graph_sel = 0;
+                    self.graph_motion.clear();
+                    return None;
+                }
+                Key::Char('b') => return Some(Action::BlockGraphNode),
                 // The Connections tab, filtered to the selected node.
                 Key::Enter => {
                     if let Some(l) = self.graph_labels.get(self.graph_sel).filter(|_| self.graph_sel > 0) {

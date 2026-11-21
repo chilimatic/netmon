@@ -151,6 +151,12 @@ impl Client {
                     None => Err("no connection selected".into()),
                 }
             }
+            Action::BlockGraphNode => match app.graph_targets.get(app.graph_sel) {
+                Some(crate::graph::Target::Exe(e)) => Ok(Request::ToggleBlock(BlockTarget::Exe(e.clone()))),
+                Some(crate::graph::Target::Host(h)) => Ok(Request::BlockHost { pattern: h.clone(), comment: String::new() }),
+                Some(crate::graph::Target::Addr(ip)) => Ok(Request::ToggleBlock(BlockTarget::host(*ip))),
+                _ => Err("nothing to block for this node: select a process or a remote end".into()),
+            },
             Action::RemoveHost => {
                 let hosts = &self.snap.rules.hosts;
                 let ids: Vec<_> = hosts.iter().map(|h| crate::app::RowId::Host(h.id)).collect();

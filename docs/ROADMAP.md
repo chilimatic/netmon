@@ -444,9 +444,9 @@ Small, independent features after the firewall core:
 
 ## Phase 9 – Connection graph
 
-Status: first version done (Graph tab). Not done yet: `b` on a node,
-`z` for the level (processes, containers, hosts), interpolation of rates
-between two snapshots.
+Status: done. Graph tab, `b` on a node, `z` for the level (process,
+container, domain), rates that ease over half a second with a phase per
+edge, so the dots never jump.
 
 A new tab shows the communication as an animated graph in the terminal.
 Only the UI changes. The daemon and the protocol stay the same: the graph

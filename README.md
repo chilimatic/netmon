@@ -296,6 +296,8 @@ that can connect, default `netmon`).
 | `s` | Hosts | Save the rules and the host blocks to the rules file |
 | `↑` `↓` | Graph | Select a node |
 | `Enter` | Graph | Show the Connections tab, filtered to the selected node |
+| `b` | Graph | Block the selected node: its exe, hostname or address |
+| `z` | Graph | Switch the level: process, container, domain |
 | `a` `A` `d` `D` `o` `x` | question window | Answer a question (see [Ask mode](#ask-mode)) |
 | `Esc` | question window | Put the questions aside: the tab gets its keys back |
 | `?` | everywhere | Show the questions again |
@@ -405,10 +407,17 @@ An animated map of the connections:
   line red.
 - Dots move along each line: magenta outward for upload, cyan inward for
   download. More bytes per second give more and faster dots, on a log
-  scale.
+  scale. A new rate changes the speed over about half a second, and the
+  dots never jump.
 - `↑` and `↓` select a node. The line below the graph shows its rates and
   its number of connections. `Enter` opens the Connections tab, filtered to
   the node.
+- `b` blocks what the node stands for: a process blocks its exe, a
+  hostname goes to the Hosts tab, an address gets a block rule. This host,
+  `+n more`, a container and a name with several exes block nothing.
+- `z` switches the level: processes and remote hosts, containers (the
+  host's own processes are one node) and remote hosts, or processes and
+  remote domains (`*.example.com`, the last two labels of the name).
 - `p` stops the animation. `v` adds the rows of bridges and veths.
 
 The tab redraws every 100 ms while it shows. The other tabs redraw only

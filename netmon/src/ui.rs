@@ -113,7 +113,8 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         " q quit  ←→/1-7 view  ↑↓ select  a block a host  d remove  s save to rules file".to_string()
     } else if app.tab == Tab::Graph {
         format!(
-            " q quit  ←→/1-7 view  ↑↓ select node  Enter its connections  p pause  h names  v veth/bridge [{}]",
+            " q quit  ←→/1-7 view  ↑↓ select node  Enter its connections  b block it  z level [{}]  p pause  h names  v veth/bridge [{}]",
+            app.graph_level.label(),
             if app.show_virtual { "on" } else { "off" }
         )
     } else if app.tab == Tab::Rules {
@@ -152,14 +153,24 @@ fn verdict_color(v: Verdict, rate: f64) -> Color {
 /// The Graph tab: processes around this host, their remote ends outside.
 /// Dots run along each line: outward for upload, inward for download.
 fn draw_conn_graph(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area: Rect) {
-    let g = graph::layout(&graph::groups(c, names, app.show_virtual, app.show_hosts));
+    let g = graph::build(c, names, app.show_virtual, app.show_hosts, app.graph_level);
     app.graph_labels = g.nodes.iter().map(|n| n.label.clone()).collect();
+    app.graph_targets = g.nodes.iter().map(|n| n.target.clone()).collect();
+    // Advance each edge's dots by the time since the last frame.
+    let dt = (app.anim - app.anim_drawn).clamp(0.0, 1.0);
+    app.anim_drawn = app.anim;
+    let edge_key = |e: &graph::Edge| (g.nodes[e.from].label.clone(), g.nodes[e.to].label.clone());
+    let live: std::collections::HashSet<_> = g.edges.iter().map(edge_key).collect();
+    app.graph_motion.retain(|k, _| live.contains(k));
+    for e in &g.edges {
+        app.graph_motion.entry(edge_key(e)).or_default().step(dt, e.traffic.tx, e.traffic.rx);
+    }
+    let motion = &app.graph_motion;
     app.graph_sel = app.graph_sel.min(g.nodes.len().saturating_sub(1));
     let [canvas_area, info] = Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(area);
-    let t = app.anim;
     let sel = app.graph_sel;
     let canvas = Canvas::default()
-        .block(Block::default().borders(Borders::ALL).title(" connections "))
+        .block(Block::default().borders(Borders::ALL).title(format!(" connections by {} ", app.graph_level.label())))
         .marker(Marker::Braille)
         .x_bounds([-1.3, 1.3])
         .y_bounds([-1.15, 1.15])
@@ -175,8 +186,11 @@ fn draw_conn_graph(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, a
             for e in &g.edges {
                 let (a, b) = (&g.nodes[e.from], &g.nodes[e.to]);
                 let at = |s: f64| (a.x + (b.x - a.x) * s, a.y + (b.y - a.y) * s);
-                let up: Vec<(f64, f64)> = graph::dots(e.traffic.tx, t).into_iter().map(at).collect();
-                let down: Vec<(f64, f64)> = graph::dots(e.traffic.rx, t).into_iter().map(|s| at(1.0 - s)).collect();
+                let m = motion.get(&edge_key(e)).copied().unwrap_or_default();
+                let up: Vec<(f64, f64)> =
+                    graph::dots_at(m.phase_up, graph::dot_count(m.up)).into_iter().map(at).collect();
+                let down: Vec<(f64, f64)> =
+                    graph::dots_at(m.phase_down, graph::dot_count(m.down)).into_iter().map(|s| at(1.0 - s)).collect();
                 ctx.draw(&Points { coords: &up, color: Color::LightMagenta });
                 ctx.draw(&Points { coords: &down, color: Color::LightCyan });
             }
@@ -847,6 +861,12 @@ mod tests {
         assert!(text.contains("1.1.1.1"), "{text}");
         assert!(text.contains("6 Graph"));
         assert_eq!(app.graph_labels, vec!["this host", "(forwarded)", "1.1.1.1"]);
+        assert_eq!(app.graph_targets[2], graph::Target::Addr("1.1.1.1".parse().unwrap()), "b blocks the address");
+        assert_eq!(app.graph_targets[1], graph::Target::None, "no exe known");
+        // z: containers; the host's own processes share one node.
+        app.on_key(crate::app::Key::Char('z'));
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &Rules::default())).unwrap();
+        assert_eq!(app.graph_labels[1], "host processes");
     }
 
 }
