@@ -433,7 +433,11 @@ Small, independent features after the firewall core:
   UDP socket of the host's hash table once per namespace. `sock_diag` per
   namespace (reader thread `setns` into each) can filter by connection and
   should take a few ms. Needed in ask mode with containers that open many
-  connections.
+  connections. Measured 2026-11-21 (about 30 namespaces): TCP tables 409 ms
+  per read, owner fd scan 27-57 ms, namespace scan 14-17 ms, UDP tables
+  under 5 ms. The kernel walks the whole TCP hash table for each namespace;
+  `sock_diag` walks the same buckets and needs `setns` (`CAP_SYS_ADMIN`).
+  Kept: reads every 10 s, every 1 s for a question.
 - **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.

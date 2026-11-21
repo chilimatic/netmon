@@ -209,18 +209,36 @@ impl SocketTable {
 /// namespace), so callers read them only when needed. `cache` is kept apart
 /// from the host's: the /proc/*/fd scan behind it covers container
 /// processes too.
-pub fn read_containers(cache: &mut OwnerCache, namespaces: &[crate::netns::Netns]) -> Vec<ContainerTable> {
+/// Time spent per part of a container read, for the profile.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadTimes {
+    pub tcp: std::time::Duration,
+    pub udp: std::time::Duration,
+    pub owners: std::time::Duration,
+}
+
+pub fn read_containers(cache: &mut OwnerCache, namespaces: &[crate::netns::Netns], times: &mut ReadTimes) -> Vec<ContainerTable> {
     let foreign: Vec<(String, Vec<RawSock>)> = namespaces
         .iter()
         .filter_map(|n| {
             let p = procfs::process::Process::new(n.pid as i32).ok()?;
-            Some((n.name.clone(), read_sockets(Some(&p))))
+            // Each read walks the host's whole hash table of that
+            // protocol, empty buckets included.
+            let t = std::time::Instant::now();
+            let mut socks = read_tables(Some(&p), true, false);
+            times.tcp += t.elapsed();
+            let t = std::time::Instant::now();
+            socks.extend(read_tables(Some(&p), false, true));
+            times.udp += t.elapsed();
+            Some((n.name.clone(), socks))
         })
         .collect();
     let inodes: HashSet<u64> = foreign.iter().flat_map(|(_, s)| s).map(|s| s.inode).collect();
     // Only processes in these namespaces can own their sockets.
     let pids: Vec<u32> = namespaces.iter().flat_map(|n| n.pids.iter().copied()).collect();
+    let t = std::time::Instant::now();
     cache.refresh(&inodes, |pid| Path::new(&format!("/proc/{pid}")).exists(), || read_owners(Some(&pids)));
+    times.owners += t.elapsed();
     foreign.into_iter().map(|(name, socks)| ContainerTable::build(&name, socks, &cache.owners)).collect()
 }
 
@@ -490,10 +508,25 @@ fn tcp_state(s: &TcpState) -> &'static str {
 /// Sockets of netmon's network namespace (`None`) or of the namespace
 /// process `p` is in.
 fn read_sockets(p: Option<&procfs::process::Process>) -> Vec<RawSock> {
+    read_tables(p, true, true)
+}
+
+/// The TCP and/or UDP tables of netmon's namespace (`None`) or of the
+/// namespace of process `p`.
+fn read_tables(p: Option<&procfs::process::Process>, want_tcp: bool, want_udp: bool) -> Vec<RawSock> {
+    fn skip<T>() -> procfs::ProcResult<Vec<T>> {
+        Err(procfs::ProcError::NotFound(None))
+    }
     let mut out = Vec::new();
-    let (tcp, tcp6, udp, udp6) = match p {
-        Some(p) => (p.tcp(), p.tcp6(), p.udp(), p.udp6()),
-        None => (procfs::net::tcp(), procfs::net::tcp6(), procfs::net::udp(), procfs::net::udp6()),
+    let (tcp, tcp6) = match (p, want_tcp) {
+        (_, false) => (skip(), skip()),
+        (Some(p), true) => (p.tcp(), p.tcp6()),
+        (None, true) => (procfs::net::tcp(), procfs::net::tcp6()),
+    };
+    let (udp, udp6) = match (p, want_udp) {
+        (_, false) => (skip(), skip()),
+        (Some(p), true) => (p.udp(), p.udp6()),
+        (None, true) => (procfs::net::udp(), procfs::net::udp6()),
     };
     for tcp in [tcp, tcp6].into_iter().flatten() {
         out.extend(tcp.into_iter().map(|e| RawSock {

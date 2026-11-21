@@ -13,7 +13,9 @@ pub(crate) fn container_of(tables: &[procmap::ContainerTable], key: &netmon_comm
 /// Reads container socket tables in a thread: one read takes 150-250 ms on
 /// a host with 30 namespaces, too long for the UI loop. Each `()` sent asks
 /// for one read; the tables come back on the other channel.
-pub(crate) type ContainerResult = (Vec<procmap::ContainerTable>, Duration);
+/// The tables, the whole read time, and its parts (namespace scan, TCP,
+/// UDP, owner scan) for the profile.
+pub(crate) type ContainerResult = (Vec<procmap::ContainerTable>, Duration, [(&'static str, Duration); 4]);
 
 pub(crate) fn container_reader() -> (std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<ContainerResult>) {
     let (req_tx, req_rx) = std::sync::mpsc::sync_channel::<()>(1);
@@ -25,12 +27,21 @@ pub(crate) fn container_reader() -> (std::sync::mpsc::SyncSender<()>, std::sync:
         // Ends when the Monitor (the sender) is dropped.
         while req_rx.recv().is_ok() {
             let start = Instant::now();
+            let mut scan_time = Duration::ZERO;
             if scanned.is_none_or(|t| t.elapsed() >= NETNS_RESCAN) {
                 namespaces = netns::scan();
                 scanned = Some(Instant::now());
+                scan_time = start.elapsed();
             }
-            let tables = procmap::read_containers(&mut owners, &namespaces);
-            if res_tx.send((tables, start.elapsed())).is_err() {
+            let mut t = procmap::ReadTimes::default();
+            let tables = procmap::read_containers(&mut owners, &namespaces, &mut t);
+            let parts = [
+                ("  containers: namespace scan", scan_time),
+                ("  containers: TCP tables", t.tcp),
+                ("  containers: UDP tables", t.udp),
+                ("  containers: owner fd scan", t.owners),
+            ];
+            if res_tx.send((tables, start.elapsed(), parts)).is_err() {
                 break;
             }
         }
@@ -43,9 +54,12 @@ impl<K: Kernel> Monitor<K> {
     /// older than `max_age`, and takes any tables it has finished.
     /// Takes the tables the reader has finished.
     pub(crate) fn take_containers(&mut self) {
-        while let Ok((tables, took)) = self.containers_rx.try_recv() {
+        while let Ok((tables, took, parts)) = self.containers_rx.try_recv() {
             self.containers = tables;
             self.prof.add_time("container tables (thread)", took);
+            for (name, d) in parts {
+                self.prof.add_time(name, d);
+            }
         }
     }
 

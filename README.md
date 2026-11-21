@@ -1031,7 +1031,11 @@ A container connection has no socket on the host. netmon finds the
 container processes through `/proc/*/ns/net` and reads their socket tables
 from `/proc/<pid>/net/*`. A read takes about 400 ms on a host with many
 containers, so a background thread does it, and only when a new connection
-has no owner.
+has no owner, at most every 10 s (every 1 s for a question). Almost all of
+the time goes to the TCP tables: each read makes the kernel walk the
+host's whole TCP hash table, empty buckets included, about 14 ms per
+namespace. Netlink `sock_diag` walks the same buckets, so it would not be
+much faster. `NETMON_PROFILE=1` shows the parts of each read.
 
 ### Count each byte once
 
@@ -1045,8 +1049,7 @@ The monitor reads `/proc` as little as possible. It reads `/proc/*/fd` only
 for sockets that the kernel hooks did not name, and at most every 2 s. The
 exe scan runs every 10 ticks while the tracepoints run. On a host with 3630
 processes and many containers in ask mode, `netmond` uses about 16 % of one
-core. Most of this is container table reads. `docs/ROADMAP.md` has the plan
-to read them with netlink `sock_diag`.
+core. Most of this is container table reads (see above).
 
 ## Limits
 
