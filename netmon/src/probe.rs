@@ -24,7 +24,7 @@ use netmon_common::{
     AskEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, DIR_OUT, CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CaptureConfig, ConnKey,
     ConnState, FlowKey, FlowStats, GuardKey,
     ListenKey, ListenOwner, MAX_CAPTURE_FLOWS, MAX_EXE_PATH, MAX_FLOWS, MAX_RULES, NameEvent, PacketEvent, RuleEntry, SockOwner,
-    TraceCfg,
+    TraceCfg, ExeInode,
 };
 
 use crate::rules::addr_bytes;
@@ -76,6 +76,9 @@ pub struct Probe {
     guard: HashMap<MapData, GuardKey, u8>,
     rule_hits: PerCpuArray<MapData, u64>,
     exe_id_map: HashMap<MapData, [u8; MAX_EXE_PATH], u32>,
+    exe_inodes: HashMap<MapData, ExeInode, u32>,
+    /// File of each exe as last written to EXE_INODES.
+    inode_of: BTreeMap<String, ExeInode>,
     tgid_exe: HashMap<MapData, u32, u32>,
     /// Exe ids as last written to EXE_IDS.
     exe_ids: BTreeMap<String, u32>,
@@ -193,6 +196,7 @@ impl Probe {
         let guard = HashMap::try_from(take("GUARD")?)?;
         let rule_hits = PerCpuArray::try_from(take("RULE_HITS")?)?;
         let exe_id_map = HashMap::try_from(take("EXE_IDS")?)?;
+        let exe_inodes = HashMap::try_from(take("EXE_INODES")?)?;
         let tgid_exe = HashMap::try_from(take("TGID_EXE")?)?;
         let trace_cfg = Array::try_from(take("TRACE_CFG")?)?;
         let mut hook_errors = Vec::new();
@@ -232,6 +236,8 @@ impl Probe {
             guard,
             rule_hits,
             exe_id_map,
+            exe_inodes,
+            inode_of: BTreeMap::new(),
             tgid_exe,
             exe_ids: BTreeMap::new(),
             cpus,
@@ -420,6 +426,7 @@ fn event_format(category: &str, event: &str) -> std::io::Result<String> {
 /// Without them exe rules still work through the /proc scan, but a new
 /// process can connect before the next refresh.
 fn attach_exec_tracking(ebpf: &mut Ebpf, mut cfg_map: Array<MapData, TraceCfg>, pins: Option<&Path>) -> Vec<String> {
+    let mut warnings = Vec::new();
     let r = (|| -> anyhow::Result<()> {
         let exec = event_format("sched", "sched_process_exec").context("read sched_process_exec format")?;
         let task = event_format("task", "task_newtask").context("read task_newtask format")?;
@@ -427,7 +434,10 @@ fn attach_exec_tracking(ebpf: &mut Ebpf, mut cfg_map: Array<MapData, TraceCfg>, 
             exec_filename: field_offset(&exec, "filename").context("no filename field in sched_process_exec")?,
             newtask_pid: field_offset(&task, "pid").context("no pid field in task_newtask")?,
             newtask_flags: field_offset(&task, "clone_flags").context("no clone_flags field in task_newtask")?,
-            _pad: 0,
+            ..inode_offsets().unwrap_or_else(|e| {
+                warnings.push(format!("exe rules match the started path only, not the file: {e}"));
+                TraceCfg::default()
+            })
         };
         cfg_map.set(0, cfg, 0)?;
         for (category, name) in [("sched", "sched_process_exec"), ("task", "task_newtask"), ("sched", "sched_process_exit")] {
@@ -441,9 +451,55 @@ fn attach_exec_tracking(ebpf: &mut Ebpf, mut cfg_map: Array<MapData, TraceCfg>, 
         Ok(())
     })();
     match r {
-        Ok(()) => Vec::new(),
+        Ok(()) => warnings,
         Err(e) => vec![format!("exec tracking off (exe blocks act at the next refresh): {e:#}")],
     }
+}
+
+/// Offsets for current->mm->exe_file->f_inode->{i_ino, i_sb->s_dev}, from
+/// the kernel's BTF.
+fn inode_offsets() -> Result<TraceCfg, String> {
+    let btf = crate::btf::Btf::from_sys_fs()?;
+    let off = |s: &str, m: &str| btf.offset(s, m).ok_or_else(|| format!("no {s}.{m} in kernel BTF"));
+    Ok(TraceCfg {
+        inode_ok: 1,
+        task_mm: off("task_struct", "mm")?,
+        mm_exe_file: off("mm_struct", "exe_file")?,
+        file_inode: off("file", "f_inode")?,
+        inode_ino: off("inode", "i_ino")?,
+        inode_sb: off("inode", "i_sb")?,
+        sb_dev: off("super_block", "s_dev")?,
+        ..TraceCfg::default()
+    })
+}
+
+/// Device and inode of the file at `path` as the kernel sees them
+/// (`super_block.s_dev`, which differs from `stat` on btrfs subvolumes):
+/// the file is mapped and the mapping read back from /proc/self/maps.
+pub fn exe_inode(path: &str) -> std::io::Result<ExeInode> {
+    use std::os::fd::AsRawFd;
+    let f = File::open(path)?;
+    // SAFETY: a private read-only mapping of one page of an open file.
+    let addr = unsafe { libc::mmap(std::ptr::null_mut(), 1, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) };
+    if addr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    let maps = std::fs::read_to_string("/proc/self/maps");
+    // SAFETY: the mapping made above.
+    unsafe { libc::munmap(addr, 1) };
+    let start = format!("{:x}-", addr as usize);
+    let line = maps?.lines().find(|l| l.starts_with(&start)).map(str::to_string);
+    line.as_deref().and_then(parse_maps_line).ok_or_else(|| std::io::Error::other("mapping not in /proc/self/maps"))
+}
+
+/// "7f..-7f.. r--p 00000000 00:2a 1234 /usr/bin/x": dev 00:2a, inode 1234.
+fn parse_maps_line(l: &str) -> Option<ExeInode> {
+    let mut f = l.split_whitespace();
+    let dev = f.nth(3)?;
+    let ino = f.next()?.parse().ok()?;
+    let (major, minor) = dev.split_once(':')?;
+    let (major, minor) = (u32::from_str_radix(major, 16).ok()?, u32::from_str_radix(minor, 16).ok()?);
+    Some(ExeInode { dev: major << 20 | minor, _pad: 0, ino })
 }
 
 fn exe_key(path: &str) -> anyhow::Result<[u8; MAX_EXE_PATH]> {
@@ -513,6 +569,11 @@ pub trait Kernel {
     /// not fit.
     fn seed(&mut self, _conns: &[(ConnKey, u8, u32)], _listeners: &[(ListenKey, SockOwner)]) -> usize {
         0
+    }
+    /// Reads the file (device, inode) of each exe that rules name again: a
+    /// package update replaces the file. Returns an error message.
+    fn refresh_exe_inodes(&mut self) -> Option<String> {
+        None
     }
 }
 
@@ -690,6 +751,7 @@ impl Kernel for Probe {
             }
         }
         self.exe_ids = exe_ids.clone();
+        let _ = self.refresh_exe_inodes();
         Ok(())
     }
 
@@ -717,6 +779,36 @@ impl Kernel for Probe {
         // A full map leaves the process unmarked: its exe rules do not
         // match. The caller reports it.
         pids.iter().filter(|pid| self.tgid_exe.insert(*pid, exe_id, 0).is_err()).count()
+    }
+
+    fn refresh_exe_inodes(&mut self) -> Option<String> {
+        let mut want = BTreeMap::new();
+        let mut errors = Vec::new();
+        for path in self.exe_ids.keys() {
+            match exe_inode(path) {
+                Ok(k) => {
+                    want.insert(path.clone(), k);
+                }
+                // A missing exe matches by path only, as before.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => errors.push(format!("{path}: {e}")),
+            }
+        }
+        for (path, k) in &self.inode_of {
+            if want.get(path) != Some(k) {
+                let _ = self.exe_inodes.remove(k);
+            }
+        }
+        for (path, k) in &want {
+            if let Some(id) = self.exe_ids.get(path)
+                && self.inode_of.get(path) != Some(k)
+                && let Err(e) = self.exe_inodes.insert(k, *id, 0)
+            {
+                errors.push(format!("{path}: {e}"));
+            }
+        }
+        self.inode_of = want;
+        (!errors.is_empty()).then(|| format!("exe files not tracked: {}", errors.join("; ")))
     }
 
     fn seed(&mut self, conns: &[(ConnKey, u8, u32)], listeners: &[(ListenKey, SockOwner)]) -> usize {
@@ -756,6 +848,17 @@ fn is_exists(e: &aya::maps::MapError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_line_gives_kernel_dev_and_inode() {
+        let k = parse_maps_line("7f00-7f01 r--p 00000000 00:2a 1234   /usr/bin/x").unwrap();
+        assert_eq!(k, ExeInode { dev: 0x2a, _pad: 0, ino: 1234 });
+        let k = parse_maps_line("7f00-7f01 r--p 00000000 103:05 99 /x").unwrap();
+        assert_eq!(k.dev, 0x103 << 20 | 5, "MKDEV: major << 20");
+        let a = exe_inode("/proc/self/exe").unwrap();
+        let b = exe_inode(std::env::current_exe().unwrap().to_str().unwrap()).unwrap();
+        assert_eq!(a, b, "a link and the path lead to the same file");
+    }
 
     #[test]
     fn staging_name_has_no_dot() {

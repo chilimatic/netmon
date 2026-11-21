@@ -841,13 +841,14 @@ impl<K: Kernel> Monitor<K> {
         if exes.is_empty() {
             return None;
         }
+        let inode_error = self.probe.refresh_exe_inodes();
         let procs = procfs::process::all_processes().ok()?;
         let running = procs.flatten().filter_map(|p| Some((p.pid as u32, p.exe().ok()?.to_string_lossy().into_owned())));
         let mut lost = 0;
         for (id, pids) in rules::pids_by_exe(running, exes) {
             lost += self.probe.mark_pids(id, &pids);
         }
-        (lost > 0).then(|| format!("exe marks full: exe rules do not apply to {lost} processes"))
+        (lost > 0).then(|| format!("exe marks full: exe rules do not apply to {lost} processes")).or(inode_error)
     }
 
 }

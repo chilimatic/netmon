@@ -3,6 +3,7 @@
 
 mod app;
 mod ask;
+mod btf;
 mod capture;
 mod client;
 mod collector;

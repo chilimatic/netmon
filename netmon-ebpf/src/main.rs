@@ -8,7 +8,7 @@ use aya_ebpf::{
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
         bpf_fib_lookup, bpf_get_current_uid_gid, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_loop,
-        bpf_probe_read_kernel_str_bytes, bpf_skb_load_bytes,
+        bpf_get_current_task, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_skb_load_bytes,
     },
     macros::{cgroup_sock, cgroup_sock_addr, classifier, map, tracepoint},
     maps::{Array, HashMap, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf},
@@ -19,7 +19,7 @@ use netmon_common::{
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
-    CLONE_THREAD, MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
+    CLONE_THREAD, ExeInode, MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
     RuleEntry, SockOwner, TraceCfg, fib_forwarded, is_dhcp, is_loopback, is_unparsed, keep_answer, parse_packet, rule_matches,
     unmap_v4_in_place,
 };
@@ -101,6 +101,11 @@ static GUARD: HashMap<GuardKey, u8> = HashMap::with_max_entries(MAX_GUARD, 0);
 /// Exe paths named by rules (NUL-padded) -> exe id.
 #[map]
 static EXE_IDS: HashMap<[u8; MAX_EXE_PATH], u32> = HashMap::with_max_entries(MAX_RULES, 0);
+
+/// File of each exe that rules name -> exe id. Matches however the exe was
+/// started: relative path, `..`, symlink, execveat.
+#[map]
+static EXE_INODES: HashMap<ExeInode, u32> = HashMap::with_max_entries(MAX_RULES, 0);
 
 /// Processes (tgid) -> exe id, for processes running an exe named by a
 /// rule. Set by the exec and fork tracepoints and by userspace for
@@ -817,6 +822,10 @@ pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
         return 0;
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if let Some(id) = exe_by_inode(cfg) {
+        let _ = TGID_EXE.insert(&tgid, &id, 0);
+        return 0;
+    }
     // __data_loc: low 16 bits offset of the string in the record.
     let Ok(loc) = (unsafe { ctx.read_at::<u32>(cfg.exec_filename as usize) }) else { return 0 };
     let mut path = [0u8; MAX_EXE_PATH];
@@ -833,6 +842,38 @@ pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
         }
     }
     0
+}
+
+/// Exe id of the file the current task now runs: current->mm->exe_file,
+/// its inode and the device of its file system. The offsets come from BTF
+/// (TraceCfg). The exec tracepoint fires after the new exe_file is set.
+#[inline(never)]
+fn exe_by_inode(cfg: &TraceCfg) -> Option<u32> {
+    if cfg.inode_ok == 0 {
+        return None;
+    }
+    unsafe {
+        let task = bpf_get_current_task() as *const u8;
+        let mm: *const u8 = bpf_probe_read_kernel(task.add(cfg.task_mm as usize) as *const *const u8).ok()?;
+        if mm.is_null() {
+            return None;
+        }
+        let file: *const u8 = bpf_probe_read_kernel(mm.add(cfg.mm_exe_file as usize) as *const *const u8).ok()?;
+        if file.is_null() {
+            return None;
+        }
+        let inode: *const u8 = bpf_probe_read_kernel(file.add(cfg.file_inode as usize) as *const *const u8).ok()?;
+        if inode.is_null() {
+            return None;
+        }
+        let ino: u64 = bpf_probe_read_kernel(inode.add(cfg.inode_ino as usize) as *const u64).ok()?;
+        let sb: *const u8 = bpf_probe_read_kernel(inode.add(cfg.inode_sb as usize) as *const *const u8).ok()?;
+        if sb.is_null() {
+            return None;
+        }
+        let dev: u32 = bpf_probe_read_kernel(sb.add(cfg.sb_dev as usize) as *const u32).ok()?;
+        EXE_INODES.get(&ExeInode { dev, _pad: 0, ino }).copied()
+    }
 }
 
 /// After fork: the new process gets its parent's exe id. Clearing it for

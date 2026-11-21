@@ -448,9 +448,16 @@ How a deny works:
   The uplink egress then decides it as outbound, with the container's
   destination. A container's connection to a service on the host is
   inbound to the host.
-- An exe rule follows `exec` and `fork` through the tracepoints. A program
-  started through a symlink (`python3` to `python3.13`) is found by the
-  `/proc` scan instead, within 10 ticks (10 s by default).
+- An exe rule follows `exec` and `fork` through the tracepoints. At
+  `exec`, the kernel program compares the file that the process runs
+  (device and inode), not the path that started it. Thus a relative path,
+  `..`, a symlink (`python3` to `python3.13`) and `execveat` all match.
+  The offsets of the kernel structs come from the kernel's BTF
+  (`/sys/kernel/btf/vmlinux`). Without BTF, the kernel program compares
+  the path, and the `/proc` scan finds the other cases within 10 ticks
+  (10 s by default).
+- After a package update the exe is a new file. netmon reads the device
+  and inode of each exe again at each `/proc` scan, every 10 ticks.
 
 ### Lockout guard
 
@@ -936,12 +943,17 @@ Limits of the `/proc` sources:
   rules name), the status line says so, and the exe rules do not apply to
   the processes that did not fit.
 - Only TCP and UDP get the default action. ICMP and other protocols pass.
-- An exe started through a symlink or a relative path is marked by the
-  `/proc` scan, so it can connect for up to 10 ticks before its rule
-  applies.
-- Exe rules do not stop an attacker who runs with the same user id: a copy
-  of the binary, `LD_PRELOAD` or ptrace get around them. They control
-  programs that cooperate.
+- Without kernel BTF, an exe started through a symlink or a relative path
+  is marked by the `/proc` scan, so it can connect for up to 10 ticks
+  before its rule applies.
+- Exe rules do not stop an attacker who runs with the same user id. They
+  control programs that cooperate. These get around them:
+  1. A copy of the binary under another path. It is a different file.
+  2. `LD_PRELOAD`, or ptrace of an allowed process: own code runs in a
+     process of the allowed exe.
+  3. A bind mount in a user namespace that puts another file at the path
+     of an allowed exe. The path checks (the `/proc` scan, and the kernel
+     program when the file does not match) take it for the exe.
 
 ## Development
 

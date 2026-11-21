@@ -338,7 +338,28 @@ pub struct TraceCfg {
     pub newtask_pid: u32,
     /// task_newtask: offset of `clone_flags` (the low 32 bits are read).
     pub newtask_flags: u32,
+    /// The offsets below come from the kernel's BTF. 0: unknown, the exec
+    /// program then matches the path only.
+    pub inode_ok: u32,
+    /// task_struct.mm, mm_struct.exe_file, file.f_inode, inode.i_ino,
+    /// inode.i_sb, super_block.s_dev.
+    pub task_mm: u32,
+    pub mm_exe_file: u32,
+    pub file_inode: u32,
+    pub inode_ino: u32,
+    pub inode_sb: u32,
+    pub sb_dev: u32,
+}
+
+/// The file of an exe: kernel device number (`super_block.s_dev`, MAJOR
+/// << 20 | MINOR) and inode number. The same for every path, link or copy
+/// of the name that leads to the file.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ExeInode {
+    pub dev: u32,
     pub _pad: u32,
+    pub ino: u64,
 }
 
 /// clone() flag: the new task is a thread of the caller's process.
@@ -512,6 +533,8 @@ unsafe impl aya::Pod for ConnKey {}
 unsafe impl aya::Pod for ConnState {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TraceCfg {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ExeInode {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for GuardKey {}
 #[cfg(feature = "user")]
