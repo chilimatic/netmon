@@ -8,6 +8,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Sparkline, Table, TableState, Tabs,
+        canvas::{Canvas, Line as CanvasLine, Points},
     },
 };
 
@@ -20,6 +21,7 @@ use crate::{
     capture::Capture,
     decode::hexdump,
     collector::{Collector, HISTORY, addr},
+    graph::{self, Kind, Verdict},
     ifaces::Names,
 };
 
@@ -31,7 +33,9 @@ fn rate(v: f64) -> String {
 const GRAPH_HEIGHT: u16 = 10;
 
 pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Option<&Capture>, rules: &Rules) {
-    let graph_height = if app.show_graph && f.area().height >= GRAPH_HEIGHT + 10 { GRAPH_HEIGHT } else { 0 };
+    // The Graph tab needs the height more than the traffic chart.
+    let chart = app.show_graph && app.tab != Tab::Graph;
+    let graph_height = if chart && f.area().height >= GRAPH_HEIGHT + 10 { GRAPH_HEIGHT } else { 0 };
     let [header, graph, tabs, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(graph_height),
@@ -90,6 +94,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         Tab::Processes => draw_procs(f, app, c, names, rules, body),
         Tab::Interfaces => draw_ifaces(f, app, c, names, body),
         Tab::Capture => draw_capture(f, cap, names, body),
+        Tab::Graph => draw_conn_graph(f, app, c, names, body),
     }
 
     let sort = match app.sort {
@@ -100,9 +105,14 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     let footer_text = if app.editing_filter {
         format!(" filter: {}█   (Enter keep, Esc clear)", app.filter)
     } else if app.tab == Tab::Capture {
-        " q quit  ←→/1-5 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
+        " q quit  ←→/1-6 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
+    } else if app.tab == Tab::Graph {
+        format!(
+            " q quit  ←→/1-6 view  ↑↓ select node  Enter its connections  p pause  h names  v veth/bridge [{}]",
+            if app.show_virtual { "on" } else { "off" }
+        )
     } else if app.tab == Tab::Rules {
-        " q quit  ←→/1-5 view  ↑↓ select  d remove rule  s save to rules file   tmp rules end when the monitor stops".to_string()
+        " q quit  ←→/1-6 view  ↑↓ select  d remove rule  s save to rules file   tmp rules end when the monitor stops".to_string()
     } else {
         let block = match app.tab {
             Tab::Connections => "  b/B block ip/port",
@@ -110,7 +120,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             _ => "",
         };
         format!(
-            " q quit  ←→/1-5 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  v veth/bridge [{}]  p pause  g graph",
+            " q quit  ←→/1-6 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  v veth/bridge [{}]  p pause  g graph",
             app.filter,
             if app.show_virtual { "on" } else { "off" }
         )
@@ -121,6 +131,79 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     {
         draw_ask(f, p, *more, &app.status);
     }
+}
+
+/// Color of an edge by the kernel's verdict. Idle edges are gray.
+fn verdict_color(v: Verdict, rate: f64) -> Color {
+    match v {
+        Verdict::Deny => Color::Red,
+        Verdict::Ask => Color::Yellow,
+        _ if rate < 1.0 => Color::DarkGray,
+        Verdict::Allow => Color::Green,
+        Verdict::None => Color::Blue,
+    }
+}
+
+/// The Graph tab: processes around this host, their remote ends outside.
+/// Dots run along each line: outward for upload, inward for download.
+fn draw_conn_graph(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, area: Rect) {
+    let g = graph::layout(&graph::groups(c, names, app.show_virtual, app.show_hosts));
+    app.graph_labels = g.nodes.iter().map(|n| n.label.clone()).collect();
+    app.graph_sel = app.graph_sel.min(g.nodes.len().saturating_sub(1));
+    let [canvas_area, info] = Layout::vertical([Constraint::Min(5), Constraint::Length(1)]).areas(area);
+    let t = app.anim;
+    let sel = app.graph_sel;
+    let canvas = Canvas::default()
+        .block(Block::default().borders(Borders::ALL).title(" connections "))
+        .marker(Marker::Braille)
+        .x_bounds([-1.3, 1.3])
+        .y_bounds([-1.15, 1.15])
+        .paint(|ctx| {
+            for e in &g.edges {
+                let (a, b) = (&g.nodes[e.from], &g.nodes[e.to]);
+                let color = verdict_color(e.traffic.verdict, e.traffic.tx + e.traffic.rx);
+                ctx.draw(&CanvasLine { x1: a.x, y1: a.y, x2: b.x, y2: b.y, color });
+                // Process to host, thin: every process belongs to this host.
+                ctx.draw(&CanvasLine { x1: 0.0, y1: 0.0, x2: a.x, y2: a.y, color: Color::DarkGray });
+            }
+            ctx.layer();
+            for e in &g.edges {
+                let (a, b) = (&g.nodes[e.from], &g.nodes[e.to]);
+                let at = |s: f64| (a.x + (b.x - a.x) * s, a.y + (b.y - a.y) * s);
+                let up: Vec<(f64, f64)> = graph::dots(e.traffic.tx, t).into_iter().map(at).collect();
+                let down: Vec<(f64, f64)> = graph::dots(e.traffic.rx, t).into_iter().map(|s| at(1.0 - s)).collect();
+                ctx.draw(&Points { coords: &up, color: Color::LightMagenta });
+                ctx.draw(&Points { coords: &down, color: Color::LightCyan });
+            }
+            ctx.layer();
+            for (i, n) in g.nodes.iter().enumerate() {
+                let mut label: String = n.label.chars().take(22).collect();
+                if n.label.chars().count() > 22 {
+                    label.push('…');
+                }
+                let style = match n.kind {
+                    _ if i == sel => Style::new().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Kind::Host => Style::new().add_modifier(Modifier::BOLD),
+                    Kind::Process => Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Kind::Remote => Style::new().fg(Color::Gray),
+                    Kind::More => Style::new().fg(Color::DarkGray),
+                };
+                // Centered on the node; labels on the left half end at it.
+                let w = label.chars().count() as f64 * 2.6 / f64::from(canvas_area.width.max(1));
+                let x = if n.x < -0.05 { n.x - w } else if n.x > 0.05 { n.x } else { n.x - w / 2.0 };
+                ctx.print(x, n.y, Line::styled(label, style));
+            }
+        });
+    f.render_widget(canvas, canvas_area);
+    let text = match g.nodes.get(sel) {
+        Some(n) => {
+            let a = &n.traffic;
+            let hidden = if g.hidden > 0 { format!("   {} quiet processes not shown", g.hidden) } else { String::new() };
+            format!(" {}   ↑ {}  ↓ {}   {} connections{hidden}", n.label, rate(a.tx), rate(a.rx), a.conns)
+        }
+        None => " no connections".into(),
+    };
+    f.render_widget(Paragraph::new(text).style(Style::new().add_modifier(Modifier::BOLD)), info);
 }
 
 /// The oldest unanswered question, over everything.
@@ -701,5 +784,25 @@ mod tests {
         println!("{s}");
         assert!(s.contains("deny") && s.contains("host 1.1.1.1") && s.contains("42"));
     }
+
+    #[test]
+    fn graph_tab_draws_nodes_and_labels() {
+        let mut c = Collector::new(30);
+        let mut k = FlowKey { family: 4, proto: 6, local_port: 40000, remote_port: 443, ifindex: 2, ..Default::default() };
+        k.local_addr[..4].copy_from_slice(&[10, 0, 0, 2]);
+        k.remote_addr[..4].copy_from_slice(&[1, 1, 1, 1]);
+        c.ingest([(k, FlowStats { tx_bytes: 0, ..Default::default() })], 1.0);
+        c.ingest([(k, FlowStats { tx_bytes: 50_000, rx_bytes: 900_000, ..Default::default() })], 1.0);
+        let mut app = App { tab: Tab::Graph, anim: 1.3, ..App::default() };
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &Rules::default())).unwrap();
+        let buf = term.backend().buffer();
+        let text: String = (0..40).map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n").collect();
+        assert!(text.contains("this host"), "{text}");
+        assert!(text.contains("1.1.1.1"), "{text}");
+        assert!(text.contains("6 Graph"));
+        assert_eq!(app.graph_labels, vec!["this host", "?", "1.1.1.1"]);
+    }
+
 }
 

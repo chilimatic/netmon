@@ -244,12 +244,12 @@ that can connect, default `netmon`).
  │─────────────────────────────── 120 samples ────────────────────────────│
  │ ↑ upload (magenta) below the zero line                                 │
  └────────────────────────────────────────────────────────────────────────┘
-  1 Connections   2 Processes   3 Interfaces   4 Capture   5 Rules              3
+  1 Connections   2 Processes   3 Interfaces   4 Capture   5 Rules   6 Graph    3
  Process      PID   Proto Local            Remote             Iface  State ...  4
  firefox      4242  tcp   10.0.0.2:51234   example.com:443    enp5s0 ESTAB
  ...
  93.184.215.14:443 (name from tls)   exe /usr/lib/firefox/firefox   ...         5
- q quit  ←→/1-5 view  Enter capture  b/B block ip/port  r/t/n sort ...         6
+ q quit  ←→/1-6 view  Enter capture  b/B block ip/port  r/t/n sort ...         6
 ```
 
 1. Header. It shows the total upload and download rate of the physical
@@ -258,8 +258,8 @@ that can connect, default `netmon`).
    action), `[PAUSED]`, the capture state, and the last status message.
 2. Traffic graph. It shows the total rate of the last 120 samples. Each
    half has its own scale. `g` hides it. A terminal with less than 20 lines
-   does not show it.
-3. Tabs. `←` and `→`, `Tab`, or `1` to `5` select a tab.
+   and the Graph tab do not show it.
+3. Tabs. `←` and `→`, `Tab`, or `1` to `6` select a tab.
 4. The table of the tab. `↑` and `↓` select a row. The selection stays on
    the same row when the order changes.
 5. Detail line (Connections tab only). The section below explains it.
@@ -271,7 +271,7 @@ that can connect, default `netmon`).
 | Key | Where | Action |
 |---|---|---|
 | `q`, `Ctrl-C` | everywhere | Quit |
-| `←` `→` `Tab` `1`-`5` | everywhere | Select a tab |
+| `←` `→` `Tab` `1`-`6` | everywhere | Select a tab |
 | `↑` `↓` `PgUp` `PgDn` `Home` | tables | Select a row |
 | `/` | tables | Type a filter. `Enter` keeps it, `Esc` clears it. |
 | `Esc` | tables | Clear the filter (never quits) |
@@ -287,6 +287,8 @@ that can connect, default `netmon`).
 | `d` | Rules | Remove the selected rule |
 | `s` | Rules | Save all rules to the rules file |
 | `s` `c` `x` `f` `End` | Capture | Save `.pcap`, clear, stop, follow new packets |
+| `↑` `↓` | Graph | Select a node |
+| `Enter` | Graph | Show the Connections tab, filtered to the selected node |
 | `a` `A` `d` `D` `o` `x` | question window | Answer a question (see [Ask mode](#ask-mode)) |
 | `Esc` | question window | Put the questions aside: the tab gets its keys back |
 | `?` | everywhere | Show the questions again |
@@ -357,6 +359,39 @@ The box under the table shows the history of the selected interface.
 ### Capture tab
 
 The section [Packet capture](#packet-capture) explains it.
+
+### Graph tab
+
+An animated map of the connections:
+
+```
+                 93.184.1.2      93.184.1.1      93.184.1.0
+                          ⠑⠤⣀        ⡇        ⣀⠤⠊
+       93.184.2.0 ⠒⠤⣀           ⠉⠒ curl ⠒⠉
+                      ssh ⠤⠤⠤⠤⠤ this host ⠤⠤⠤⠤ dockerd ⠤⠤ 93.184.4.4
+       93.184.3.0 ⠤⠤⠤ spotify           firefox ⠤⠤⠤ 93.184.0.1
+```
+
+- This host is in the middle. The processes (and containers) are on a ring
+  around it, in name order. Their remote ends are outside, in the sector
+  of their process. The remote end is the hostname if known (`h`), else the
+  address.
+- A process shows at most 4 remote ends. The quieter ones share one
+  `+n more` node. At most 12 processes show, the busiest ones. The line
+  below the graph counts the others.
+- The color of a line is the kernel's verdict: green allow, yellow ask, red
+  deny, blue no rules in force, gray idle. One denied connection makes the
+  line red.
+- Dots move along each line: magenta outward for upload, cyan inward for
+  download. More bytes per second give more and faster dots, on a log
+  scale.
+- `↑` and `↓` select a node. The line below the graph shows its rates and
+  its number of connections. `Enter` opens the Connections tab, filtered to
+  the node.
+- `p` stops the animation. `v` adds the rows of bridges and veths.
+
+The tab redraws every 100 ms while it shows. The other tabs redraw only
+when data changes.
 
 ### Rules tab
 

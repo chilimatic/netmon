@@ -11,7 +11,7 @@ use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::{
-    app::{App, Key, human},
+    app::{App, Key, Tab, human},
     client::Client,
     engine::Engine,
     monitor::{self, Monitor},
@@ -158,18 +158,32 @@ fn print_rows(snap: &Snapshot) {
     }
 }
 
+/// Time between two frames of the graph animation.
+const ANIM_FRAME: Duration = Duration::from_millis(100);
+
 fn run_tui(mut backend: Backend, snapshot: Snapshot, interval: Duration, status: String) -> anyhow::Result<()> {
     let mut app = App { interval_secs: interval.as_secs_f64(), status, ..App::default() };
     let mut client = Client::new(snapshot, &mut app);
     let mut terminal = ratatui::init();
+    let mut frame = std::time::Instant::now();
     let result = (|| -> anyhow::Result<()> {
         while !app.quit {
+            // The graph's dots move only while it shows and runs.
+            let now = std::time::Instant::now();
+            if app.tab == Tab::Graph && !app.paused {
+                app.anim += now.duration_since(frame).as_secs_f64();
+            }
+            frame = now;
             terminal.draw(|f| {
                 let s = &client.snap;
                 ui::draw(f, &mut app, &s.collector, &s.names, client.capture.as_ref(), &s.rules)
             })?;
             let was_paused = app.paused;
-            if event::poll(backend.wait()).context("poll terminal events")?
+            let mut wait = backend.wait();
+            if app.tab == Tab::Graph && !app.paused {
+                wait = wait.min(ANIM_FRAME);
+            }
+            if event::poll(wait).context("poll terminal events")?
                 && let Event::Key(k) = event::read()?
                 && k.kind == KeyEventKind::Press
                 && let Some(key) = map_key(k)

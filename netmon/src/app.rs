@@ -17,10 +17,11 @@ pub enum Tab {
     Interfaces,
     Capture,
     Rules,
+    Graph,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::Connections, Tab::Processes, Tab::Interfaces, Tab::Capture, Tab::Rules];
+    pub const ALL: [Tab; 6] = [Tab::Connections, Tab::Processes, Tab::Interfaces, Tab::Capture, Tab::Rules, Tab::Graph];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -29,6 +30,7 @@ impl Tab {
             Tab::Interfaces => "Interfaces",
             Tab::Capture => "Capture",
             Tab::Rules => "Rules",
+            Tab::Graph => "Graph",
         }
     }
 
@@ -155,6 +157,12 @@ pub struct App {
     pub pending: isize,
     pub quit: bool,
     pub status: String,
+    /// Seconds of animation in the Graph tab. Stands still while paused.
+    pub anim: f64,
+    /// Labels of the graph nodes as last drawn, for Enter.
+    pub graph_labels: Vec<String>,
+    /// Selected graph node.
+    pub graph_sel: usize,
 }
 
 impl Default for App {
@@ -176,6 +184,9 @@ impl Default for App {
             pending: 0,
             quit: false,
             status: String::new(),
+            anim: 0.0,
+            graph_labels: Vec::new(),
+            graph_sel: 0,
         }
     }
 }
@@ -292,6 +303,28 @@ impl App {
                 _ => {}
             }
         }
+        if self.tab == Tab::Graph {
+            let n = self.graph_labels.len().max(1);
+            match key {
+                Key::Up | Key::Char('k') => {
+                    self.graph_sel = (self.graph_sel + n - 1) % n;
+                    return None;
+                }
+                Key::Down | Key::Char('j') => {
+                    self.graph_sel = (self.graph_sel + 1) % n;
+                    return None;
+                }
+                // The Connections tab, filtered to the selected node.
+                Key::Enter => {
+                    if let Some(l) = self.graph_labels.get(self.graph_sel).filter(|_| self.graph_sel > 0) {
+                        self.filter = l.clone();
+                        self.set_tab(Tab::Connections);
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+        }
         match key {
             Key::Char('q') => self.quit = true,
             // Esc never quits: it only clears an active filter.
@@ -306,6 +339,7 @@ impl App {
             Key::Char('3') => self.set_tab(Tab::Interfaces),
             Key::Char('4') => self.set_tab(Tab::Capture),
             Key::Char('5') => self.set_tab(Tab::Rules),
+            Key::Char('6') => self.set_tab(Tab::Graph),
             Key::Char('b') if self.tab == Tab::Connections => return Some(Action::ToggleBlockRemote),
             Key::Char('B') if self.tab == Tab::Connections => return Some(Action::ToggleBlockPort),
             Key::Char('b') if self.tab == Tab::Processes => return Some(Action::ToggleBlockProcess),
@@ -451,7 +485,7 @@ impl App {
     }
 }
 
-fn owner_cols(f: &Flow) -> (String, String) {
+pub(crate) fn owner_cols(f: &Flow) -> (String, String) {
     match &f.owner {
         Some(Owner { container: Some(c), comm, pid, .. }) => (format!("container:{c}/{comm}"), pid.to_string()),
         Some(o) => (o.comm.clone(), o.pid.to_string()),
@@ -573,7 +607,7 @@ mod tests {
     fn arrows_switch_tabs_and_esc_does_not_quit() {
         let mut app = App::default();
         app.on_key(Key::Left);
-        assert_eq!(app.tab, Tab::Rules, "wraps around");
+        assert_eq!(app.tab, Tab::Graph, "wraps around");
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Connections);
         app.on_key(Key::Right);
@@ -705,7 +739,27 @@ mod tests {
         assert_eq!(app.on_key(Key::Char('b')), None);
         assert_eq!(app.on_key(Key::Enter), None);
         app.on_key(Key::Right);
+        assert_eq!(app.tab, Tab::Graph);
+        app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Connections, "wraps");
+    }
+
+    #[test]
+    fn graph_keys_select_nodes_and_enter_filters_connections() {
+        let mut app = App::default();
+        app.on_key(Key::Char('6'));
+        assert_eq!(app.tab, Tab::Graph);
+        app.graph_labels = vec!["this host".into(), "firefox".into(), "example.com".into()];
+        app.on_key(Key::Enter);
+        assert_eq!(app.tab, Tab::Graph, "the host node filters nothing");
+        app.on_key(Key::Down);
+        app.on_key(Key::Down);
+        app.on_key(Key::Down);
+        assert_eq!(app.graph_sel, 0, "wraps");
+        app.on_key(Key::Up);
+        assert_eq!(app.graph_sel, 2);
+        app.on_key(Key::Enter);
+        assert_eq!((app.tab, app.filter.as_str()), (Tab::Connections, "example.com"));
     }
 }
 

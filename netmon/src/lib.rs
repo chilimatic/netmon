@@ -10,6 +10,7 @@ mod collector;
 mod daemon;
 mod decode;
 mod engine;
+mod graph;
 mod ifaces;
 mod linkwatch;
 mod monitor;

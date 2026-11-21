@@ -211,7 +211,7 @@ impl Client {
                     label: format!("{} {} → {} on {}", r.proto, r.local, r.remote, r.iface),
                 })
             }
-            Tab::Capture | Tab::Rules => Err("select a row in another tab".into()),
+            Tab::Capture | Tab::Rules | Tab::Graph => Err("select a row in another tab".into()),
         }
     }
 }
