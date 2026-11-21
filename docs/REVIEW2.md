@@ -73,10 +73,10 @@ Status column: `open` for all items at the time of writing.
 | # | Sev | Finding | Where | Src | Status |
 |---|-----|---------|-------|-----|--------|
 | U1 | Medium | An open question takes `x`, `d`, arrows and `j`/`k` in every tab: in Capture `x` denies instead of stopping, in Rules `d` makes a deny rule. The key line still shows `x stop` and `d remove rule`. No way to put a question aside. | `netmon/src/app.rs:253-268`; `netmon/src/ui.rs:100-102` | C | fixed (step 2) |
-| U2 | Medium | A capture that fails to start leaves the old capture marked running; a process capture turns itself on again at the next tick. | `netmon/src/monitor.rs:405-420` | C | open |
+| U2 | Medium | A capture that fails to start leaves the old capture marked running; a process capture turns itself on again at the next tick. | `netmon/src/monitor.rs:405-420` | C | fixed (step 10) |
 | U3 | Medium | README says UI blocks are temporary and show `tmp`. In the code, `b`/`B` blocks are not temporary (no `tmp`, `s` saves them). Only `a`/`d` answers are temporary and can never be saved. | `netmon/src/rules.rs:238`; README | C | fixed (step 1) |
 | U4 | Low | README errors: "within 10 s" is 10 ticks; "more headers count with port 0" is proto 60 (B1); the guard "applies to netmond" (G1). `rules.rs` module comment still says a crash removes every rule. | README; `netmon/src/rules.rs:1-3`; `netmon/src/monitor.rs:108` | C, S | fixed (step 1) |
-| U5 | Low | Only the first error of an engine step is shown. `x` with no capture reports "capture stopped". `--interval-ms`/`--expire-secs` are ignored silently with a daemon. A process row is red if any deny rule names its exe, also a port-only one. | `netmon/src/engine.rs:75`; `netmon/src/client.rs:172`; `netmon/src/tui.rs:110`; `netmon/src/rules.rs:329-331` | C | open |
+| U5 | Low | Only the first error of an engine step is shown. `x` with no capture reports "capture stopped". `--interval-ms`/`--expire-secs` are ignored silently with a daemon. A process row is red if any deny rule names its exe, also a port-only one. | `netmon/src/engine.rs:75`; `netmon/src/client.rs:172`; `netmon/src/tui.rs:110`; `netmon/src/rules.rs:329-331` | C | fixed (step 10) |
 | U6 | Low | `monitor.rs` (1477 lines) holds owners, rules, asks, hostnames, capture and containers. | `netmon/src/monitor.rs` | A | open |
 
 ## Test gaps

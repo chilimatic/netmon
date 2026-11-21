@@ -23,13 +23,16 @@ use crate::{
 };
 
 /// Options of the monitor itself: in `netmon` local mode and in `netmond`.
+pub(crate) const DEFAULT_INTERVAL_MS: u64 = 1000;
+pub(crate) const DEFAULT_EXPIRE_SECS: u64 = 30;
+
 #[derive(clap::Args)]
 pub(crate) struct Args {
     /// Refresh interval in milliseconds.
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = DEFAULT_INTERVAL_MS)]
     pub(crate) interval_ms: u64,
     /// Drop flows idle for this many seconds.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_EXPIRE_SECS)]
     pub(crate) expire_secs: u64,
     /// Rules file. Must belong to root and not be writable by group or
     /// others. [default: /etc/netmon/rules.toml, skipped if missing]
@@ -477,15 +480,24 @@ impl<K: Kernel> Monitor<K> {
             .collect()
     }
 
+    /// Starts a capture. The old one ends first. If the new one fails,
+    /// none runs: a process capture must not come back at the next tick.
     pub(crate) fn start_capture(&mut self, target: Target) -> anyhow::Result<()> {
+        if let Some(cap) = self.capture.as_mut() {
+            cap.info.running = false;
+        }
         self.probe.capture_off()?;
         // Packets still queued belong to the old capture.
         self.probe.discard_packets();
         self.packets.clear();
-        match &target {
-            Target::Interface { index, .. } => self.probe.capture_iface(*index)?,
-            Target::Process { pid, .. } => self.probe.capture_flows(&self.process_flows(*pid))?,
-            Target::Connection { key, .. } => self.probe.capture_flows(&HashSet::from([*key]))?,
+        let started = match &target {
+            Target::Interface { index, .. } => self.probe.capture_iface(*index),
+            Target::Process { pid, .. } => self.probe.capture_flows(&self.process_flows(*pid)),
+            Target::Connection { key, .. } => self.probe.capture_flows(&HashSet::from([*key])),
+        };
+        if let Err(e) = started {
+            let _ = self.probe.capture_off();
+            return Err(e);
         }
         self.capture = Some(Capturing {
             info: CaptureInfo { id: self.capture.as_ref().map_or(1, |c| c.info.id + 1), target, running: true, dropped: 0 },
@@ -497,6 +509,9 @@ impl<K: Kernel> Monitor<K> {
 
     /// Stops the capture. Packets already captured still go to the UI.
     pub(crate) fn stop_capture(&mut self) -> String {
+        if !self.capture.as_ref().is_some_and(|c| c.info.running) {
+            return "no capture running".into();
+        }
         let mut msg = String::new();
         if let Err(e) = self.probe.capture_off() {
             msg = format!("stop failed: {e:#}");
@@ -984,6 +999,7 @@ mod tests {
         asks: VecDeque<netmon_common::AskEvent>,
         verdicts: Vec<(netmon_common::ConnKey, u8)>,
         fail_block: bool,
+        fail_capture: bool,
         marked: Vec<(u32, u32)>,
     }
 
@@ -1002,7 +1018,11 @@ mod tests {
             Ok(())
         }
         fn capture_flows(&mut self, keys: &HashSet<netmon_common::FlowKey>) -> anyhow::Result<()> {
+            // A failed update can leave some keys in the kernel map.
             self.mode = Mode::Flows(keys.clone());
+            if self.fail_capture {
+                anyhow::bail!("map full");
+            }
             Ok(())
         }
         fn capture_off(&mut self) -> anyhow::Result<()> {
@@ -1112,6 +1132,7 @@ mod tests {
             asks: VecDeque::new(),
             verdicts: Vec::new(),
             fail_block: false,
+            fail_capture: false,
             marked: Vec::new(),
         };
         let (mut m, _) = Monitor::with_kernel(fake, &args(1000, 30)).unwrap_or_else(|(_, e)| panic!("{e}"));
@@ -1122,6 +1143,24 @@ mod tests {
 
     fn secs(t0: Instant, s: u64) -> Instant {
         t0 + Duration::from_secs(s)
+    }
+
+    #[test]
+    fn a_capture_that_fails_to_start_leaves_none_running() {
+        let (mut m, t0) = monitor();
+        let owner = Some(Owner::new(4242, "curl"));
+        m.probe.flows = vec![(key(50001), tx(10))];
+        m.tick_at(secs(t0, 1));
+        m.collector.flows.get_mut(&key(50001)).unwrap().owner = owner;
+        m.start_capture(Target::Process { pid: 4242, comm: "curl".into() }).unwrap();
+        m.probe.fail_capture = true;
+        assert!(m.start_capture(Target::Connection { key: key(50001), label: "x".into() }).is_err());
+        assert_eq!(m.probe.mode, Mode::Off, "a half-started capture is turned off");
+        assert!(!m.capture.as_ref().unwrap().info.running, "the old capture is not running either");
+        m.probe.fail_capture = false;
+        m.tick_at(secs(t0, 2));
+        assert_eq!(m.probe.mode, Mode::Off, "the old process capture does not come back");
+        assert_eq!(m.stop_capture(), "no capture running");
     }
 
     #[test]

@@ -340,9 +340,17 @@ impl Rules {
         }
     }
 
-    /// Does a deny rule name this exe?
+    /// Does a deny rule block this exe entirely (no host, port or
+    /// protocol in the rule)?
     pub fn denies_exe(&self, exe: &str) -> bool {
-        !exe.is_empty() && self.rules.iter().any(|r| r.action == Action::Deny && r.m.exe.as_deref() == Some(exe))
+        !exe.is_empty()
+            && self.rules.iter().any(|r| {
+                r.action == Action::Deny
+                    && r.m.exe.as_deref() == Some(exe)
+                    && r.m.net.is_none()
+                    && r.m.ports.is_none()
+                    && r.m.proto.is_none()
+            })
     }
 }
 
@@ -558,6 +566,16 @@ mod tests {
         want.extend(out("[fe80::1]:53"));
         assert_eq!(g, want, "resolvers outbound only");
         assert!(guard_endpoints(Some("garbage"), "").is_empty());
+    }
+
+    #[test]
+    fn only_a_whole_exe_block_marks_the_process() {
+        let mut r = Rules::default();
+        let curl = || Match { exe: Some("/usr/bin/curl".into()), ..Match::default() };
+        r.insert(0, Action::Deny, Match { ports: Some((25, 25)), proto: Some(IPPROTO_TCP), ..curl() }, "").unwrap();
+        assert!(!r.denies_exe("/usr/bin/curl"), "port-only rule");
+        r.insert(0, Action::Deny, Match { dir: Some(Dir::Out), ..curl() }, "").unwrap();
+        assert!(r.denies_exe("/usr/bin/curl"));
     }
 
     #[test]

@@ -81,8 +81,8 @@ impl<K: Kernel> Engine<K> {
             errors.extend(self.mon.tick_at(now));
             changed = true;
         }
-        if let Some(e) = errors.into_iter().next() {
-            out.push(ToClient::Status(e));
+        if !errors.is_empty() {
+            out.push(ToClient::Status(errors.join("; ")));
         }
         if changed {
             let t = Instant::now();

@@ -110,6 +110,9 @@ pub fn run() -> anyhow::Result<()> {
     if m.rules.is_some() || m.ask {
         bail!("--rules and --ask set up netmond: give them to netmond, or use --local");
     }
+    if m.interval_ms != monitor::DEFAULT_INTERVAL_MS || m.expire_secs != monitor::DEFAULT_EXPIRE_SECS {
+        bail!("--interval-ms and --expire-secs set up netmond: give them to netmond, or use --local");
+    }
     let (remote, welcome) = Remote::connect(&args.socket)?;
     if let Some(secs) = args.once {
         return print_remote_once(remote, welcome.snapshot, secs);
