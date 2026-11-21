@@ -82,8 +82,11 @@ pub struct Probe {
     failed: HashSet<u32>,
     /// Socket owner hooks that did not load or attach.
     pub hook_errors: Vec<String>,
-    /// Where the links are pinned, if they are (netmond).
+    /// Where the links are pinned, if they are (netmond). Before
+    /// `commit_pins` this is the staging directory.
     pins: Option<PathBuf>,
+    /// The live pin directory that `commit_pins` replaces.
+    pin_target: Option<PathBuf>,
     /// The exec and fork tracepoints run: they keep exe marks current.
     pub exec_tracking: bool,
 }
@@ -103,20 +106,30 @@ fn is_bpffs(dir: &Path) -> bool {
     unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as i64 == BPF_FS_MAGIC }
 }
 
-/// Removes pins left by an earlier run (a crash): their links detach.
-/// Then creates the empty pin directory. None if pins cannot be used.
+/// Where a start pins its links before `commit_pins`: the pins of the
+/// running (or crashed) netmond stay in force until then.
+/// bpffs refuses names with a dot (EPERM, reserved): no "netmon.new".
+fn staging_dir(dir: &Path) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push("-new");
+    dir.with_file_name(name)
+}
+
+/// Creates an empty staging directory for the new pins. It removes a
+/// staging directory of a start that failed. The live pins stay.
 fn prepare_pins(dir: &Path) -> Result<PathBuf, String> {
     let parent = dir.parent().unwrap_or(Path::new("/"));
     if !is_bpffs(parent) {
         return Err(format!("{} is not a BPF file system (mount -t bpf bpf {})", parent.display(), parent.display()));
     }
-    match std::fs::remove_dir_all(dir) {
+    let staging = staging_dir(dir);
+    match std::fs::remove_dir_all(&staging) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("remove old pins {}: {e}", dir.display())),
+        Err(e) => return Err(format!("remove old pins {}: {e}", staging.display())),
     }
-    std::fs::create_dir(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    Ok(dir.to_path_buf())
+    std::fs::create_dir(&staging).map_err(|e| format!("create {}: {e}", staging.display()))?;
+    Ok(staging)
 }
 
 /// Pins a link so it outlives the process. On failure the link is gone
@@ -184,6 +197,7 @@ impl Probe {
             }
             None => None,
         };
+        let pin_target = pins.as_ref().and(pin_dir).map(Path::to_path_buf);
         hook_errors.extend(attach_owner_hooks(&mut ebpf, pins.as_deref()));
         let exec_errors = attach_exec_tracking(&mut ebpf, trace_cfg, pins.as_deref());
         let exec_tracking = exec_errors.is_empty();
@@ -217,12 +231,30 @@ impl Probe {
             failed: HashSet::new(),
             hook_errors,
             pins,
+            pin_target,
             exec_tracking,
         })
     }
 
+    /// Makes the new pins the live ones. The links of the earlier netmond
+    /// detach only now, when the new programs run with their rules: no
+    /// moment without a firewall. Until now both sets run, and a packet
+    /// passes only if both allow it.
+    pub fn commit_pins(&mut self) -> Result<(), String> {
+        let (Some(target), Some(staging)) = (self.pin_target.take(), self.pins.clone()) else { return Ok(()) };
+        match std::fs::remove_dir_all(&target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove old pins {}: {e}", target.display())),
+        }
+        std::fs::rename(&staging, &target).map_err(|e| format!("move {} to {}: {e}", staging.display(), target.display()))?;
+        self.pins = Some(target);
+        Ok(())
+    }
+
     /// Removes the pins: every link detaches when this process ends (at
-    /// once for those it no longer holds). For a clean stop.
+    /// once for those it no longer holds). For a clean stop, or a failed
+    /// start: then only the staging pins go, the live ones stay.
     pub fn unpin(&mut self) {
         if let Some(dir) = self.pins.take() {
             let _ = std::fs::remove_dir_all(dir);
@@ -248,11 +280,16 @@ impl Probe {
             let _ = tc::qdisc_add_clsact(&iface.name);
         }
         for (name, ty) in [("tc_ingress", TcAttachType::Ingress), ("tc_egress", TcAttachType::Egress)] {
+            if needs_clsact() {
+                // A netlink filter of a crashed netmond stays on the
+                // interface with its old rules. Remove it first.
+                let _ = tc::qdisc_detach_program(iface.name.as_str(), ty, name);
+            }
             let prog: &mut SchedClassifier = self.ebpf.program_mut(name).context("program missing")?.try_into()?;
             let id = prog.attach(&iface.name, ty)?;
             // Before tcx (kernel 6.6) the attachment is a netlink filter:
             // no link to pin, but it stays on the interface after a crash
-            // by itself.
+            // by itself. The next start removes it (above).
             if let Some(dir) = &self.pins
                 && !needs_clsact()
             {
@@ -454,6 +491,14 @@ pub trait Kernel {
     /// Marks running processes with the exe id of their exe. Returns how
     /// many did not fit into the map.
     fn mark_pids(&mut self, exe_id: u32, pids: &[u32]) -> usize;
+    /// Writes direction and owner of connections and listeners that existed
+    /// before the start. Connections get an old generation: the kernel
+    /// decides them again, but for the right process and direction.
+    /// Entries the new programs wrote already stay. Returns how many did
+    /// not fit.
+    fn seed(&mut self, _conns: &[(ConnKey, u8, u32)], _listeners: &[(ListenKey, SockOwner)]) -> usize {
+        0
+    }
 }
 
 impl Kernel for Probe {
@@ -658,6 +703,27 @@ impl Kernel for Probe {
         pids.iter().filter(|pid| self.tgid_exe.insert(*pid, exe_id, 0).is_err()).count()
     }
 
+    fn seed(&mut self, conns: &[(ConnKey, u8, u32)], listeners: &[(ListenKey, SockOwner)]) -> usize {
+        /// Insert only a new key: keep what the programs wrote since attach.
+        const BPF_NOEXIST: u64 = 1;
+        let stale = self.generation.wrapping_sub(1);
+        let mut lost = 0;
+        for (key, dir, tgid) in conns {
+            let st = ConnState { generation: stale, dir: *dir, action: 0, exe_known: 0, answered: 0, tgid: *tgid };
+            if let Err(e) = self.conns.insert(key, st, BPF_NOEXIST) {
+                lost += usize::from(!is_exists(&e));
+            }
+        }
+        for (key, owner) in listeners {
+            // Cookie 0: sock_release never removes it. A later bind of
+            // the same address replaces it.
+            if let Err(e) = self.listeners.insert(key, ListenOwner { owner: *owner, cookie: 0 }, BPF_NOEXIST) {
+                lost += usize::from(!is_exists(&e));
+            }
+        }
+        lost
+    }
+
     fn listeners(&self) -> Vec<(u8, SocketAddr, SockOwner)> {
         self.listeners
             .iter()
@@ -667,9 +733,18 @@ impl Kernel for Probe {
     }
 }
 
+fn is_exists(e: &aya::maps::MapError) -> bool {
+    matches!(e, aya::maps::MapError::SyscallError(s) if s.io_error.raw_os_error() == Some(libc::EEXIST))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_name_has_no_dot() {
+        assert_eq!(staging_dir(Path::new(PIN_DIR)), Path::new("/sys/fs/bpf/netmon-new"));
+    }
 
     #[test]
     fn pins_only_on_bpffs() {

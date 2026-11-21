@@ -26,4 +26,5 @@ mod tui;
 mod ui;
 
 pub use daemon::run as run_daemon;
+pub use monitor::RulesFileError;
 pub use tui::run;

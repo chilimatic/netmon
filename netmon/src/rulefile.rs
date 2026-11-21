@@ -282,7 +282,7 @@ fn write_atomic(dir: &Path, path: &Path, text: &str) -> Result<(), String> {
     r.map_err(|e| e.to_string())
 }
 
-fn mask(ip: IpAddr, len: u8) -> IpAddr {
+pub(crate) fn mask(ip: IpAddr, len: u8) -> IpAddr {
     match ip {
         IpAddr::V4(a) => {
             let m = u32::MAX.checked_shl(32 - len as u32).unwrap_or(0);

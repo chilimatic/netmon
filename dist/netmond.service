@@ -20,6 +20,8 @@ ExecStart=/usr/local/bin/netmond
 # leaves them in force; the restart replaces them with the rules file.
 Restart=on-failure
 RestartSec=2
+# 78: the rules file has an error. A restart would fail the same way.
+RestartPreventExitStatus=78
 # netmond loads eBPF programs and reads every process's sockets: it runs
 # as root. It writes only the socket, its pins and /etc/netmon (s in the
 # Rules tab saves there).

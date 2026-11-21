@@ -663,14 +663,30 @@ attached when the process ends, and it keeps its program and maps. Thus if
 - Rules that were not saved also stay until the next start.
 - Counting and hostnames stop, because nothing reads the maps.
 
-Known gap: when `netmond` starts again (also 2 s after a crash), it
-removes the old programs before the new rules are in force. Thus the
-rules survive a crash only until the restart. `docs/REVIEW2.md` (L1)
-describes the fix.
+systemd starts `netmond` again 2 s after a crash (`Restart=on-failure`).
+The start keeps the old rules in force until the new ones are ready:
 
-systemd starts `netmond` again 2 s after a crash (`Restart=on-failure`). At
-start, `netmond` first makes sure that no other `netmond` runs. Then it
-removes the old pins, attaches new programs and loads the rules file.
+1. `netmond` makes sure that no other `netmond` runs.
+2. It attaches the new programs and pins them in
+   `/sys/fs/bpf/netmon-new`. The old programs stay attached. A packet then
+   passes only if the old and the new programs both allow it.
+3. It writes the guard, the rules file and the default action.
+4. It reads the open sockets and their processes from `/proc` once. It
+   writes their direction and owner to the new maps. Thus connections that
+   were open before the start keep their process and their direction, and
+   exe rules still apply to them.
+5. It removes the old pins, and the old programs detach. Then it renames
+   `netmon-new` to `netmon`.
+
+If the rules file has an error, `netmond` stops at step 3 with exit code 78.
+The old pins, and with them the old rules, stay in force. systemd does not
+restart `netmond` on exit code 78 (`RestartPreventExitStatus=78`). Correct
+the file, then start `netmond`. On the first start after a reboot no old
+pins exist: no rule is in force until the file is correct.
+
+On kernels before 6.6, TC programs are netlink filters and cannot be pinned.
+They stay on the interface after a crash by themselves. The next start
+removes them on each interface right before it attaches the new ones.
 
 To remove the rules of a crashed daemon without a new start:
 
@@ -689,7 +705,8 @@ rules end.
 - starts before `network-pre.target`, so the rules apply before the
   network comes up
 - needs `/sys/fs/bpf` (`RequiresMountsFor`)
-- restarts 2 s after a crash
+- restarts 2 s after a crash, but not after exit code 78 (error in the
+  rules file)
 - runs with `NoNewPrivileges`, `ProtectSystem=full`,
   `ProtectHome=read-only` and `PrivateTmp`. `/etc/netmon` stays writable
   for `s` in the Rules tab.

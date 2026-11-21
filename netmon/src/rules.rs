@@ -132,6 +132,12 @@ impl Match {
             if len > max {
                 return Err(format!("prefix /{len} too long for {ip}"));
             }
+            // The rules file refuses host bits: a rule saved with them
+            // would make the next start fail.
+            let masked = crate::rulefile::mask(ip, len);
+            if masked != ip {
+                return Err(format!("{ip}/{len}: host bits set, did you mean {masked}/{len}?"));
+            }
         }
         if let Some((lo, hi)) = self.ports
             && (lo == 0 || lo > hi)

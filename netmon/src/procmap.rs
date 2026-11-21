@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 
-use netmon_common::{IPPROTO_TCP, IPPROTO_UDP};
+use netmon_common::{COMM_LEN, ConnKey, DIR_IN, DIR_OUT, IPPROTO_TCP, IPPROTO_UDP, ListenKey, SockOwner};
 use procfs::{
     net::TcpState,
     process::{FDTarget, all_processes},
@@ -320,6 +320,56 @@ impl OwnerCache {
             }
         }
     }
+}
+
+/// Every socket of netmon's namespace with its owner, from one full
+/// /proc scan. Sockets with no owner found are left out.
+pub fn sockets_with_owners() -> Vec<(RawSock, Owner)> {
+    let owners = read_owners(None);
+    read_sockets(None).into_iter().filter_map(|s| owners.get(&s.inode).map(|o| (s, o.clone()))).collect()
+}
+
+/// A connection key, its direction (DIR_*) and the owner tgid.
+pub type SeedConn = (ConnKey, u8, u32);
+
+/// Kernel entries for sockets that existed before the start, for
+/// `Kernel::seed`: connections with direction and owner tgid, and bound
+/// sockets. A connection is inbound when a bound socket of its protocol
+/// takes its local address and port.
+pub fn seed_entries(socks: &[(RawSock, Owner)]) -> (Vec<SeedConn>, Vec<(ListenKey, SockOwner)>) {
+    let unconnected = |s: &RawSock| if s.proto == IPPROTO_TCP { s.state == "LISTEN" } else { s.remote.port() == 0 };
+    let mut listeners = Vec::new();
+    let mut bound = Vec::new();
+    for (s, o) in socks.iter().filter(|(s, _)| unconnected(s)) {
+        // The kernel keys bound sockets by the raw address, mapped
+        // IPv6 addresses as IPv6.
+        let (family, addr) = crate::rules::addr_bytes(s.local.ip());
+        listeners.push((ListenKey { addr, port: s.local.port(), proto: s.proto, family }, sock_owner(o)));
+        bound.push((s.proto, normalize(s.local)));
+    }
+    let conns = socks
+        .iter()
+        .filter(|(s, _)| !unconnected(s) && s.remote.port() != 0)
+        .map(|(s, o)| {
+            let local = normalize(s.local);
+            let remote = normalize(s.remote);
+            let inbound = bound
+                .iter()
+                .any(|(p, b)| *p == s.proto && b.port() == local.port() && bind_rank(b.ip(), local.ip()).is_some());
+            let (family, remote_addr) = crate::rules::addr_bytes(remote.ip());
+            let key =
+                ConnKey { remote_addr, local_port: local.port(), remote_port: remote.port(), family, proto: s.proto, _pad: [0; 2] };
+            (key, if inbound { DIR_IN } else { DIR_OUT }, o.pid)
+        })
+        .collect();
+    (conns, listeners)
+}
+
+fn sock_owner(o: &Owner) -> SockOwner {
+    let mut comm = [0u8; COMM_LEN];
+    let n = o.comm.len().min(COMM_LEN - 1);
+    comm[..n].copy_from_slice(&o.comm.as_bytes()[..n]);
+    SockOwner { tgid: o.pid, uid: o.uid.unwrap_or(0), cgroup_id: 0, comm }
 }
 
 /// Turns IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) into plain IPv4.
@@ -690,5 +740,30 @@ mod tests {
         assert!(t.lookup_kind(IPPROTO_TCP, sa("10.0.0.2:40000"), sa("1.1.1.1:443")).unwrap().1);
         assert!(!t.lookup_kind(IPPROTO_TCP, sa("10.0.0.2:80"), sa("9.9.9.9:1")).unwrap().1);
     }
-}
 
+    #[test]
+    fn seed_marks_inbound_by_bound_socket_and_keeps_owner() {
+        let sock = |proto, local: &str, remote: &str, state| RawSock { proto, local: sa(local), remote: sa(remote), state, inode: 1 };
+        let owner = |pid| Owner { pid, comm: "a-very-long-process-name".into(), uid: Some(7), ..Default::default() };
+        let socks = vec![
+            (sock(IPPROTO_TCP, "[::]:22", "[::]:0", "LISTEN"), owner(10)),
+            (sock(IPPROTO_TCP, "[::ffff:10.0.0.2]:22", "[::ffff:9.9.9.9]:5000", "ESTAB"), owner(11)),
+            (sock(IPPROTO_TCP, "10.0.0.2:40000", "1.1.1.1:443", "ESTAB"), owner(12)),
+            (sock(IPPROTO_UDP, "0.0.0.0:53", "0.0.0.0:0", ""), owner(13)),
+            (sock(IPPROTO_UDP, "10.0.0.2:41000", "8.8.8.8:53", ""), owner(14)),
+        ];
+        let (conns, listeners) = seed_entries(&socks);
+        assert_eq!(listeners.len(), 2);
+        assert_eq!((listeners[0].0.family, listeners[0].0.port, listeners[0].1.tgid), (6, 22, 10));
+        assert_eq!(listeners[0].1.uid, 7);
+        assert_eq!(&listeners[0].1.comm[..COMM_LEN - 1], &b"a-very-long-pro"[..]);
+        assert_eq!(listeners[0].1.comm[COMM_LEN - 1], 0, "comm ends with NUL");
+        let find = |port| *conns.iter().find(|c| c.0.local_port == port).unwrap();
+        let ssh = find(22);
+        assert_eq!((ssh.1, ssh.2, ssh.0.family, ssh.0.remote_port), (DIR_IN, 11, 4, 5000), "mapped address as IPv4");
+        assert_eq!(&ssh.0.remote_addr[..4], &[9, 9, 9, 9]);
+        assert_eq!((find(40000).1, find(40000).2), (DIR_OUT, 12));
+        assert_eq!((find(41000).1, find(41000).2), (DIR_OUT, 14));
+        assert_eq!(conns.len(), 3);
+    }
+}

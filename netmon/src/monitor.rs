@@ -187,6 +187,19 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) hello_parts: HashMap<netmon_common::FlowKey, Vec<u8>>,
 }
 
+/// The rules file did not load. netmond then does not start: exit code
+/// 78 (EX_CONFIG) tells systemd not to restart it.
+#[derive(Debug)]
+pub struct RulesFileError(pub String);
+
+impl std::fmt::Display for RulesFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}; netmond does not start, the rules of an earlier netmond stay in force", self.0)
+    }
+}
+
+impl std::error::Error for RulesFileError {}
+
 impl Monitor {
     /// With `pin_dir` (netmond) the kernel side stays in force after the
     /// process ends, until `Probe::unpin`.
@@ -213,8 +226,16 @@ impl Monitor {
         if exec_tracking {
             mon.exe_scan_every = EXE_SCAN_EVERY;
         }
-        if let Some(msg) = mon.load_rules_file(args) {
-            errors.push(msg);
+        match mon.load_rules_file(args) {
+            Ok(Some(msg)) => errors.push(msg),
+            Ok(None) => {}
+            // netmond does not start with fewer rules than the file has:
+            // the pins of an earlier netmond stay in force.
+            Err(e) if pin_dir.is_some() => {
+                mon.probe.unpin();
+                return Err(RulesFileError(e).into());
+            }
+            Err(e) => errors.push(e),
         }
         if args.ask {
             let msg = mon.change_rules(|r| {
@@ -224,6 +245,17 @@ impl Monitor {
             if !msg.is_empty() {
                 errors.push(msg);
             }
+        }
+        // Sockets opened before the start have no owner in the new maps.
+        let (conns, listeners) = crate::procmap::seed_entries(&crate::procmap::sockets_with_owners());
+        let lost = mon.probe.seed(&conns, &listeners);
+        if lost > 0 {
+            errors.push(format!("{lost} existing sockets got no owner entry: maps full"));
+        }
+        // Only now, with rules, guard and owners in place, the programs of
+        // an earlier netmond detach.
+        if let Err(e) = mon.probe.commit_pins() {
+            errors.push(format!("rules will not survive a crash: {e}"));
         }
         match LinkWatch::open() {
             Ok(w) => mon.links = Some(w),
@@ -767,13 +799,13 @@ impl<K: Kernel> Monitor<K> {
     /// Appends the rules of the rules file. Returns a status message, or
     /// None when the default file does not exist. Any error loads no rule
     /// of the file.
-    pub(crate) fn load_rules_file(&mut self, args: &Args) -> Option<String> {
+    pub(crate) fn load_rules_file(&mut self, args: &Args) -> Result<Option<String>, String> {
         let path = args.rules.clone().unwrap_or_else(|| rulefile::DEFAULT_PATH.into());
         self.rules_path = path.clone();
-        let fail = |e: String| Some(format!("rules file {}: {e}; no file rules loaded", path.display()));
+        let fail = |e: String| Err(format!("rules file {}: {e}; no file rules loaded", path.display()));
         let text = match rulefile::read(&path, args.rules.is_some()) {
             Ok(Some(t)) => t,
-            Ok(None) => return None,
+            Ok(None) => return Ok(None),
             Err(e) => return fail(e),
         };
         let parsed = match rulefile::parse(&text) {
@@ -796,7 +828,7 @@ impl<K: Kernel> Monitor<K> {
             let d = if rules.default == rules::Action::Allow { String::new() } else { format!(", default {}", rules.default) };
             Ok(format!("{n} rules from {}{d}", path.display()))
         });
-        if failed || msg.starts_with("rule update failed") { fail(msg) } else { Some(msg) }
+        if failed || msg.starts_with("rule update failed") { fail(msg) } else { Ok(Some(msg)) }
     }
 
     /// Marks running processes of exes that rules name. The exec and fork
@@ -1191,13 +1223,13 @@ mod tests {
         let path = dir.join("rules.toml");
         std::fs::write(&path, "[[rule]]\naction = \"deny\"\nport = 25\n").unwrap();
         let a = Args { rules: Some(path.clone()), ..args(1000, 30) };
-        let msg = m.load_rules_file(&a).unwrap();
+        let msg = m.load_rules_file(&a).unwrap_err();
         std::fs::remove_dir_all(&dir).unwrap();
         // Tests run as a normal user, so the file is not root's.
         assert!(msg.contains("not owned by root") && msg.contains("no file rules loaded"), "{msg}");
         assert!(m.rules.rules.is_empty());
         let missing = Args { rules: Some(dir.join("gone.toml")), ..args(1000, 30) };
-        assert!(m.load_rules_file(&missing).unwrap().contains("no file rules loaded"), "explicit path must exist");
+        assert!(m.load_rules_file(&missing).unwrap_err().contains("no file rules loaded"), "explicit path must exist");
     }
 
     #[test]
