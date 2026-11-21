@@ -366,21 +366,26 @@ pub struct ExeInode {
 pub const CLONE_THREAD: u32 = 0x0001_0000;
 
 /// A remote endpoint that is never blocked (SSH session, DNS resolver),
-/// or, with family 0, a local TCP port that is never blocked (sshd).
+/// or, with family 0, a local TCP port that is never blocked (sshd). Only
+/// for its protocol, and only in direction `dir` (DIR_*), or in both with
+/// 0. A resolver is guarded outbound only: a spoofed packet from its
+/// address and port 53 must not pass every inbound rule.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GuardKey {
     pub addr: [u8; 16],
     pub port: u16,
     pub family: u8,
-    pub _pad: u8,
+    pub proto: u8,
+    pub dir: u8,
+    pub _pad: [u8; 3],
 }
 
 impl GuardKey {
-    /// The key for a guarded local TCP port.
+    /// The key for a guarded local TCP port (both directions).
     #[inline(always)]
     pub fn local_tcp(port: u16) -> Self {
-        GuardKey { addr: [0; 16], port, family: 0, _pad: IPPROTO_TCP }
+        GuardKey { addr: [0; 16], port, family: 0, proto: IPPROTO_TCP, dir: 0, _pad: [0; 3] }
     }
 }
 

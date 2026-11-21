@@ -228,7 +228,7 @@ fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
         return ACTION_ALLOW;
     }
     let mut scan = Scan {
-        guard: GuardKey { addr: c.remote_addr, port: c.remote_port, family: c.family, _pad: 0 },
+        guard: GuardKey { addr: c.remote_addr, port: c.remote_port, family: c.family, proto: c.proto, dir: 0, _pad: [0; 3] },
         exe: 0,
         base: half * MAX_RULES,
         count: if count > MAX_RULES { MAX_RULES } else { count },
@@ -237,6 +237,11 @@ fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
         action: 0,
         _pad: 0,
     };
+    // Guarded in both directions, or in this one.
+    if unsafe { GUARD.get(&scan.guard) }.is_some() {
+        return ACTION_ALLOW;
+    }
+    scan.guard.dir = dir;
     if unsafe { GUARD.get(&scan.guard) }.is_some() {
         return ACTION_ALLOW;
     }
@@ -477,6 +482,20 @@ fn name_event(ctx: &TcContext, key: &FlowKey, off: u32, kind: u8) {
     entry.submit(0);
 }
 
+/// A DNS answer to a query this host sent: the query left an outbound
+/// connection state. A remote host that sends unasked answers must not
+/// put a trusted name on its address. Loopback answers come from a local
+/// resolver. Without rules no state is kept, and no question shows names.
+#[inline(never)]
+fn dns_solicited(key: &FlowKey) -> bool {
+    if key.ifindex == LOOPBACK_IFINDEX || !rules_active() {
+        return true;
+    }
+    let mut c = ConnKey::default();
+    conn_key(key, &mut c);
+    unsafe { CONNS.get(&c) }.is_some_and(|s| s.dir == DIR_OUT)
+}
+
 /// A packet that only passes through the host on a bridge or veth (a
 /// container's connection to the internet, or to another container). It
 /// is decided where it leaves the host, not here: on this side of the NAT
@@ -531,17 +550,20 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
     let mut action = TC_ACT_UNSPEC;
     if let Some(key) = &key {
         count(ctx, key, egress);
-        // DNS answers: from port 53, on every interface (lo carries the
-        // answers of a local stub resolver).
-        if !egress && key.proto == IPPROTO_UDP && key.remote_port == 53 {
-            name_event(ctx, key, payload as u32, NAME_DNS);
-        }
         if egress && key.proto == IPPROTO_TCP && payload > 0 {
             tls_names(ctx, key, payload as u32);
         }
         // Unparsed packets have no key and pass (fail-open).
-        if ifindex != LOOPBACK_IFINDEX && !forwarded(ctx, key, egress) && packet_denied(key, egress, packet_tgid(ctx, egress)) {
+        let denied =
+            ifindex != LOOPBACK_IFINDEX && !forwarded(ctx, key, egress) && packet_denied(key, egress, packet_tgid(ctx, egress));
+        if denied {
             action = TC_ACT_SHOT;
+        }
+        // DNS answers: from port 53, on every interface (lo carries the
+        // answers of a local stub resolver). Only answers to a query of
+        // this host: the names show in questions.
+        if !egress && !denied && key.proto == IPPROTO_UDP && key.remote_port == 53 && dns_solicited(key) {
+            name_event(ctx, key, payload as u32, NAME_DNS);
         }
     }
 
@@ -822,7 +844,8 @@ pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
         return 0;
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    if let Some(id) = exe_by_inode(cfg) {
+    let id = exe_by_inode(cfg);
+    if id != 0 {
         let _ = TGID_EXE.insert(&tgid, &id, 0);
         return 0;
     }
@@ -847,8 +870,14 @@ pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
 /// Exe id of the file the current task now runs: current->mm->exe_file,
 /// its inode and the device of its file system. The offsets come from BTF
 /// (TraceCfg). The exec tracepoint fires after the new exe_file is set.
+/// 0 if none. A BPF function returns one register: no Option here.
 #[inline(never)]
-fn exe_by_inode(cfg: &TraceCfg) -> Option<u32> {
+fn exe_by_inode(cfg: &TraceCfg) -> u32 {
+    exe_by_inode_inner(cfg).unwrap_or(0)
+}
+
+#[inline(always)]
+fn exe_by_inode_inner(cfg: &TraceCfg) -> Option<u32> {
     if cfg.inode_ok == 0 {
         return None;
     }

@@ -27,7 +27,7 @@ use netmon_common::{
     TraceCfg, ExeInode,
 };
 
-use crate::rules::addr_bytes;
+use crate::rules::{GuardEndpoint, addr_bytes};
 
 use crate::ifaces::Iface;
 
@@ -74,6 +74,8 @@ pub struct Probe {
     generation: u32,
     conns: HashMap<MapData, ConnKey, ConnState>,
     guard: HashMap<MapData, GuardKey, u8>,
+    /// Keys as last written to GUARD.
+    guard_set: HashSet<GuardKey>,
     rule_hits: PerCpuArray<MapData, u64>,
     exe_id_map: HashMap<MapData, [u8; MAX_EXE_PATH], u32>,
     exe_inodes: HashMap<MapData, ExeInode, u32>,
@@ -234,6 +236,7 @@ impl Probe {
             generation: 0,
             conns,
             guard,
+            guard_set: HashSet::new(),
             rule_hits,
             exe_id_map,
             exe_inodes,
@@ -558,7 +561,9 @@ pub trait Kernel {
     fn rule_hits(&self, slot: usize) -> u64;
     /// Remote endpoints that are never blocked.
     /// Remote endpoints and local TCP ports that are never blocked.
-    fn set_guard(&mut self, endpoints: &[SocketAddr], local_tcp_ports: &[u16]) -> anyhow::Result<()>;
+    /// Replaces the guard: new entries first, then the old ones go, so
+    /// an entry in both sets is never missing.
+    fn set_guard(&mut self, endpoints: &[GuardEndpoint], local_tcp_ports: &[u16]) -> anyhow::Result<()>;
     /// Marks running processes with the exe id of their exe. Returns how
     /// many did not fit into the map.
     fn mark_pids(&mut self, exe_id: u32, pids: &[u32]) -> usize;
@@ -764,14 +769,20 @@ impl Kernel for Probe {
         self.rule_hits.get(&i, 0).map(|v| v.iter().sum()).unwrap_or(0)
     }
 
-    fn set_guard(&mut self, endpoints: &[SocketAddr], local_tcp_ports: &[u16]) -> anyhow::Result<()> {
-        for ep in endpoints {
+    fn set_guard(&mut self, endpoints: &[GuardEndpoint], local_tcp_ports: &[u16]) -> anyhow::Result<()> {
+        let mut want = HashSet::new();
+        for (ep, proto, dir) in endpoints {
             let (family, addr) = addr_bytes(ep.ip());
-            self.guard.insert(GuardKey { addr, port: ep.port(), family, _pad: 0 }, 1, 0)?;
+            want.insert(GuardKey { addr, port: ep.port(), family, proto: *proto, dir: *dir, _pad: [0; 3] });
         }
-        for port in local_tcp_ports.iter().filter(|p| **p != 0) {
-            self.guard.insert(GuardKey::local_tcp(*port), 1, 0)?;
+        want.extend(local_tcp_ports.iter().filter(|p| **p != 0).map(|p| GuardKey::local_tcp(*p)));
+        for k in want.difference(&self.guard_set) {
+            self.guard.insert(k, 1, 0)?;
         }
+        for k in self.guard_set.difference(&want) {
+            let _ = self.guard.remove(k);
+        }
+        self.guard_set = want;
         Ok(())
     }
 

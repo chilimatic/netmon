@@ -358,6 +358,21 @@ pub fn addr_bytes(ip: IpAddr) -> (u8, [u8; 16]) {
     }
 }
 
+/// The exe ids, also under the real path of each exe (`real` resolves
+/// symlinks), for comparing with /proc/<pid>/exe.
+pub fn with_real_paths(
+    exes: &BTreeMap<String, u32>,
+    real: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> BTreeMap<String, u32> {
+    let mut out = exes.clone();
+    for (path, id) in exes {
+        if let Some(r) = real(path).and_then(|r| r.to_str().map(str::to_string)) {
+            out.entry(r).or_insert(*id);
+        }
+    }
+    out
+}
+
 /// Groups running processes by the exes rules name: exe id -> pids.
 pub fn pids_by_exe(running: impl Iterator<Item = (u32, String)>, exes: &BTreeMap<String, u32>) -> Vec<(u32, Vec<u32>)> {
     let mut out: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
@@ -369,10 +384,14 @@ pub fn pids_by_exe(running: impl Iterator<Item = (u32, String)>, exes: &BTreeMap
     out.into_iter().collect()
 }
 
+/// A guarded remote endpoint: address, protocol, direction (DIR_*, 0 both).
+pub type GuardEndpoint = (SocketAddr, u8, u8);
+
 /// Endpoints that are never blocked: the SSH client of the session netmon
-/// runs in, and the DNS servers in resolv.conf (port 53). Loopback is
-/// guarded in the kernel by address.
-pub fn guard_endpoints(ssh_connection: Option<&str>, resolv_conf: &str) -> Vec<SocketAddr> {
+/// runs in (TCP, both directions), and the DNS servers in resolv.conf
+/// (port 53, UDP and TCP, outbound only). Loopback is guarded in the
+/// kernel by address.
+pub fn guard_endpoints(ssh_connection: Option<&str>, resolv_conf: &str) -> Vec<GuardEndpoint> {
     let mut out = Vec::new();
     // "client_ip client_port server_ip server_port": the client is the
     // remote end of the session on this host.
@@ -381,7 +400,7 @@ pub fn guard_endpoints(ssh_connection: Option<&str>, resolv_conf: &str) -> Vec<S
         if let (Some(ip), Some(port)) = (f.next(), f.next())
             && let (Ok(ip), Ok(port)) = (ip.parse::<IpAddr>(), port.parse::<u16>())
         {
-            out.push(normalize(SocketAddr::new(ip, port)));
+            out.push((normalize(SocketAddr::new(ip, port)), IPPROTO_TCP, 0));
         }
     }
     for line in resolv_conf.lines() {
@@ -391,7 +410,9 @@ pub fn guard_endpoints(ssh_connection: Option<&str>, resolv_conf: &str) -> Vec<S
             // Drop a zone id such as fe80::1%eth0.
             && let Ok(ip) = ip.split('%').next().unwrap_or("").parse::<IpAddr>()
         {
-            out.push(normalize(SocketAddr::new(ip, 53)));
+            let ep = normalize(SocketAddr::new(ip, 53));
+            out.push((ep, IPPROTO_UDP, DIR_OUT));
+            out.push((ep, IPPROTO_TCP, DIR_OUT));
         }
     }
     out
@@ -531,8 +552,22 @@ mod tests {
             Some("192.168.1.20 51234 192.168.1.5 22"),
             "# comment\nnameserver 127.0.0.53\nnameserver fe80::1%eth0\noptions edns0\nsearch lan\n",
         );
-        assert_eq!(g, vec![sa("192.168.1.20:51234"), sa("127.0.0.53:53"), sa("[fe80::1]:53")]);
+        let out = |a| [(sa(a), IPPROTO_UDP, DIR_OUT), (sa(a), IPPROTO_TCP, DIR_OUT)];
+        let mut want = vec![(sa("192.168.1.20:51234"), IPPROTO_TCP, 0)];
+        want.extend(out("127.0.0.53:53"));
+        want.extend(out("[fe80::1]:53"));
+        assert_eq!(g, want, "resolvers outbound only");
         assert!(guard_endpoints(Some("garbage"), "").is_empty());
+    }
+
+    #[test]
+    fn rule_path_through_a_symlink_matches_the_real_exe() {
+        let mut exes = BTreeMap::new();
+        exes.insert("/usr/sbin/twingated".to_string(), 7);
+        let real = |p: &str| p.strip_prefix("/usr/sbin/").map(|n| std::path::PathBuf::from(format!("/usr/bin/{n}")));
+        let all = with_real_paths(&exes, real);
+        let got = pids_by_exe([(42, "/usr/bin/twingated".to_string())].into_iter(), &all);
+        assert_eq!(got, vec![(7, vec![42])]);
     }
 
     #[test]

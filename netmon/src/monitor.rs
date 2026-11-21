@@ -181,10 +181,34 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) asks_tried: HashSet<netmon_common::ConnKey>,
     /// Ticks between full /proc scans for exe marks.
     pub(crate) exe_scan_every: u64,
+    /// What the lockout guard holds. resolv.conf is read again every
+    /// GUARD_REFRESH ticks: a network change brings new resolvers.
+    pub(crate) guard: Guard,
     /// TLS server name per connection, from its ClientHello.
     pub(crate) sni: HashMap<netmon_common::FlowKey, String>,
     /// First segments of ClientHellos that continue in the next segment.
     pub(crate) hello_parts: HashMap<netmon_common::FlowKey, Vec<u8>>,
+}
+
+/// Ticks between two reads of /etc/resolv.conf for the guard.
+const GUARD_REFRESH: u64 = 5;
+
+/// Inputs of the lockout guard.
+#[derive(Default)]
+pub(crate) struct Guard {
+    ssh: Option<String>,
+    ports: Vec<u16>,
+    resolv: String,
+}
+
+impl Guard {
+    fn endpoints(&self) -> Vec<rules::GuardEndpoint> {
+        guard_endpoints(self.ssh.as_deref(), &self.resolv)
+    }
+}
+
+fn read_resolv() -> String {
+    std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default()
 }
 
 /// The rules file did not load. netmond then does not start: exit code
@@ -207,8 +231,8 @@ impl Monitor {
         let mut probe = Probe::load(pin_dir)?;
         let hook_errors = probe.hook_errors.clone();
         let exec_tracking = probe.exec_tracking;
-        let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-        if let Err(e) = probe.set_guard(&guard_endpoints(ssh_connection().as_deref(), &resolv), &args.guard_ports) {
+        let guard = Guard { ssh: ssh_connection(), ports: args.guard_ports.clone(), resolv: read_resolv() };
+        if let Err(e) = probe.set_guard(&guard.endpoints(), &guard.ports) {
             probe.unpin();
             return Err(e);
         }
@@ -220,6 +244,7 @@ impl Monitor {
             }
         };
         errors.extend(hook_errors);
+        mon.guard = guard;
         mon.owners.min_gap = FD_SCAN_GAP;
         // The tracepoints mark new processes; the full scan only catches
         // what they missed.
@@ -278,7 +303,7 @@ impl<K: Kernel> Monitor<K> {
         let mut collector = Collector::new(args.expire_ticks());
         collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1 };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default() };
         Ok((mon, errors))
     }
 
@@ -388,6 +413,16 @@ impl<K: Kernel> Monitor<K> {
             self.procs.fill(o, read_details);
         }
         self.prof.add("process details", t);
+        if self.ticks.is_multiple_of(GUARD_REFRESH) {
+            let resolv = read_resolv();
+            if resolv != self.guard.resolv {
+                let old = std::mem::replace(&mut self.guard.resolv, resolv);
+                if let Err(e) = self.probe.set_guard(&self.guard.endpoints(), &self.guard.ports) {
+                    self.guard.resolv = old;
+                    errors.push(format!("guard update failed: {e:#}"));
+                }
+            }
+        }
         if self.ticks.is_multiple_of(self.exe_scan_every) {
             let t = Instant::now();
             if let Some(e) = self.sync_exe_blocks() {
@@ -844,8 +879,11 @@ impl<K: Kernel> Monitor<K> {
         let inode_error = self.probe.refresh_exe_inodes();
         let procs = procfs::process::all_processes().ok()?;
         let running = procs.flatten().filter_map(|p| Some((p.pid as u32, p.exe().ok()?.to_string_lossy().into_owned())));
+        // /proc/<pid>/exe names the real file: a rule path through a
+        // symlink (/usr/sbin is a link to /usr/bin on Arch) must match it.
+        let exes = rules::with_real_paths(exes, |p| std::fs::canonicalize(p).ok());
         let mut lost = 0;
-        for (id, pids) in rules::pids_by_exe(running, exes) {
+        for (id, pids) in rules::pids_by_exe(running, &exes) {
             lost += self.probe.mark_pids(id, &pids);
         }
         (lost > 0).then(|| format!("exe marks full: exe rules do not apply to {lost} processes")).or(inode_error)
@@ -1032,7 +1070,7 @@ mod tests {
         fn rule_hits(&self, slot: usize) -> u64 {
             slot as u64 + 100
         }
-        fn set_guard(&mut self, _: &[std::net::SocketAddr], _: &[u16]) -> anyhow::Result<()> {
+        fn set_guard(&mut self, _: &[rules::GuardEndpoint], _: &[u16]) -> anyhow::Result<()> {
             Ok(())
         }
     }

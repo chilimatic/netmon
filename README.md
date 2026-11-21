@@ -384,7 +384,11 @@ The Remote column shows a hostname where netmon knows one, for example
   because one address can serve many names and SNI tells which name this
   connection asked for. It also works when DNS is encrypted.
 - DNS (`name from dns`). The kernel passes each DNS answer (UDP from port
-  53, on every interface) to netmon. Each A or AAAA address gets the name
+  53, on every interface) to netmon. With rules in force, it passes only
+  answers that the rules let through and that belong to a query this host
+  sent (an outbound connection to that server and port). Thus a remote
+  host cannot put a trusted name on its address with an unasked answer.
+  Answers on loopback come from a local resolver and always count. Each A or AAAA address gets the name
   that was asked, not the CDN name behind a CNAME. A name stays for 1 hour
   after the last answer. netmon keeps up to 4096 names.
 
@@ -456,6 +460,9 @@ How a deny works:
   (`/sys/kernel/btf/vmlinux`). Without BTF, the kernel program compares
   the path, and the `/proc` scan finds the other cases within 10 ticks
   (10 s by default).
+- A rule path can go through a symlink, for example `/usr/sbin/x` where
+  `/usr/sbin` is a link to `/usr/bin`. The kernel compares the file, and
+  the `/proc` scan also accepts the real path.
 - After a package update the exe is a new file. netmon reads the device
   and inode of each exe again at each `/proc` scan, every 10 ticks.
 
@@ -464,11 +471,17 @@ How a deny works:
 These are never blocked, whatever the rules say:
 
 - loopback
-- the SSH session that `netmon --local` started from (`SSH_CONNECTION`)
+- the SSH session that `netmon --local` started from (`SSH_CONNECTION`):
+  TCP to and from that address and port
 - inbound and outbound TCP on the guarded local ports: `netmond` guards
   port 22 (sshd), so that no rule can lock out a remote admin. Change it
   with `--guard-port PORT` (repeat for more ports, `0` for none).
-- DNS (port 53) to the name servers in `/etc/resolv.conf`
+- outbound DNS (UDP and TCP to port 53) to the name servers in
+  `/etc/resolv.conf`, and the answers. Inbound packets from a name server
+  are not guarded: a host that fakes the address of the name server gets
+  no free pass through the inbound rules. netmon reads
+  `/etc/resolv.conf` again every 5 ticks, so a new name server after a
+  network change is guarded.
 - the DHCP and DHCPv6 client: local UDP port 68 with server port 67, local
   546 with server 547
 - later fragments of TCP and UDP packets: they carry no ports, so both
