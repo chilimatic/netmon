@@ -95,6 +95,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         Tab::Interfaces => draw_ifaces(f, app, c, names, body),
         Tab::Capture => draw_capture(f, cap, names, body),
         Tab::Graph => draw_conn_graph(f, app, c, names, body),
+        Tab::Hosts => draw_hosts(f, app, rules, body),
     }
 
     let sort = match app.sort {
@@ -102,25 +103,29 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         Sort::Total => "total",
         Sort::Process => "name",
     };
-    let footer_text = if app.editing_filter {
+    let footer_text = if app.editing_host {
+        format!(" block host (name or *.domain): {}█   (Enter block, Esc cancel)", app.host_input)
+    } else if app.editing_filter {
         format!(" filter: {}█   (Enter keep, Esc clear)", app.filter)
     } else if app.tab == Tab::Capture {
-        " q quit  ←→/1-6 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
+        " q quit  ←→/1-7 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
+    } else if app.tab == Tab::Hosts {
+        " q quit  ←→/1-7 view  ↑↓ select  a block a host  d remove  s save to rules file".to_string()
     } else if app.tab == Tab::Graph {
         format!(
-            " q quit  ←→/1-6 view  ↑↓ select node  Enter its connections  p pause  h names  v veth/bridge [{}]",
+            " q quit  ←→/1-7 view  ↑↓ select node  Enter its connections  p pause  h names  v veth/bridge [{}]",
             if app.show_virtual { "on" } else { "off" }
         )
     } else if app.tab == Tab::Rules {
-        " q quit  ←→/1-6 view  ↑↓ select  d remove rule  s save to rules file   tmp rules end when the monitor stops".to_string()
+        " q quit  ←→/1-7 view  ↑↓ select  d remove rule  s save to rules file   tmp rules end when the monitor stops".to_string()
     } else {
         let block = match app.tab {
-            Tab::Connections => "  b/B block ip/port",
+            Tab::Connections => "  b/B/H block ip/port/host",
             Tab::Processes => "  b block exe",
             _ => "",
         };
         format!(
-            " q quit  ←→/1-6 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  v veth/bridge [{}]  p pause  g graph",
+            " q quit  ←→/1-7 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  v veth/bridge [{}]  p pause  g graph",
             app.filter,
             if app.show_virtual { "on" } else { "off" }
         )
@@ -524,6 +529,45 @@ fn draw_rules(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
         [Constraint::Length(4), Constraint::Length(6), Constraint::Fill(2), Constraint::Fill(1), Constraint::Length(12)],
     )
     .header(header_row(&["#", "Action", "Match", "Comment", "Hits"]));
+    render_table(f, app, table, &ids, area);
+}
+
+/// The Hosts tab: blocked hostnames, the addresses learned for them and
+/// the connections they denied.
+fn draw_hosts(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
+    if rules.hosts.is_empty() {
+        f.render_widget(
+            Paragraph::new(
+                "\n  No blocked hosts.\n\n  a blocks a hostname: ads.example.com blocks that name, *.example.com also every\n  \
+                 name below it. In Connections, H blocks the hostname of the selected row.\n\n  \
+                 netmon learns the addresses from DNS answers and TLS server names and blocks them in\n  \
+                 the kernel, also on open connections. s saves the list with the rules.",
+            )
+            .block(Block::new().borders(Borders::TOP)),
+            area,
+        );
+        return;
+    }
+    let ids: Vec<RowId> = rules.hosts.iter().map(|h| RowId::Host(h.id)).collect();
+    let table = Table::new(
+        rules.hosts.iter().map(|h| {
+            let mut addrs: Vec<String> = h.addrs.iter().take(4).map(|a| a.to_string()).collect();
+            if h.addrs.len() > 4 {
+                addrs.push(format!("+{} more", h.addrs.len() - 4));
+            }
+            let addrs = if addrs.is_empty() { "none seen yet".to_string() } else { addrs.join(", ") };
+            Row::new(vec![
+                Cell::from(h.pattern.clone()),
+                Cell::from(Line::from(h.addrs.len().to_string()).right_aligned()),
+                Cell::from(addrs),
+                Cell::from(h.comment.clone()),
+                Cell::from(Line::from(h.hits.to_string()).right_aligned()),
+            ])
+            .style(Style::new().fg(Color::Red))
+        }),
+        [Constraint::Fill(1), Constraint::Length(6), Constraint::Fill(2), Constraint::Fill(1), Constraint::Length(10)],
+    )
+    .header(header_row(&["Host", "Addrs", "Addresses", "Comment", "Hits"]));
     render_table(f, app, table, &ids, area);
 }
 

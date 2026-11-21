@@ -26,6 +26,18 @@ struct RawFile {
     default: Option<RawAction>,
     #[serde(default)]
     rule: Vec<toml::Spanned<RawRule>>,
+    /// Blocked hostnames.
+    #[serde(default)]
+    host: Vec<toml::Spanned<RawHost>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHost {
+    /// `name.example.com` or `*.example.com`.
+    name: String,
+    #[serde(default)]
+    comment: String,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +84,15 @@ pub struct RulesFile {
     /// None: the file does not say; netmon keeps allow.
     pub default: Option<Action>,
     pub rules: Vec<FileRule>,
+    pub hosts: Vec<FileHost>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct FileHost {
+    /// 1-based line of the `[[host]]` header.
+    pub line: usize,
+    pub pattern: String,
+    pub comment: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -132,7 +153,18 @@ pub fn parse(text: &str) -> Result<RulesFile, String> {
                 .map_err(|e| format!("line {line}: {e}"))
         })
         .collect::<Result<_, _>>()?;
-    Ok(RulesFile { default: raw.default.map(action), rules })
+    let hosts = raw
+        .host
+        .into_iter()
+        .map(|h| {
+            let line = line_of(text, h.span().start);
+            let h = h.into_inner();
+            crate::rules::host_pattern(&h.name)
+                .map(|pattern| FileHost { line, pattern, comment: h.comment })
+                .map_err(|e| format!("line {line}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(RulesFile { default: raw.default.map(action), rules, hosts })
 }
 
 fn action(a: RawAction) -> Action {
@@ -239,6 +271,12 @@ pub fn render(rules: &Rules) -> String {
         }
         if !r.comment.is_empty() {
             let _ = writeln!(out, "comment = {}", q(&r.comment));
+        }
+    }
+    for h in &rules.hosts {
+        let _ = write!(out, "\n[[host]]\nname = {}\n", q(&h.pattern));
+        if !h.comment.is_empty() {
+            let _ = writeln!(out, "comment = {}", q(&h.comment));
         }
     }
     out
@@ -386,6 +424,19 @@ remote = "2001:db8::1"
         for (a, b) in back.rules.iter().zip(&rules.rules) {
             assert_eq!((a.action, &a.m, &a.comment), (b.action, &b.m, &b.comment), "{text}");
         }
+    }
+
+    #[test]
+    fn host_blocks_round_trip_and_are_checked() {
+        let mut rules = Rules::default();
+        rules.add_host("*.ads.example", "ads").unwrap();
+        rules.add_host("tracker.example.com", "").unwrap();
+        let back = parse(&render(&rules)).unwrap();
+        let got: Vec<_> = back.hosts.iter().map(|h| (h.pattern.as_str(), h.comment.as_str())).collect();
+        assert_eq!(got, vec![("*.ads.example", "ads"), ("tracker.example.com", "")]);
+        let e = parse("[[host]]\nname = \"a b\"\n").unwrap_err();
+        assert!(e.starts_with("line 1:") && e.contains("hostname"), "{e}");
+        assert!(parse("[[host]]\nname = \"x.com\"\nport = 1\n").is_err(), "unknown key");
     }
 
     #[test]

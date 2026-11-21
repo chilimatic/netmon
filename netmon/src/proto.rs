@@ -68,6 +68,9 @@ pub enum Request {
     /// Block, or remove the block rule if it exists.
     ToggleBlock(BlockTarget),
     RemoveRule(u32),
+    /// Block a hostname pattern (`name` or `*.domain`).
+    BlockHost { pattern: String, comment: String },
+    RemoveHost(u32),
     SaveRules,
     /// Answer a question for one of its destinations.
     Answer { question: u64, dest: DestId, scope: Scope, answer: Answer },

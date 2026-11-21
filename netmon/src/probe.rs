@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::DirBuilderExt,
     collections::{BTreeMap, HashSet},
     fs::File,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -24,7 +24,7 @@ use netmon_common::{
     AskEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_OFF, DIR_OUT, CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CaptureConfig, ConnKey,
     ConnState, FlowKey, FlowStats, GuardKey,
     ListenKey, ListenOwner, MAX_CAPTURE_FLOWS, MAX_EXE_PATH, MAX_FLOWS, MAX_RULES, NameEvent, PacketEvent, RuleEntry, SockOwner,
-    TraceCfg, ExeInode,
+    TraceCfg, ExeInode, AddrKey,
 };
 
 use crate::rules::{GuardEndpoint, addr_bytes};
@@ -78,6 +78,8 @@ pub struct Probe {
     generation: u32,
     conns: HashMap<MapData, ConnKey, ConnState>,
     guard: HashMap<MapData, GuardKey, u8>,
+    /// Addresses of blocked hostnames -> hits.
+    host_blocks: HashMap<MapData, AddrKey, u64>,
     /// Keys as last written to GUARD.
     guard_set: HashSet<GuardKey>,
     rule_hits: PerCpuArray<MapData, u64>,
@@ -208,6 +210,7 @@ impl Probe {
         let rule_cfg = Array::try_from(take("RULE_CFG")?)?;
         let conns = HashMap::try_from(take("CONNS")?)?;
         let guard = HashMap::try_from(take("GUARD")?)?;
+        let host_blocks = HashMap::try_from(take("HOST_BLOCKS")?)?;
         let rule_hits = PerCpuArray::try_from(take("RULE_HITS")?)?;
         let exe_id_map = HashMap::try_from(take("EXE_IDS")?)?;
         let exe_inodes = HashMap::try_from(take("EXE_INODES")?)?;
@@ -251,6 +254,7 @@ impl Probe {
             conns,
             guard,
             guard_set: HashSet::new(),
+            host_blocks,
             rule_hits,
             exe_id_map,
             exe_inodes,
@@ -606,6 +610,16 @@ pub trait Kernel {
     fn refresh_exe_inodes(&mut self) -> Option<String> {
         None
     }
+    /// Adds and removes addresses of blocked hostnames. New addresses make
+    /// the kernel decide open connections again. Returns the addresses
+    /// that did not fit.
+    fn set_blocked_addrs(&mut self, _add: &[IpAddr], _remove: &[IpAddr]) -> Vec<IpAddr> {
+        Vec::new()
+    }
+    /// Connections denied per blocked address.
+    fn blocked_hits(&self) -> std::collections::HashMap<IpAddr, u64> {
+        std::collections::HashMap::new()
+    }
 }
 
 impl Kernel for Probe {
@@ -830,6 +844,41 @@ impl Kernel for Probe {
         // A full map leaves the process unmarked: its exe rules do not
         // match. The caller reports it.
         pids.iter().filter(|pid| self.tgid_exe.insert(*pid, exe_id, 0).is_err()).count()
+    }
+
+    fn set_blocked_addrs(&mut self, add: &[IpAddr], remove: &[IpAddr]) -> Vec<IpAddr> {
+        /// Keep the hits of an address that is already there.
+        const BPF_NOEXIST: u64 = 1;
+        let key = |ip: &IpAddr| {
+            let (family, addr) = addr_bytes(*ip);
+            AddrKey { addr, family, _pad: [0; 3] }
+        };
+        for ip in remove {
+            let _ = self.host_blocks.remove(&key(ip));
+        }
+        let mut failed = Vec::new();
+        let mut added = false;
+        for ip in add {
+            match self.host_blocks.insert(key(ip), 0, BPF_NOEXIST) {
+                Ok(()) => added = true,
+                Err(e) if is_exists(&e) => {}
+                Err(_) => failed.push(*ip),
+            }
+        }
+        // Cached verdicts of connections to a new address are stale.
+        if added {
+            self.generation = self.generation.wrapping_add(1);
+            let _ = self.rule_cfg.set(CFG_GEN, self.generation, 0);
+        }
+        failed
+    }
+
+    fn blocked_hits(&self) -> std::collections::HashMap<IpAddr, u64> {
+        self.host_blocks
+            .iter()
+            .flatten()
+            .map(|(k, hits)| (crate::collector::addr(k.family, &k.addr, 0).ip(), hits))
+            .collect()
     }
 
     fn refresh_exe_inodes(&mut self) -> Option<String> {

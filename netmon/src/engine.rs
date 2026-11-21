@@ -38,8 +38,9 @@ impl<K: Kernel> Engine<K> {
         if self.mon.capture.as_ref().is_some_and(|c| c.info.running) {
             t = t.min(CAPTURE_POLL);
         }
-        // Questions must show before the first TCP retransmit (~1 s).
-        if self.mon.links.is_some() || self.mon.rules.default == rules::Action::Ask {
+        // Questions must show before the first TCP retransmit (~1 s), and
+        // an address of a blocked hostname must reach the kernel soon.
+        if self.mon.links.is_some() || self.mon.rules.default == rules::Action::Ask || !self.mon.rules.hosts.is_empty() {
             t = t.min(LINK_POLL);
         }
         t
@@ -70,6 +71,9 @@ impl<K: Kernel> Engine<K> {
         self.mon.drain_capture(DRAIN_BATCH);
         let mut out = self.packets();
         let mut changed = self.mon.poll_asks(now);
+        if !self.mon.rules.hosts.is_empty() {
+            changed |= self.mon.poll_names(now);
+        }
         let mut errors = self.mon.check_links();
         self.mon.prof.add("poll (packets, asks, links)", t);
         if now >= self.next {

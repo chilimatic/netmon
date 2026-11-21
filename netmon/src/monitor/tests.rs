@@ -68,9 +68,17 @@ struct Fake {
     fail_block: bool,
     fail_capture: bool,
     marked: Vec<(u32, u32)>,
+    blocked: HashSet<std::net::IpAddr>,
 }
 
 impl Kernel for Fake {
+    fn set_blocked_addrs(&mut self, add: &[std::net::IpAddr], remove: &[std::net::IpAddr]) -> Vec<std::net::IpAddr> {
+        for ip in remove {
+            self.blocked.remove(ip);
+        }
+        self.blocked.extend(add);
+        Vec::new()
+    }
     fn attach_new(&mut self, _: &[Iface]) -> Vec<String> {
         Vec::new()
     }
@@ -201,6 +209,7 @@ fn monitor() -> (Monitor<Fake>, Instant) {
         fail_block: false,
         fail_capture: false,
         marked: Vec::new(),
+        blocked: HashSet::new(),
     };
     let (mut m, _) = Monitor::with_kernel(fake, &args(1000, 30)).unwrap_or_else(|(_, e)| panic!("{e}"));
     let t0 = Instant::now();
@@ -391,6 +400,49 @@ fn kernel_verdicts_read_while_rules_are_in_force() {
     let mut app = App::default();
     act(&mut m, &mut app, Action::ToggleBlockPort);
     assert_eq!(m.probe.default, netmon_common::ACTION_DENY, "default sent with the table");
+}
+
+#[test]
+fn blocked_hostnames_reach_the_kernel_and_leave_it() {
+    let (mut m, t0) = monitor();
+    m.probe.flows = vec![(key(50001), tx(10))];
+    m.tick_at(secs(t0, 1));
+    // An answer for example.com before the block: the block finds it.
+    let mut dns = vec![0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+    dns.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+    dns.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 198, 51, 100, 9]);
+    let mut ev = netmon_common::NameEvent {
+        key: key(53),
+        len: dns.len() as u16,
+        kind: netmon_common::NAME_DNS,
+        _pad: 0,
+        data: [0; netmon_common::NAME_DATA],
+    };
+    ev.data[..dns.len()].copy_from_slice(&dns);
+    m.probe.names.push_back(ev);
+    m.tick_at(secs(t0, 2));
+    assert!(m.probe.blocked.is_empty());
+    let ip: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+    let msg = m.request(Request::BlockHost { pattern: "*.Example.com".into(), comment: String::new() });
+    assert!(msg.starts_with("blocked host *.example.com"), "{msg}");
+    assert_eq!(m.probe.blocked, HashSet::from([ip]));
+    assert_eq!(m.rules.hosts[0].addrs, vec![ip]);
+    // A new answer while the block holds goes to the kernel at once,
+    // without a tick.
+    let mut dns2 = vec![0, 2, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+    dns2.extend_from_slice(b"\x03cdn\x07example\x03com\x00\x00\x01\x00\x01");
+    dns2.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 5]);
+    ev.len = dns2.len() as u16;
+    ev.data = [0; netmon_common::NAME_DATA];
+    ev.data[..dns2.len()].copy_from_slice(&dns2);
+    m.probe.names.push_back(ev);
+    assert!(m.poll_names(secs(t0, 2)));
+    assert!(m.probe.blocked.contains(&"203.0.113.5".parse().unwrap()));
+    let text = rulefile::render(&m.rules);
+    assert!(text.contains("[[host]]\nname = \"*.example.com\""), "{text}");
+    let id = m.rules.hosts[0].id;
+    assert!(m.request(Request::RemoveHost(id)).starts_with("unblocked host"));
+    assert!(m.probe.blocked.is_empty(), "the addresses leave the kernel");
 }
 
 #[test]

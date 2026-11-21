@@ -169,6 +169,11 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) sni: HashMap<netmon_common::FlowKey, String>,
     /// First segments of ClientHellos that continue in the next segment.
     pub(crate) hello_parts: HashMap<netmon_common::FlowKey, Vec<u8>>,
+    /// Addresses of blocked hostnames: the name they were learned for and
+    /// when. They expire like the names.
+    pub(crate) blocked: HashMap<std::net::IpAddr, (String, Instant)>,
+    /// Addresses as last written to HOST_BLOCKS.
+    pub(crate) kernel_blocked: HashSet<std::net::IpAddr>,
 }
 
 impl Monitor {
@@ -250,7 +255,7 @@ impl<K: Kernel> Monitor<K> {
         let mut collector = Collector::new(args.expire_ticks());
         collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new() };
         Ok((mon, errors))
     }
 
@@ -270,10 +275,17 @@ impl<K: Kernel> Monitor<K> {
         match req {
             Request::ToggleBlock(target) => self.toggle_block(target),
             Request::RemoveRule(id) => self.remove_rule(id),
+            Request::BlockHost { pattern, comment } => self.block_host(&pattern, &comment),
+            Request::RemoveHost(id) => self.remove_host(id),
             Request::SaveRules => {
                 let path = &self.rules_path;
                 match rulefile::save(path, &rulefile::render(&self.rules)) {
-                    Ok(()) => format!("saved {} rules to {}", self.rules.rules.len(), path.display()),
+                    Ok(()) => format!(
+                        "saved {} rules and {} blocked hosts to {}",
+                        self.rules.rules.iter().filter(|r| !r.temporary).count(),
+                        self.rules.hosts.len(),
+                        path.display()
+                    ),
                     Err(e) => format!("save {} failed: {e}", path.display()),
                 }
             }
@@ -378,6 +390,9 @@ impl<K: Kernel> Monitor<K> {
         self.prof.add("rule hits + verdicts", t);
         let t = Instant::now();
         self.refresh_hosts(now);
+        if let Some(e) = self.sync_host_blocks(now) {
+            errors.push(e);
+        }
         self.prof.add("hostnames", t);
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {

@@ -391,6 +391,18 @@ impl GuardKey {
     }
 }
 
+/// A blocked remote address (host blocks). IPv4 in the first 4 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct AddrKey {
+    pub addr: [u8; 16],
+    pub family: u8,
+    pub _pad: [u8; 3],
+}
+
+/// Addresses that host blocks hold at most.
+pub const MAX_BLOCKED_ADDRS: u32 = 16_384;
+
 /// True for 127.0.0.0/8, ::1 and IPv4-mapped 127.x. Loopback is never
 /// blocked.
 #[inline(always)]
@@ -544,6 +556,8 @@ unsafe impl aya::Pod for TraceCfg {}
 unsafe impl aya::Pod for ExeInode {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for GuardKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for AddrKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ListenOwner {}
 

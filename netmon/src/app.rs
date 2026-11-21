@@ -18,10 +18,12 @@ pub enum Tab {
     Capture,
     Rules,
     Graph,
+    Hosts,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [Tab::Connections, Tab::Processes, Tab::Interfaces, Tab::Capture, Tab::Rules, Tab::Graph];
+    pub const ALL: [Tab; 7] =
+        [Tab::Connections, Tab::Processes, Tab::Interfaces, Tab::Capture, Tab::Rules, Tab::Graph, Tab::Hosts];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -31,6 +33,7 @@ impl Tab {
             Tab::Capture => "Capture",
             Tab::Rules => "Rules",
             Tab::Graph => "Graph",
+            Tab::Hosts => "Hosts",
         }
     }
 
@@ -61,6 +64,7 @@ pub enum RowId {
     Proc(String, String),
     Iface(u32),
     Rule(u32),
+    Host(u32),
 }
 
 pub struct ConnRow {
@@ -163,6 +167,9 @@ pub struct App {
     pub graph_labels: Vec<String>,
     /// Selected graph node.
     pub graph_sel: usize,
+    /// Typing a hostname to block (Hosts tab, a).
+    pub editing_host: bool,
+    pub host_input: String,
 }
 
 impl Default for App {
@@ -187,6 +194,8 @@ impl Default for App {
             anim: 0.0,
             graph_labels: Vec::new(),
             graph_sel: 0,
+            editing_host: false,
+            host_input: String::new(),
         }
     }
 }
@@ -228,6 +237,12 @@ pub enum Action {
     ToggleBlockProcess,
     /// Remove the selected rule in the Rules tab.
     RemoveRule,
+    /// Block a hostname pattern typed in the Hosts tab.
+    BlockHost(String),
+    /// Block the hostname of the selected connection.
+    BlockHostOfRow,
+    /// Remove the selected host block in the Hosts tab.
+    RemoveHost,
     /// Write all rules to the rules file.
     SaveRules,
     /// Answer the shown ask-mode question.
@@ -249,6 +264,25 @@ pub enum Answer {
 
 impl App {
     pub fn on_key(&mut self, key: Key) -> Option<Action> {
+        if self.editing_host {
+            match key {
+                Key::Char(c) => self.host_input.push(c),
+                Key::Backspace => {
+                    self.host_input.pop();
+                }
+                Key::Enter => {
+                    self.editing_host = false;
+                    let p = std::mem::take(&mut self.host_input);
+                    return (!p.trim().is_empty()).then_some(Action::BlockHost(p));
+                }
+                Key::Esc => {
+                    self.host_input.clear();
+                    self.editing_host = false;
+                }
+                _ => {}
+            }
+            return None;
+        }
         if self.editing_filter {
             match key {
                 Key::Char(c) => self.filter.push(c),
@@ -340,6 +374,11 @@ impl App {
             Key::Char('4') => self.set_tab(Tab::Capture),
             Key::Char('5') => self.set_tab(Tab::Rules),
             Key::Char('6') => self.set_tab(Tab::Graph),
+            Key::Char('7') => self.set_tab(Tab::Hosts),
+            Key::Char('a') if self.tab == Tab::Hosts => self.editing_host = true,
+            Key::Char('d') if self.tab == Tab::Hosts => return Some(Action::RemoveHost),
+            Key::Char('s') if self.tab == Tab::Hosts => return Some(Action::SaveRules),
+            Key::Char('H') if self.tab == Tab::Connections => return Some(Action::BlockHostOfRow),
             Key::Char('b') if self.tab == Tab::Connections => return Some(Action::ToggleBlockRemote),
             Key::Char('B') if self.tab == Tab::Connections => return Some(Action::ToggleBlockPort),
             Key::Char('b') if self.tab == Tab::Processes => return Some(Action::ToggleBlockProcess),
@@ -652,7 +691,7 @@ mod tests {
     fn arrows_switch_tabs_and_esc_does_not_quit() {
         let mut app = App::default();
         app.on_key(Key::Left);
-        assert_eq!(app.tab, Tab::Graph, "wraps around");
+        assert_eq!(app.tab, Tab::Hosts, "wraps around");
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Connections);
         app.on_key(Key::Right);
@@ -786,7 +825,17 @@ mod tests {
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Graph);
         app.on_key(Key::Right);
+        assert_eq!(app.tab, Tab::Hosts);
+        assert_eq!(app.on_key(Key::Char('d')), Some(Action::RemoveHost));
+        assert_eq!(app.on_key(Key::Char('a')), None);
+        for c in "*.ads.example".chars() {
+            assert_eq!(app.on_key(Key::Char(c)), None, "typing, not keys");
+        }
+        assert_eq!(app.on_key(Key::Enter), Some(Action::BlockHost("*.ads.example".into())));
+        assert!(!app.editing_host && app.host_input.is_empty());
+        app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Connections, "wraps");
+        assert_eq!(app.on_key(Key::Char('H')), Some(Action::BlockHostOfRow));
     }
 
     #[test]

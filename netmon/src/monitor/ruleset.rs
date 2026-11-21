@@ -38,6 +38,66 @@ impl std::error::Error for RulesFileError {}
 
 impl<K: Kernel> Monitor<K> {
     /// Adds the rule, or removes it if it exists.
+    /// Blocks a hostname pattern. Saved with the rules (s).
+    pub(crate) fn block_host(&mut self, pattern: &str, comment: &str) -> String {
+        self.change_rules(|r| {
+            r.add_host(pattern, comment)?;
+            let p = rules::host_pattern(pattern)?;
+            Ok(format!("blocked host {p} (s in the Rules or Hosts tab saves it)"))
+        })
+    }
+
+    pub(crate) fn remove_host(&mut self, id: u32) -> String {
+        let mut name = String::new();
+        let msg = self.change_rules(|r| {
+            name = r.remove_host(id).ok_or("host block already removed")?;
+            Ok(String::new())
+        });
+        if msg.is_empty() { format!("unblocked host {name}") } else { msg }
+    }
+
+    /// Writes the addresses of blocked hostnames to the kernel: new
+    /// patterns match names learned before, removed patterns and old
+    /// answers drop out. Fills the addresses and hits each pattern shows.
+    pub(crate) fn sync_host_blocks(&mut self, now: Instant) -> Option<String> {
+        if self.rules.hosts.is_empty() && self.blocked.is_empty() && self.kernel_blocked.is_empty() {
+            return None;
+        }
+        let rules = &self.rules;
+        for (ip, name, seen) in self.hosts.iter(now) {
+            if rules.host_blocked(name) {
+                self.blocked.entry(ip).or_insert_with(|| (name.to_string(), seen));
+            }
+        }
+        for (k, name) in &self.sni {
+            if rules.host_blocked(name) {
+                let ip = procmap::normalize(collector::addr(k.family, &k.remote_addr, 0)).ip();
+                self.blocked.insert(ip, (name.clone(), now));
+            }
+        }
+        self.blocked.retain(|_, (name, seen)| rules.host_blocked(name) && now.duration_since(*seen) < names::KEEP);
+        let want: HashSet<std::net::IpAddr> = self.blocked.keys().copied().collect();
+        let add: Vec<_> = want.difference(&self.kernel_blocked).copied().collect();
+        let remove: Vec<_> = self.kernel_blocked.difference(&want).copied().collect();
+        let mut error = None;
+        if !add.is_empty() || !remove.is_empty() {
+            let failed = self.probe.set_blocked_addrs(&add, &remove);
+            if !failed.is_empty() {
+                error = Some(format!("{} addresses of blocked hosts not blocked: map full", failed.len()));
+            }
+            self.kernel_blocked = want.into_iter().filter(|ip| !failed.contains(ip)).collect();
+        }
+        let hits = self.probe.blocked_hits();
+        for h in &mut self.rules.hosts {
+            let mut addrs: Vec<_> =
+                self.blocked.iter().filter(|(_, (n, _))| h.matches(n)).map(|(ip, _)| *ip).collect();
+            addrs.sort();
+            h.hits = addrs.iter().filter_map(|a| hits.get(a)).sum();
+            h.addrs = addrs;
+        }
+        error
+    }
+
     pub(crate) fn toggle_block(&mut self, target: BlockTarget) -> String {
         if let Some(rule) = self.rules.find_block(&target) {
             return self.remove_rule(rule.id);
@@ -87,7 +147,8 @@ impl<K: Kernel> Monitor<K> {
         };
         match self.probe.set_rules(&self.rules.entries(), self.rules.exe_ids(), self.rules.default.kernel()) {
             Ok(()) => {
-                if let Some(e) = self.sync_exe_blocks() {
+                let host_error = self.sync_host_blocks(Instant::now());
+                if let Some(e) = self.sync_exe_blocks().or(host_error) {
                     return format!("{msg}; {e}");
                 }
                 msg
@@ -116,6 +177,7 @@ impl<K: Kernel> Monitor<K> {
             Err(e) => return fail(e),
         };
         let n = parsed.rules.len();
+        let hosts = parsed.hosts;
         let default = parsed.default;
         let mut failed = false;
         let msg = self.change_rules(|rules| {
@@ -128,8 +190,16 @@ impl<K: Kernel> Monitor<K> {
                     format!("line {}: {e}", r.line)
                 })?;
             }
+            let h = hosts.len();
+            for x in hosts {
+                rules.add_host(&x.pattern, &x.comment).map_err(|e| {
+                    failed = true;
+                    format!("line {}: {e}", x.line)
+                })?;
+            }
             let d = if rules.default == rules::Action::Allow { String::new() } else { format!(", default {}", rules.default) };
-            Ok(format!("{n} rules from {}{d}", path.display()))
+            let h = if h == 0 { String::new() } else { format!(", {h} blocked hosts") };
+            Ok(format!("{n} rules from {}{d}{h}", path.display()))
         });
         if failed || msg.starts_with("rule update failed") { fail(msg) } else { Ok(Some(msg)) }
     }

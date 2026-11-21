@@ -169,7 +169,7 @@ fn hostname(b: &[u8]) -> Option<String> {
 const MAX_HOSTS: usize = 4096;
 /// How long a name stays after its last answer. DNS TTLs are often a
 /// minute, connections live much longer.
-const KEEP: Duration = Duration::from_secs(3600);
+pub const KEEP: Duration = Duration::from_secs(3600);
 
 /// Remote address -> hostname from DNS answers.
 #[derive(Default)]
@@ -189,6 +189,14 @@ impl HostNames {
             }
         }
         self.by_ip.insert(ip, (name, now));
+    }
+
+    /// Every address with its name and the time of its last answer.
+    pub fn iter(&self, now: Instant) -> impl Iterator<Item = (IpAddr, &str, Instant)> {
+        self.by_ip
+            .iter()
+            .filter(move |(_, (_, t))| now.duration_since(*t) < KEEP)
+            .map(|(ip, (n, t))| (*ip, n.as_str(), *t))
     }
 
     pub fn get(&self, ip: IpAddr, now: Instant) -> Option<&str> {

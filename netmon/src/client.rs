@@ -139,6 +139,23 @@ impl Client {
                 app.selected_in(&ids).map(|i| Request::RemoveRule(rules[i].id)).ok_or_else(|| "no rule selected".into())
             }
             Action::SaveRules => Ok(Request::SaveRules),
+            Action::BlockHost(pattern) => Ok(Request::BlockHost { pattern, comment: String::new() }),
+            Action::BlockHostOfRow => {
+                let rows = app.conn_rows(&self.snap.collector, &self.snap.names);
+                let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
+                match app.selected_in(&ids).map(|i| &rows[i]) {
+                    Some(r) => match &r.host {
+                        Some(h) => Ok(Request::BlockHost { pattern: h.clone(), comment: String::new() }),
+                        None => Err("no hostname known for this connection: b blocks its address".into()),
+                    },
+                    None => Err("no connection selected".into()),
+                }
+            }
+            Action::RemoveHost => {
+                let hosts = &self.snap.rules.hosts;
+                let ids: Vec<_> = hosts.iter().map(|h| crate::app::RowId::Host(h.id)).collect();
+                app.selected_in(&ids).map(|i| Request::RemoveHost(hosts[i].id)).ok_or_else(|| "no host selected".into())
+            }
             Action::Answer(answer) => match &app.ask {
                 Some((p, _)) => match p.selected_dest() {
                     Some(d) => Ok(Request::Answer { question: p.id, dest: dest_id(d), scope: p.scope, answer }),
@@ -211,7 +228,7 @@ impl Client {
                     label: format!("{} {} → {} on {}", r.proto, r.local, r.remote, r.iface),
                 })
             }
-            Tab::Capture | Tab::Rules | Tab::Graph => Err("select a row in another tab".into()),
+            Tab::Capture | Tab::Rules | Tab::Graph | Tab::Hosts => Err("select a row in another tab".into()),
         }
     }
 }

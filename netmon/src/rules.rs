@@ -223,9 +223,88 @@ pub struct Rules {
     next_id: u32,
     /// Action for TCP and UDP traffic no rule matches.
     pub default: Action,
+    /// Blocked hostnames, in the order they were added.
+    #[serde(default)]
+    pub hosts: Vec<HostBlock>,
+}
+
+/// Patterns a host block list holds at most.
+pub const MAX_HOST_BLOCKS: usize = 256;
+
+/// A blocked hostname: `ads.example.com` blocks that name, `*.example.com`
+/// blocks example.com and every name below it. The addresses come from DNS
+/// answers and TLS server names.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HostBlock {
+    pub id: u32,
+    pub pattern: String,
+    pub comment: String,
+    /// Addresses learned for it, as last synced. For display.
+    pub addrs: Vec<IpAddr>,
+    /// Connections denied for it since the start.
+    pub hits: u64,
+}
+
+impl HostBlock {
+    pub fn matches(&self, name: &str) -> bool {
+        host_matches(&self.pattern, name)
+    }
+}
+
+/// Does `name` fall under `pattern`? Case and a final dot do not count.
+pub fn host_matches(pattern: &str, name: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    match pattern.strip_prefix("*.") {
+        Some(base) => name == base || name.ends_with(&format!(".{base}")),
+        None => name == pattern,
+    }
+}
+
+/// Checks a host pattern and gives its normal form (lower case, no final
+/// dot): letters, digits, `-` and `_` in dot-separated labels, optionally
+/// `*.` in front.
+pub fn host_pattern(p: &str) -> Result<String, String> {
+    let p = p.trim().trim_end_matches('.').to_ascii_lowercase();
+    let base = p.strip_prefix("*.").unwrap_or(&p);
+    let ok_label = |l: &str| {
+        !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    if base.is_empty() || base.len() > 253 || !base.split('.').all(ok_label) {
+        return Err(format!("host {p:?}: not a hostname or *.domain"));
+    }
+    Ok(p)
 }
 
 impl Rules {
+    /// Adds a blocked hostname. Returns its id.
+    pub fn add_host(&mut self, pattern: &str, comment: &str) -> Result<u32, String> {
+        let pattern = host_pattern(pattern)?;
+        if comment.chars().any(char::is_control) {
+            return Err("comment: control characters".into());
+        }
+        if self.hosts.iter().any(|h| h.pattern == pattern) {
+            return Err(format!("host {pattern} is already blocked"));
+        }
+        if self.hosts.len() >= MAX_HOST_BLOCKS {
+            return Err(format!("host block limit {MAX_HOST_BLOCKS} reached"));
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.hosts.push(HostBlock { id, pattern, comment: comment.to_string(), ..HostBlock::default() });
+        Ok(id)
+    }
+
+    /// Removes a blocked hostname. Its pattern, if it existed.
+    pub fn remove_host(&mut self, id: u32) -> Option<String> {
+        let i = self.hosts.iter().position(|h| h.id == id)?;
+        Some(self.hosts.remove(i).pattern)
+    }
+
+    /// Is a hostname blocked by any pattern?
+    pub fn host_blocked(&self, name: &str) -> bool {
+        self.hosts.iter().any(|h| h.matches(name))
+    }
+
     /// Inserts a rule at position `at` (clamped). Returns its id.
     pub fn insert(&mut self, at: usize, action: Action, m: Match, comment: &str) -> Result<u32, String> {
         if action == Action::Ask {
@@ -566,6 +645,25 @@ mod tests {
         want.extend(out("[fe80::1]:53"));
         assert_eq!(g, want, "resolvers outbound only");
         assert!(guard_endpoints(Some("garbage"), "").is_empty());
+    }
+
+    #[test]
+    fn host_patterns_match_names_and_subdomains() {
+        assert!(host_matches("ads.example.com", "ADS.example.com."));
+        assert!(!host_matches("ads.example.com", "x.ads.example.com"));
+        assert!(host_matches("*.example.com", "example.com"));
+        assert!(host_matches("*.example.com", "a.b.example.com"));
+        assert!(!host_matches("*.example.com", "badexample.com"));
+        assert_eq!(host_pattern(" *.Example.COM. ").unwrap(), "*.example.com");
+        assert!(host_pattern("a b.com").is_err());
+        assert!(host_pattern("*.").is_err());
+        assert!(host_pattern("x.*.com").is_err());
+        let mut r = Rules::default();
+        let id = r.add_host("*.example.com", "ads").unwrap();
+        assert!(r.add_host("*.EXAMPLE.com", "").is_err(), "duplicate");
+        assert!(r.host_blocked("cdn.example.com"));
+        assert_eq!(r.remove_host(id).as_deref(), Some("*.example.com"));
+        assert!(!r.host_blocked("cdn.example.com"));
     }
 
     #[test]

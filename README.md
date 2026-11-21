@@ -247,12 +247,12 @@ that can connect, default `netmon`).
  │─────────────────────────────── 120 samples ────────────────────────────│
  │ ↑ upload (magenta) below the zero line                                 │
  └────────────────────────────────────────────────────────────────────────┘
-  1 Connections   2 Processes   3 Interfaces   4 Capture   5 Rules   6 Graph    3
+  1 Connections  2 Processes  3 Interfaces  4 Capture  5 Rules  6 Graph  7 Hosts 3
  Process      PID   Proto Local            Remote             Iface  State ...  4
  firefox      4242  tcp   10.0.0.2:51234   example.com:443    enp5s0 ESTAB
  ...
  93.184.215.14:443 (name from tls)   exe /usr/lib/firefox/firefox   ...         5
- q quit  ←→/1-6 view  Enter capture  b/B block ip/port  r/t/n sort ...         6
+ q quit  ←→/1-7 view  Enter capture  b/B block ip/port  r/t/n sort ...         6
 ```
 
 1. Header. It shows the total upload and download rate of the physical
@@ -262,7 +262,7 @@ that can connect, default `netmon`).
 2. Traffic graph. It shows the total rate of the last 120 samples. Each
    half has its own scale. `g` hides it. A terminal with less than 20 lines
    and the Graph tab do not show it.
-3. Tabs. `←` and `→`, `Tab`, or `1` to `6` select a tab.
+3. Tabs. `←` and `→`, `Tab`, or `1` to `7` select a tab.
 4. The table of the tab. `↑` and `↓` select a row. The selection stays on
    the same row when the order changes.
 5. Detail line (Connections tab only). The section below explains it.
@@ -274,7 +274,7 @@ that can connect, default `netmon`).
 | Key | Where | Action |
 |---|---|---|
 | `q`, `Ctrl-C` | everywhere | Quit |
-| `←` `→` `Tab` `1`-`6` | everywhere | Select a tab |
+| `←` `→` `Tab` `1`-`7` | everywhere | Select a tab |
 | `↑` `↓` `PgUp` `PgDn` `Home` | tables | Select a row |
 | `/` | tables | Type a filter. `Enter` keeps it, `Esc` clears it. |
 | `Esc` | tables | Clear the filter (never quits) |
@@ -286,10 +286,14 @@ that can connect, default `netmon`).
 | `Enter` | Connections, Processes, Interfaces | Capture the packets of the selected row |
 | `b` | Connections | Block or unblock the remote address |
 | `B` | Connections | Block or unblock the remote port |
+| `H` | Connections | Block the hostname of the connection (see [Hosts tab](#hosts-tab)) |
 | `b` | Processes | Block or unblock the exe of the process |
 | `d` | Rules | Remove the selected rule |
 | `s` | Rules | Save all rules to the rules file |
 | `s` `c` `x` `f` `End` | Capture | Save `.pcap`, clear, stop, follow new packets |
+| `a` | Hosts | Type a hostname to block. `Enter` blocks it, `Esc` cancels. |
+| `d` | Hosts | Remove the selected host block |
+| `s` | Hosts | Save the rules and the host blocks to the rules file |
 | `↑` `↓` | Graph | Select a node |
 | `Enter` | Graph | Show the Connections tab, filtered to the selected node |
 | `a` `A` `d` `D` `o` `x` | question window | Answer a question (see [Ask mode](#ask-mode)) |
@@ -409,6 +413,38 @@ An animated map of the connections:
 
 The tab redraws every 100 ms while it shows. The other tabs redraw only
 when data changes.
+
+### Hosts tab
+
+Blocked hostnames. The kernel sees only addresses, so netmon learns the
+addresses of each name from the DNS answers and the TLS server names that
+it reads, and blocks those addresses in the kernel (`HOST_BLOCKS`).
+
+- `ads.example.com` blocks that name only. `*.example.com` blocks
+  `example.com` and every name below it.
+- `a` adds a pattern, `d` removes the selected one, `s` saves the list with
+  the rules. In the Connections tab, `H` blocks the hostname of the
+  selected row.
+- The table shows each pattern, the addresses learned for it, and its
+  hits: the connections that the kernel denied.
+- A host block wins over every rule and over a question, like a UI block.
+  The lockout guard still wins over a host block.
+- A new address makes the kernel decide the open connections again, so an
+  open connection to that address is cut too. With host blocks in force,
+  netmond reads the DNS answers every 200 ms. The first packets of a
+  connection that starts right after the DNS answer can pass in that time.
+- An address leaves the block 1 hour after the last answer for the name,
+  like the names in the UI.
+
+Limits:
+
+- A program that uses encrypted DNS (DNS over HTTPS or TLS) gives netmon
+  no DNS answer. Its connections are blocked only from their TLS server
+  name, which arrives after the TCP handshake.
+- An address can serve many names (CDNs). A blocked name blocks the whole
+  address, also for other names on it.
+- Names that a program resolved before netmond started are not known
+  until the next lookup.
 
 ### Rules tab
 
@@ -562,6 +598,11 @@ top.
 # Default action for TCP and UDP traffic that no rule matches.
 default = "deny"           # "allow" (the default), "deny" or "ask"
 
+# Blocked hostnames: one name, or a domain with every name below it.
+# [[host]]
+# name = "*.ads.example"
+# comment = "ads"
+
 # curl can connect to HTTPS only.
 [[rule]]
 action = "allow"
@@ -589,6 +630,8 @@ direction = "out"          # connections this host opens
 - `process` is an absolute exe path. Process names (`comm`) are refused,
   because each process can choose its own name.
 - `remote` must not have host bits set. `10.1.0.0/8` is refused.
+- A `[[host]]` section blocks a hostname, with `name` and an optional
+  `comment`. The section [Hosts tab](#hosts-tab) explains how.
 - For inbound connections, an exe rule uses the process that bound the
   local port.
 - The file and its directory must belong to root and must not be writable

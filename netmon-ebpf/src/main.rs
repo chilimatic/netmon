@@ -19,7 +19,7 @@ use netmon_common::{
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
-    CLONE_THREAD, ExeInode, MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
+    AddrKey, CLONE_THREAD, ExeInode, MAX_BLOCKED_ADDRS, MAX_LISTENERS, MAX_MARKED_TGIDS, MAX_RULES, MAX_SOCK_OWNERS, PacketEvent, PacketSource,
     RuleEntry, SockOwner, TraceCfg, fib_forwarded, is_dhcp, is_loopback, is_unparsed, keep_answer, parse_packet, rule_matches,
     unmap_v4_in_place,
 };
@@ -97,6 +97,12 @@ static RULE_CFG: Array<u32> = Array::with_max_entries(CFG_LEN, 0);
 /// Remote endpoints that are never blocked (lockout guard).
 #[map]
 static GUARD: HashMap<GuardKey, u8> = HashMap::with_max_entries(MAX_GUARD, 0);
+
+/// Addresses of blocked hostnames -> connections denied so far. User
+/// space fills it from DNS answers and TLS names. Not LRU: a block must
+/// never be evicted.
+#[map]
+static HOST_BLOCKS: HashMap<AddrKey, u64> = HashMap::with_max_entries(MAX_BLOCKED_ADDRS, 0);
 
 /// Exe paths named by rules (NUL-padded) -> exe id.
 #[map]
@@ -246,6 +252,10 @@ fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
     if unsafe { GUARD.get(&scan.guard) }.is_some() {
         return ACTION_ALLOW;
     }
+    // A blocked hostname wins over every rule, like a UI block.
+    if host_blocked(c) {
+        return ACTION_DENY;
+    }
     if scan.count == 0 {
         return default_action(c.family, c.proto, dir, half);
     }
@@ -256,6 +266,21 @@ fn decide(c: &ConnKey, tgid: u32, dir: u8) -> u8 {
         bpf_loop(scan.count, scan_rule as *mut c_void, &mut scan as *mut Scan as *mut c_void, 0);
     }
     if scan.action == 0 { default_action(scan.guard.family, scan.proto, scan.dir, half) } else { scan.action }
+}
+
+/// Is the remote end an address of a blocked hostname? Counts the hit.
+/// Its own BPF function: the key stays off the rule walk's stack.
+#[inline(never)]
+fn host_blocked(c: &ConnKey) -> bool {
+    let k = AddrKey { addr: c.remote_addr, family: c.family, _pad: [0; 3] };
+    match HOST_BLOCKS.get_ptr_mut(&k) {
+        Some(hits) => {
+            // Not atomic: a lost count on a race is fine.
+            unsafe { *hits += 1 };
+            true
+        }
+        None => false,
+    }
 }
 
 /// Action when no rule matches: the configured default for TCP and UDP
