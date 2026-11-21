@@ -489,12 +489,38 @@ pub(crate) fn owner_cols(f: &Flow) -> (String, String) {
     match &f.owner {
         Some(Owner { container: Some(c), comm, pid, .. }) => (format!("container:{c}/{comm}"), pid.to_string()),
         Some(o) => (o.comm.clone(), o.pid.to_string()),
-        None => ("?".into(), "-".into()),
+        None => (no_owner(f).into(), "-".into()),
+    }
+}
+
+/// Why a flow has no process, as far as its counters tell:
+/// - "(icmp)", "(ip)": not TCP or UDP, which have no socket to map.
+/// - "(closed)": the socket closed (TIME-WAIT and the like), or the host
+///   sent from a socket whose process is gone.
+/// - "(inbound, no socket)": only received, nothing sent back: scans,
+///   packets to closed ports, broadcasts.
+/// - "(forwarded)": sent without a socket of this host. Container or VM
+///   traffic after NAT, before netmon read the container's tables, or a
+///   kernel socket (WireGuard, NFS).
+pub(crate) fn no_owner(f: &Flow) -> &'static str {
+    const CLOSED: [&str; 6] = ["TIME-WAIT", "CLOSE", "CLOSE-WAIT", "LAST-ACK", "CLOSING", "FIN-WAIT-2"];
+    match f.key.proto {
+        1 | 58 => "(icmp)",
+        IPPROTO_TCP | IPPROTO_UDP => {
+            if CLOSED.contains(&f.state) || f.total.cookie != 0 {
+                "(closed)"
+            } else if f.total.tx_bytes == 0 {
+                "(inbound, no socket)"
+            } else {
+                "(forwarded)"
+            }
+        }
+        _ => "(ip)",
     }
 }
 
 static NO_DETAILS: ProcDetails =
-    ProcDetails { exe: String::new(), user: String::new(), unit: String::new(), cgroup: String::new() };
+    ProcDetails { name: String::new(), exe: String::new(), user: String::new(), unit: String::new(), cgroup: String::new() };
 
 fn details(f: &Flow) -> &ProcDetails {
     f.owner.as_ref().and_then(|o| o.details.as_ref()).unwrap_or(&NO_DETAILS)
@@ -588,7 +614,26 @@ mod tests {
     fn groups_processes() {
         let rows = App::default().proc_rows(&collector(), &Names::default());
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].process, "?");
+        assert_eq!(rows[0].process, "(forwarded)", "sent, no socket");
+    }
+
+    #[test]
+    fn flows_without_owner_say_why() {
+        let mut c = collector();
+        let f = c.flows.values_mut().find(|f| f.owner.is_none()).unwrap();
+        f.owner = None;
+        assert_eq!(no_owner(f), "(forwarded)");
+        f.total.cookie = 7;
+        assert_eq!(no_owner(f), "(closed)", "a socket of a process that is gone");
+        f.total.cookie = 0;
+        f.total.tx_bytes = 0;
+        assert_eq!(no_owner(f), "(inbound, no socket)");
+        f.state = "TIME-WAIT";
+        assert_eq!(no_owner(f), "(closed)");
+        f.key.proto = 1;
+        assert_eq!(no_owner(f), "(icmp)");
+        f.key.proto = 47;
+        assert_eq!(no_owner(f), "(ip)");
     }
 
     #[test]

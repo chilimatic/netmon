@@ -32,6 +32,11 @@ pub struct Owner {
 /// Facts about a process that the process itself cannot fake.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProcDetails {
+    /// Name of the process (its main thread), from /proc/<pid>/comm. The
+    /// kernel hooks record the name of the thread that made the socket,
+    /// for example "DNS Resolver #3" of firefox.
+    #[serde(default)]
+    pub name: String,
     /// Path of the running binary, from /proc/<pid>/exe.
     pub exe: String,
     /// User name for the uid, or the uid as a number.
@@ -406,6 +411,7 @@ impl ProcCache {
         let users = self.users.get_or_insert_with(read_users);
         let entry = self.by_pid.entry(owner.pid).or_insert_with(|| {
             read(owner.pid).map(|r| ProcDetails {
+                name: crate::text::sanitize(&r.name),
                 user: users.get(&r.uid).cloned().unwrap_or_else(|| r.uid.to_string()),
                 unit: unit_of(&r.cgroup).to_string(),
                 exe: crate::text::sanitize(&r.exe),
@@ -413,11 +419,18 @@ impl ProcCache {
             })
         });
         owner.details = entry.clone();
+        if let Some(d) = &owner.details
+            && !d.name.is_empty()
+        {
+            owner.comm = d.name.clone();
+        }
     }
 }
 
 /// What /proc says about a process, before formatting.
 pub struct RawDetails {
+    /// /proc/<pid>/comm: the main thread's name.
+    pub name: String,
     pub exe: String,
     pub uid: u32,
     pub cgroup: String,
@@ -432,7 +445,8 @@ pub fn read_details(pid: u32) -> Option<RawDetails> {
     let exe = std::fs::read_link(dir.join("exe")).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     let cgroup = std::fs::read_to_string(dir.join("cgroup")).unwrap_or_default();
     let cgroup = cgroup.lines().find_map(|l| l.strip_prefix("0::")).unwrap_or("").to_string();
-    Some(RawDetails { exe, uid, cgroup })
+    let name = std::fs::read_to_string(dir.join("comm")).unwrap_or_default().trim_end().to_string();
+    Some(RawDetails { name, exe, uid, cgroup })
 }
 
 /// The most specific systemd unit or scope in a cgroup path:
@@ -705,14 +719,17 @@ mod tests {
     #[test]
     fn proc_cache_reads_each_pid_once() {
         let mut cache = ProcCache { users: Some(HashMap::from([(1000, "j".to_string())])), ..Default::default() };
-        let raw = || Some(RawDetails { exe: "/usr/bin/curl".into(), uid: 1000, cgroup: "/user.slice/s.scope".into() });
-        let mut a = Owner::new(7, "renamed");
+        let raw =
+            || Some(RawDetails { name: "curl".into(), exe: "/usr/bin/curl".into(), uid: 1000, cgroup: "/user.slice/s.scope".into() });
+        // The kernel recorded the name of a thread.
+        let mut a = Owner::new(7, "DNS Resolver #3");
         cache.fill(&mut a, |_| raw());
         let d = a.details.clone().unwrap();
         assert_eq!((d.exe.as_str(), d.user.as_str(), d.unit.as_str()), ("/usr/bin/curl", "j", "s.scope"));
+        assert_eq!(a.comm, "curl", "the process name, not the thread name");
         let mut b = Owner::new(7, "other");
         cache.fill(&mut b, |_| unreachable!("cached"));
-        assert_eq!(b.details, a.details);
+        assert_eq!((b.details.as_ref(), b.comm.as_str()), (a.details.as_ref(), "curl"));
         // Process gone: the pid is read again when it shows up next.
         cache.prune(|_| false);
         let mut c = Owner::new(7, "new");

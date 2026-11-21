@@ -708,6 +708,7 @@ mod tests {
         f.owner_source = crate::collector::OwnerSource::Kernel;
         f.owner = Some(Owner {
             details: Some(ProcDetails {
+                name: String::new(),
                 exe: "/usr/bin/curl".into(),
                 user: "j".into(),
                 unit: "app-foo.scope".into(),
@@ -801,7 +802,7 @@ mod tests {
         assert!(text.contains("this host"), "{text}");
         assert!(text.contains("1.1.1.1"), "{text}");
         assert!(text.contains("6 Graph"));
-        assert_eq!(app.graph_labels, vec!["this host", "?", "1.1.1.1"]);
+        assert_eq!(app.graph_labels, vec!["this host", "(forwarded)", "1.1.1.1"]);
     }
 
 }

@@ -303,7 +303,7 @@ One row per connection and interface.
 
 | Column | Content |
 |---|---|
-| Process | Process name (`comm`), `container:<name>/<process>` for a container, or `?` if unknown |
+| Process | Process name (`comm` of the main thread), `container:<name>/<process>` for a container, or why no process is known (see below) |
 | PID | Process ID, or `-` |
 | Proto | `tcp`, `udp`, `icmp`, `icmp6` or `other` |
 | Local | Local address and port |
@@ -331,6 +331,20 @@ The detail line under the table shows the selected connection:
   sources.
 - Which side opened the connection and the kernel verdict, while rules are
   in force.
+
+A connection without a known process shows why, as far as the counters
+tell:
+
+| Process | Meaning |
+|---|---|
+| `(forwarded)` | Sent without a socket of this host: container or VM traffic after NAT (until netmon reads the container's tables), or a kernel socket such as WireGuard or NFS |
+| `(inbound, no socket)` | Only received, nothing sent: scans, packets to closed ports, broadcasts of other hosts |
+| `(closed)` | The socket closed (TIME-WAIT and the like), or its process ended |
+| `(icmp)`, `(ip)` | ICMP or another protocol without ports: no socket to map |
+
+The kernel hooks record the name of the thread that made a socket, for
+example `DNS Resolver #3` of Firefox. netmon shows the name of the
+process instead, from `/proc/<pid>/comm`.
 
 ### Processes tab
 
@@ -959,7 +973,7 @@ The sources, best first:
 Limits of the `/proc` sources:
 
 - A socket that opens and closes between two ticks (a DNS query, a short
-  `curl`) without a kernel owner shows `?`.
+  `curl`) without a kernel owner shows `(closed)`.
 - Container sockets: on veth and bridge interfaces the match is exact
   (state `container`). On the uplink after masquerade, the match is by
   remote end and local port (state `nat`). This fails when NAT changed the
