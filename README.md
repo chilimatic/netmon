@@ -3,7 +3,8 @@
 netmon is a network monitor and a firewall for one Linux host. It runs in a
 terminal. It shows each open connection, the process that owns it, the
 interface it uses, and its upload and download rates. It can block traffic,
-ask before a program connects, name the remote hosts, and capture packets.
+ask before a program connects, name the remote hosts, capture packets, and
+draw the connections as an animated graph.
 
 netmon has two parts:
 
@@ -46,7 +47,8 @@ Contents:
  ═══════════════════════════════════════════════╪═══════════════════╪═════════
  kernel                                         ▼                   │
         ┌──────────────────────── eBPF maps and ring buffers ──────────────────┐
-        │ RULES  RULE_CFG  CONNS  GUARD  EXE_IDS  TGID_EXE    (firewall)       │
+        │ RULES  RULE_CFG  CONNS  GUARD  TRANSIT_IFACES       (firewall)       │
+        │ EXE_IDS  EXE_INODES  TGID_EXE  TRACE_CFG            (exe rules)      │
         │ FLOWS  SOCK_OWNER  LISTENERS                        (counting)       │
         │ NAMES  ASKS  PACKETS                                (event rings)    │
         └──────▲──────────────────────────▲─────────────────────────▲──────────┘
@@ -67,8 +69,9 @@ call:
   they refuse new connections that the rules deny.
 - The tracepoints see each `exec`, each new process and each process exit.
   They keep the map of "process runs this exe" current, so that rules for
-  an exe apply at once. New threads are not recorded: rules look up
-  processes, and thread ids would fill the map.
+  an exe apply at once. At `exec` they compare the file of the new program
+  (device and inode), not the path that started it. New threads are not
+  recorded: rules look up processes, and thread ids would fill the map.
 
 `netmond` reads the maps once per tick (1 s by default), computes the
 rates, finds the owner of each connection, and sends a snapshot to each
@@ -825,8 +828,9 @@ and the time of each step of the monitor loop to stderr every 30 s.
 ## Decisions
 
 This section lists the design decisions and their reasons. `docs/REVIEW.md`
-has the review that started the firewall work. `docs/ROADMAP.md` has the
-phases and the commits.
+has the review that started the firewall work. `docs/REVIEW2.md` has the
+second review (architecture, correctness, security) and the step that
+fixed each finding. `docs/ROADMAP.md` has the phases and the commits.
 
 ### eBPF with aya, Linux only
 
@@ -851,13 +855,26 @@ An allowed packet returns `TC_ACT_UNSPEC`, not `TC_ACT_OK`. Under tcx,
 `TC_ACT_OK` ends the chain, and tools attached after netmon (Cilium,
 other monitors) then never run.
 
-### Owner identity is the exe path, not the process name
+### Owner identity is the exe file, not the process name
 
 Any process can set its own name with `prctl`. A rule therefore names an
-exe path, which comes from `/proc/<pid>/exe`. The kernel gives each exe a
-number (`EXE_IDS`) and marks each process that runs it (`TGID_EXE`). The
-exec, new-task and exit tracepoints keep the marks current. Exe numbers are never
-used again, so an old mark can never point to another exe.
+exe path. The kernel gives each exe a number (`EXE_IDS`) and marks each
+process that runs it (`TGID_EXE`). The exec, new-task and exit tracepoints
+keep the marks current. Exe numbers are never used again, so an old mark
+can never point to another exe.
+
+At `exec`, the kernel program reads the file of the new program
+(`current->mm->exe_file`) and looks up its device and inode in
+`EXE_INODES`. A relative path, `..`, a symlink or `execveat` thus match.
+aya gives no stable CO-RE, so netmon reads the struct offsets from the
+kernel's BTF (`/sys/kernel/btf/vmlinux`) with its own small reader
+(`btf.rs`) and passes them in `TRACE_CFG`. User space learns the kernel's
+device number of a file by mapping it and reading `/proc/self/maps`:
+`stat` gives another number on btrfs subvolumes.
+
+The name shown in the UI is the process name from `/proc/<pid>/comm`.
+The kernel hooks record the name of the thread that made a socket, which
+can be a worker thread such as `DNS Resolver #3`.
 
 ### Owner sources, best first
 
@@ -897,6 +914,31 @@ its links, so the last rules stay after a crash, and systemd restarts it.
 A clean stop removes them, because the administrator asked for it. The
 local mode (`sudo netmon --local`) stays fail-open: it is for a quick look,
 not for protection.
+
+A start never leaves a gap. The new programs run next to the old ones
+until the guard, the rules and the owners of open sockets are in place.
+Only then the old pins go. A rules file with an error stops the start
+(exit code 78), and the old rules stay in force. The section
+[Stop and crash](#stop-and-crash) has the steps.
+
+### Container traffic is decided where it leaves the host
+
+On the host side of a veth or bridge, a container's outbound packet
+arrives on ingress: seen from there, its direction is reversed. netmon
+therefore decides only the host's own packets on bridges and veths
+(`TRANSIT_IFACES`): egress with a host socket, and ingress to a host
+address (`bpf_fib_lookup` says that the kernel delivers it locally).
+Forwarded container traffic passes there and gets its verdict on the
+uplink egress, as outbound, with its real destination.
+
+### The lockout guard is narrow
+
+The guard must keep the admin in, but it must not open the host. A name
+server is guarded for outbound UDP and TCP to port 53 only, so a host
+that fakes the server's address gets no free pass through the inbound
+rules. The SSH session is guarded for TCP to and from its address and
+port. DNS names count only from answers to a query this host sent, so an
+unasked answer cannot put a trusted name on an address in a question.
 
 ### Ask mode drops the first packet
 
@@ -1009,6 +1051,14 @@ Limits of the `/proc` sources:
   rules name), the status line says so, and the exe rules do not apply to
   the processes that did not fit.
 - Only TCP and UDP get the default action. ICMP and other protocols pass.
+- The guard covers the name servers in `/etc/resolv.conf`. If that is a
+  local DNS proxy (systemd-resolved on 127.0.0.53, or a VPN client such as
+  Twingate on its tun), the proxy's own upstream queries are not guarded.
+  With `default = "ask"` or `"deny"`, give the proxy a rule, for example
+  `process = "/usr/bin/twingated"` with `direction = "out"`. Without it,
+  name lookups hang until someone answers a question for the proxy.
+- In ask mode, netmon can block the tools you work with, also an AI
+  assistant in the terminal. Give them rules before you switch to ask.
 - Without kernel BTF, an exe started through a symlink or a relative path
   is marked by the `/proc` scan, so it can connect for up to 10 ticks
   before its rule applies.
@@ -1040,9 +1090,13 @@ Limits of the `/proc` sources:
 | `netmon/src/tui.rs`, `client.rs`, `remote.rs` | The UI: terminal loop, snapshot view, daemon connection |
 | `netmon/src/proto.rs` | Wire types: requests, snapshots, packets |
 | `netmon/src/ui.rs`, `app.rs` | Drawing and UI state |
+| `netmon/src/graph.rs` | Model and layout of the Graph tab |
+| `netmon/src/collector.rs`, `procmap.rs`, `netns.rs` | Flows and rates, owners from `/proc`, container namespaces |
+| `netmon/src/rules.rs`, `rulefile.rs`, `ask.rs` | Rules, the rules file, questions |
+| `netmon/src/btf.rs` | Struct offsets from the kernel's BTF |
 | `netmon/src/probe.rs` | Loads and attaches the eBPF programs, reads the maps, pins the links |
 | `dist/netmond.service` | systemd unit |
-| `docs/ROADMAP.md`, `docs/REVIEW.md` | Phases, review and decisions |
+| `docs/ROADMAP.md`, `docs/REVIEW.md`, `docs/REVIEW2.md` | Phases, reviews and decisions |
 
 ### Tests
 
@@ -1064,6 +1118,13 @@ the object with `llvm-objdump`. Make sure that:
   into it, and the verifier refuses the program.
 - the stack of each program, with its subprograms, fits in 512 bytes.
 - the cgroup hooks return only 0 or 1.
+- no BPF function (`#[inline(never)]`) returns more than one register.
+  An `Option<u32>` needs two, and the verifier refuses it with
+  `R2 !read_ok`.
+
+After a live start, read `journalctl -u netmond`. A program that the
+verifier refused shows there as a warning, for example "exec tracking
+off", and netmond runs on without it.
 
 ### Without the daemon and without sudo
 
