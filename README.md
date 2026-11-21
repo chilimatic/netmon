@@ -980,7 +980,12 @@ Limits of the `/proc` sources:
 |---|---|
 | `netmon-ebpf/` | Kernel programs (`no_std`): TC, cgroup hooks, tracepoints |
 | `netmon-common/` | Types that kernel and user space share, the packet parser, the rule match |
-| `netmon/src/monitor.rs` | The monitor: owners, rules, hostnames, questions, capture |
+| `netmon/src/monitor/mod.rs` | The monitor: state, tick, owners, requests |
+| `netmon/src/monitor/ruleset.rs` | Rule edits, the rules file, exe marks, the lockout guard |
+| `netmon/src/monitor/asks.rs` | Questions from the kernel and their answers |
+| `netmon/src/monitor/hosts.rs` | Hostnames from DNS answers and TLS SNI |
+| `netmon/src/monitor/capturing.rs` | Packet capture |
+| `netmon/src/monitor/containers.rs` | Socket tables of containers |
 | `netmon/src/engine.rs` | The monitor on its clock: ticks and polls |
 | `netmon/src/daemon.rs` | `netmond`: socket, peer check, clients |
 | `netmon/src/tui.rs`, `client.rs`, `remote.rs` | The UI: terminal loop, snapshot view, daemon connection |
@@ -1001,7 +1006,7 @@ AYA_BUILD_SKIP=1 cargo clippy --all-targets
 
 A binary built with `AYA_BUILD_SKIP=1` has no eBPF object and refuses to
 run. Tests of the monitor use a fake kernel (`Fake` in
-`netmon/src/monitor.rs`).
+`netmon/src/monitor/tests.rs`).
 
 For a change to the kernel programs, run `cargo build --release` and read
 the object with `llvm-objdump`. Make sure that:

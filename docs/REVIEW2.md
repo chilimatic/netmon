@@ -77,7 +77,7 @@ Status column: `open` for all items at the time of writing.
 | U3 | Medium | README says UI blocks are temporary and show `tmp`. In the code, `b`/`B` blocks are not temporary (no `tmp`, `s` saves them). Only `a`/`d` answers are temporary and can never be saved. | `netmon/src/rules.rs:238`; README | C | fixed (step 1) |
 | U4 | Low | README errors: "within 10 s" is 10 ticks; "more headers count with port 0" is proto 60 (B1); the guard "applies to netmond" (G1). `rules.rs` module comment still says a crash removes every rule. | README; `netmon/src/rules.rs:1-3`; `netmon/src/monitor.rs:108` | C, S | fixed (step 1) |
 | U5 | Low | Only the first error of an engine step is shown. `x` with no capture reports "capture stopped". `--interval-ms`/`--expire-secs` are ignored silently with a daemon. A process row is red if any deny rule names its exe, also a port-only one. | `netmon/src/engine.rs:75`; `netmon/src/client.rs:172`; `netmon/src/tui.rs:110`; `netmon/src/rules.rs:329-331` | C | fixed (step 10) |
-| U6 | Low | `monitor.rs` (1477 lines) holds owners, rules, asks, hostnames, capture and containers. | `netmon/src/monitor.rs` | A | open |
+| U6 | Low | `monitor.rs` (1477 lines) holds owners, rules, asks, hostnames, capture and containers. | `netmon/src/monitor.rs` | A | fixed (step 11) |
 
 ## Test gaps
 
