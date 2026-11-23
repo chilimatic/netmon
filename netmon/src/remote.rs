@@ -129,6 +129,7 @@ mod tests {
     /// A daemon that reads one line, then writes `lines`, then reads
     /// requests into the returned channel.
     fn fake_daemon(name: &str, lines: Vec<ToClient>) -> (std::path::PathBuf, mpsc::Receiver<String>) {
+        let _fs = crate::test_fs_lock();
         let dir = std::env::temp_dir().join(format!("netmon-remote-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

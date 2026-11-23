@@ -559,6 +559,7 @@ remote = "2001:db8::1"
 
     #[test]
     fn atomic_write_replaces_and_leaves_no_temp() {
+        let _fs = crate::test_fs_lock();
         let dir = std::env::temp_dir().join(format!("netmon-save-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rules.toml");

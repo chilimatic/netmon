@@ -570,6 +570,7 @@ mod tests {
 
     #[test]
     fn bind_replaces_stale_socket_only() {
+        let _fs = crate::test_fs_lock();
         let dir = std::env::temp_dir().join(format!("netmond-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

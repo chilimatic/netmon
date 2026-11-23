@@ -200,6 +200,7 @@ mod tests {
 
     #[test]
     fn logs_once_per_program_and_destination() {
+        let _fs = crate::test_fs_lock();
         let d = dir("once");
         let path = d.join("sub/connections.log");
         let mut log = ConnLog::new(&path, None);
@@ -219,6 +220,7 @@ mod tests {
 
     #[test]
     fn rotates_and_reports_errors_once() {
+        let _fs = crate::test_fs_lock();
         let d = dir("rotate");
         let path = d.join("connections.log");
         let mut log = ConnLog::new(&path, None);
@@ -236,6 +238,7 @@ mod tests {
 
     #[test]
     fn tail_skips_a_cut_first_line() {
+        let _fs = crate::test_fs_lock();
         let d = dir("tail");
         std::fs::create_dir_all(&d).unwrap();
         let path = d.join("connections.log");

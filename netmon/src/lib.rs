@@ -30,6 +30,15 @@ mod text;
 mod tui;
 mod ui;
 
+/// Tests that create directories hold this lock: the socket bind test sets
+/// a narrow umask for a moment, and a directory made in that moment gets
+/// no execute bit.
+#[cfg(test)]
+pub(crate) fn test_fs_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub use daemon::run as run_daemon;
 pub use monitor::RulesFileError;
 pub use notify::run as run_notify;

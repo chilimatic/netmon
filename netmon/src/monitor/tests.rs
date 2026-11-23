@@ -379,6 +379,7 @@ fn block_toggle_and_remove_from_rules_tab() {
 
 #[test]
 fn connection_log_gets_new_flows_and_denials() {
+    let _fs = crate::test_fs_lock();
     let (mut m, t0) = monitor();
     let dir = std::env::temp_dir().join(format!("netmon-connlog-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -433,6 +434,7 @@ fn timed_rules_end() {
 
 #[test]
 fn rules_file_owned_by_a_user_is_refused() {
+    let _fs = crate::test_fs_lock();
     let (mut m, _) = monitor();
     let dir = std::env::temp_dir().join(format!("netmon-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
