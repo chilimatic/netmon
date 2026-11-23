@@ -293,6 +293,7 @@ default `netmon`), `--log PATH` (the connection log, default
 | `Q` | Processes | Turn QUIC (HTTP/3) off or on for the exe: a rule denies its outbound UDP port 443. Browsers then use TCP, where netmon sees the TLS server name. |
 | `d` | Rules | Remove the selected rule |
 | `t` | Rules | Set the end time of the selected rule: 1 hour, then 1 day, then none |
+| `P` | Rules | Pick a rule profile (`↑↓`, `Enter` loads, `Esc` cancels) |
 | `s` | Rules | Save all rules to the rules file |
 | `s` `c` `x` `f` `End` | Capture | Save `.pcap`, clear, stop, follow new packets |
 | `a` | Hosts | Type a hostname to block. `Enter` blocks it, `Esc` cancels. |
@@ -740,6 +741,34 @@ until = 2026-12-01T18:00:00Z   # TOML date and time; Z is UTC
   in match order. It writes a temporary file (mode 0644) and renames it
   over the old one. Only the `comment` fields stay. Other `#` comments of a
   hand-written file are lost.
+
+### Rule profiles
+
+A rule profile is a second rules file, for example one for home and one
+for work. Each profile is a file `/etc/netmon/profiles/<name>.toml` in the
+format of the rules file. The name has lower-case letters, digits, `-` and
+`_`. The profile `default` is the rules file that netmond started with.
+
+1. Write a profile, for example from the current rules file:
+
+   ```sh
+   sudo install -d -o root -g root -m 0755 /etc/netmon/profiles
+   sudo cp /etc/netmon/rules.toml /etc/netmon/profiles/work.toml
+   ```
+
+2. In the Rules tab, press `P`, select the profile, and press `Enter`.
+
+- The rules, the default action, the host blocks and the lists of the
+  profile replace the current ones. Temporary rules (`tmp`) stay.
+- If the profile file has an error, nothing changes, and the status line
+  names the error.
+- `s` saves into the active profile. The header shows `PROFILE <name>`.
+- netmond writes the name of the active profile to `/etc/netmon/profile`
+  and loads that profile at the next start. With `--rules PATH`, netmond
+  starts with that file and ignores `/etc/netmon/profile`. The profile
+  `default` removes the file.
+- Profile files have the checks of the rules file: they must belong to
+  root and must not be writable by group or others.
 
 ### Ask mode
 

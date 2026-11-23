@@ -467,6 +467,11 @@ Small, independent features after the firewall core:
 - **Notifier 1-hour buttons, QUIC off per program: done (2026-11-23).**
   The notifier buttons are Allow 1 h, Deny 1 h, Allow always, Deny always.
   `Q` in the Processes tab toggles "deny out exe X udp port 443".
+- **Rule profiles: done (2026-11-23).** `/etc/netmon/profiles/<name>.toml`;
+  `P` in the Rules tab picks one. The profile replaces the file rules,
+  default, host blocks and lists; temporary rules stay; an error changes
+  nothing. The active name goes to `/etc/netmon/profile` and loads at the
+  next start (not with `--rules`). Protocol version 6.
 - **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.

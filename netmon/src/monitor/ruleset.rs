@@ -216,14 +216,63 @@ impl<K: Kernel> Monitor<K> {
         }
     }
 
-    /// Appends the rules of the rules file. Returns a status message, or
-    /// None when the default file does not exist. Any error loads no rule
-    /// of the file.
+    /// Loads the rules file at start: `--rules`, else the active profile
+    /// (`/etc/netmon/profile`), else the default file. Returns a status
+    /// message, or None when the default file does not exist. Any error
+    /// loads no rule of the file.
     pub(crate) fn load_rules_file(&mut self, args: &Args) -> Result<Option<String>, String> {
-        let path = args.rules.clone().unwrap_or_else(|| rulefile::DEFAULT_PATH.into());
-        self.rules_path = path.clone();
+        let base = args.rules.clone().unwrap_or_else(|| rulefile::DEFAULT_PATH.into());
+        self.base_rules_path = base.clone();
+        if args.rules.is_none()
+            && let Some(name) = active_profile(&base)
+        {
+            let path = profile_path(&base, &name);
+            if path.exists() {
+                self.rules.profile = name;
+                return self.load_rules_path(&path, true, false);
+            }
+        }
+        self.load_rules_path(&base, args.rules.is_some(), false)
+    }
+
+    /// Switches to profile `name` ("default": the rules file netmond
+    /// started with): its rules, default, host blocks and lists replace
+    /// the current ones. Temporary rules stay. On any error nothing changes.
+    pub(crate) fn load_profile(&mut self, name: &str) -> String {
+        if let Err(e) = check_profile_name(name) {
+            return e;
+        }
+        let base = self.base_rules_path.clone();
+        let path = if name == DEFAULT_PROFILE { base.clone() } else { profile_path(&base, name) };
+        let msg = match self.load_rules_path(&path, true, true) {
+            Ok(m) => m.unwrap_or_default(),
+            Err(e) => return e,
+        };
+        self.rules.profile = if name == DEFAULT_PROFILE { String::new() } else { name.to_string() };
+        self.drop_decided_asks();
+        // Remembered for the next start.
+        let active = base.with_file_name(ACTIVE_PROFILE_FILE);
+        let saved = if name == DEFAULT_PROFILE {
+            match std::fs::remove_file(&active) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+                _ => Ok(()),
+            }
+        } else {
+            rulefile::save(&active, &format!("{name}\n"))
+        };
+        match saved {
+            Ok(()) => format!("profile {name}: {msg}"),
+            Err(e) => format!("profile {name}: {msg}; not remembered for the next start: {e}"),
+        }
+    }
+
+    /// Loads the rules file at `path`. `replace`: the file's rules, hosts
+    /// and lists replace the current ones (temporary rules stay), else
+    /// they are added.
+    fn load_rules_path(&mut self, path: &Path, required: bool, replace: bool) -> Result<Option<String>, String> {
+        let path = path.to_path_buf();
         let fail = |e: String| Err(format!("rules file {}: {e}; no file rules loaded", path.display()));
-        let text = match rulefile::read(&path, args.rules.is_some()) {
+        let text = match rulefile::read(&path, required) {
             Ok(Some(t)) => t,
             Ok(None) => return Ok(None),
             Err(e) => return fail(e),
@@ -252,6 +301,15 @@ impl<K: Kernel> Monitor<K> {
             .collect();
         let mut failed = false;
         let msg = self.change_rules(|rules| {
+            if replace {
+                let ids: Vec<u32> = rules.rules.iter().filter(|r| !r.temporary).map(|r| r.id).collect();
+                for id in ids {
+                    rules.remove(id);
+                }
+                rules.hosts.clear();
+                rules.blocklists.clear();
+                rules.default = rules::Action::Allow;
+            }
             if let Some(d) = default {
                 rules.default = d;
             }
@@ -284,7 +342,11 @@ impl<K: Kernel> Monitor<K> {
             let e = if ended.is_empty() { String::new() } else { format!(", {} ended rules left out", ended.len()) };
             Ok(format!("{n} rules from {}{d}{h}{e}", path.display()))
         });
-        if failed || msg.starts_with("rule update failed") { fail(msg) } else { Ok(Some(msg)) }
+        if failed || msg.starts_with("rule update failed") {
+            return fail(msg);
+        }
+        self.rules_path = path.clone();
+        Ok(Some(msg))
     }
 
     /// Marks running processes of exes that rules name. The exec and fork
@@ -320,4 +382,32 @@ pub(crate) fn read_blocklist(path: &Path, max: usize) -> Result<(HashSet<String>
     }
     let text = rulefile::read(path, true)?.unwrap_or_default();
     crate::blocklist::parse(&text, max)
+}
+
+/// The profile that stands for the rules file netmond started with.
+pub(crate) const DEFAULT_PROFILE: &str = "default";
+/// Next to the rules file: the name of the active profile.
+const ACTIVE_PROFILE_FILE: &str = "profile";
+/// Next to the rules file: one rules file per profile, `<name>.toml`.
+pub(crate) const PROFILES_DIR: &str = "profiles";
+
+/// Profile names: lower-case letters, digits, `-` and `_`, 1-32 long.
+pub(crate) fn check_profile_name(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 32
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    if ok { Ok(()) } else { Err(format!("profile {name:?}: use a-z, 0-9, - and _ (at most 32)")) }
+}
+
+pub(crate) fn profile_path(base: &Path, name: &str) -> std::path::PathBuf {
+    base.with_file_name(PROFILES_DIR).join(format!("{name}.toml"))
+}
+
+/// The active profile remembered next to the rules file, if any. The file
+/// has the checks of the rules file.
+fn active_profile(base: &Path) -> Option<String> {
+    let text = rulefile::read(&base.with_file_name(ACTIVE_PROFILE_FILE), false).ok()??;
+    let name = text.trim().to_string();
+    check_profile_name(&name).ok()?;
+    (name != DEFAULT_PROFILE).then_some(name)
 }

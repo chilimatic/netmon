@@ -52,6 +52,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         draw_graph(f, app, c, graph);
     }
     let paused = if app.paused { "  [PAUSED]" } else { "" };
+    let profile = if rules.profile.is_empty() { String::new() } else { format!("  PROFILE {}", rules.profile) };
     let capturing = match cap {
         Some(k) if k.running => format!("  ● capturing {}", k.target.label()),
         Some(k) => format!("  ■ stopped {}", k.target.label()),
@@ -72,7 +73,8 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             match &app.ask {
                 Some((_, more)) if app.ask_hidden => format!("  {} QUESTIONS WAITING (? shows)", more + 1),
                 _ => String::new(),
-            } + paused,
+            } + &profile
+                + paused,
             capturing,
             app.status
         ))
@@ -121,7 +123,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     } else if app.tab == Tab::Log {
         format!(" q quit  ←→/1-8 view  ↑↓ select  / filter [{}]   newest first, read every 2 s", app.filter)
     } else if app.tab == Tab::Rules {
-        " q quit  ←→/1-8 view  ↑↓ select  d remove rule  t end time 1h/1d/never  s save to rules file   tmp rules end when the monitor stops".to_string()
+        " q quit  ←→/1-8 view  ↑↓ select  d remove rule  t end time 1h/1d/never  P profile  s save to rules file   tmp rules end when the monitor stops".to_string()
     } else {
         let block = match app.tab {
             Tab::Connections => "  b/B/H block ip/port/host",
@@ -135,11 +137,40 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         )
     };
     f.render_widget(Paragraph::new(footer_text).style(Style::new().fg(Color::DarkGray)), footer);
+    if app.picking_profile {
+        draw_profiles(f, app, rules);
+    }
     if let Some((p, more)) = &app.ask
         && !app.ask_hidden
     {
         draw_ask(f, p, *more, &app.status);
     }
+}
+
+/// The profile picker over the Rules tab.
+fn draw_profiles(f: &mut Frame, app: &App, rules: &Rules) {
+    let active = if rules.profile.is_empty() { "default" } else { rules.profile.as_str() };
+    let a = f.area();
+    let h = (app.profiles.len() as u16 + 4).min(a.height.saturating_sub(2));
+    let w = 50.min(a.width.saturating_sub(4));
+    let r = Rect { x: a.x + (a.width - w) / 2, y: a.y + (a.height - h) / 2, width: w, height: h };
+    let mut lines: Vec<Line> = app
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mark = if p == active { " (active)" } else { "" };
+            let style = if i == app.profile_sel { Style::new().fg(Color::Black).bg(Color::Cyan) } else { Style::new() };
+            Line::from(Span::styled(format!(" {p}{mark} "), style))
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("↑↓ select  Enter load  Esc cancel", Style::new().fg(Color::Yellow))));
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::new().borders(Borders::ALL).title(" rule profile ").border_style(Style::new().fg(Color::Cyan))),
+        r,
+    );
 }
 
 /// Color of an edge by the kernel's verdict. Idle edges are gray.
@@ -865,6 +896,20 @@ mod tests {
         app.log.clear();
         app.log_error = "/var/log/netmon/connections.log: No such file or directory".into();
         assert!(draw_log_tab(&mut app).contains("No such file"));
+    }
+
+    #[test]
+    fn profile_picker_marks_the_active_profile() {
+        let mut app = App { tab: Tab::Rules, show_graph: false, picking_profile: true, ..App::default() };
+        app.profiles = vec!["default".into(), "home".into(), "work".into()];
+        app.profile_sel = 2;
+        let mut rules = Rules::default();
+        rules.profile = "home".into();
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app, &Collector::new(1), &Names::default(), None, &rules)).unwrap();
+        let s = screen(&term);
+        assert!(s.contains("rule profile") && s.contains("home (active)") && s.contains(" work "), "{s}");
+        assert!(s.contains("PROFILE home"), "header: {s}");
     }
 
     #[test]

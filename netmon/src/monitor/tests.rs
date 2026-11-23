@@ -433,6 +433,43 @@ fn timed_rules_end() {
 }
 
 #[test]
+fn profiles_replace_the_file_rules_and_keep_temporary_ones() {
+    let _fs = crate::test_fs_lock();
+    rulefile::TRUST_OWN_FILES.with(|t| t.set(true));
+    let dir = std::env::temp_dir().join(format!("netmon-profiles-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("profiles")).unwrap();
+    let base = dir.join("rules.toml");
+    std::fs::write(&base, "[[rule]]\naction = \"deny\"\nport = 25\n\n[[host]]\nname = \"ads.example\"\n").unwrap();
+    std::fs::write(dir.join("profiles/home.toml"), "default = \"deny\"\n\n[[rule]]\naction = \"allow\"\nport = 443\n").unwrap();
+    std::fs::write(dir.join("profiles/broken.toml"), "[[rule]]\naction = \"maybe\"\n").unwrap();
+    let (mut m, _) = monitor();
+    let a = Args { rules: Some(base.clone()), ..args(1000, 30) };
+    assert!(m.load_rules_file(&a).unwrap().unwrap().starts_with("1 rules from"));
+    m.request(Request::ToggleBlock(rules::BlockTarget::Port(IPPROTO_TCP, 9)));
+    m.rules.set_temporary(m.rules.rules[0].id);
+    let msg = m.request(Request::LoadProfile("home".into()));
+    assert!(msg.starts_with("profile home: 1 rules from"), "{msg}");
+    let shown: Vec<String> = m.rules.rules.iter().map(|r| r.to_string()).collect();
+    assert_eq!(shown, ["deny tcp port 9", "allow port 443"], "temporary rule stays on top");
+    assert_eq!((m.rules.default, m.rules.hosts.len(), m.rules.profile.as_str()), (rules::Action::Deny, 0, "home"));
+    assert_eq!(std::fs::read_to_string(dir.join("profile")).unwrap(), "home\n");
+    assert_eq!(m.rules_path, dir.join("profiles/home.toml"), "s saves into the profile");
+    // A broken profile changes nothing.
+    let msg = m.request(Request::LoadProfile("broken".into()));
+    assert!(msg.contains("no file rules loaded") && m.rules.profile == "home", "{msg}");
+    assert!(m.request(Request::LoadProfile("../etc".into())).contains("use a-z"));
+    // Back to the default: the file at start, and no remembered profile.
+    let msg = m.request(Request::LoadProfile("default".into()));
+    assert!(msg.starts_with("profile default: 1 rules from"), "{msg}");
+    assert_eq!((m.rules.default, m.rules.hosts.len(), m.rules.profile.as_str()), (rules::Action::Allow, 1, ""));
+    assert!(!dir.join("profile").exists());
+    assert_eq!(crate::client::list_profiles(&dir.join("profiles")), ["default", "broken", "home"]);
+    rulefile::TRUST_OWN_FILES.with(|t| t.set(false));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn rules_file_owned_by_a_user_is_refused() {
     let _fs = crate::test_fs_lock();
     let (mut m, _) = monitor();

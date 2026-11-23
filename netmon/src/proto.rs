@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Version of this protocol. Client and daemon must have the same.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// Where `netmond` listens.
 pub const DEFAULT_SOCKET: &str = "/run/netmon.sock";
@@ -78,6 +78,8 @@ pub enum Request {
     RemoveHost(u32),
     /// Read the host block lists again.
     ReloadBlocklists,
+    /// Switch to a rule profile ("default": the rules file).
+    LoadProfile(String),
     SaveRules,
     /// Answer a question for one of its destinations.
     Answer { question: u64, dest: DestId, scope: Scope, answer: Answer },

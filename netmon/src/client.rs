@@ -175,6 +175,15 @@ impl Client {
                 }
             }
             Action::ReloadBlocklists => Ok(Request::ReloadBlocklists),
+            Action::PickProfile => {
+                let dir = std::path::Path::new(crate::rulefile::DEFAULT_PATH).with_file_name(crate::monitor::PROFILES_DIR);
+                app.profiles = list_profiles(&dir);
+                let active = if self.snap.rules.profile.is_empty() { "default" } else { &self.snap.rules.profile };
+                app.profile_sel = app.profiles.iter().position(|p| p == active).unwrap_or(0);
+                app.picking_profile = true;
+                return None;
+            }
+            Action::LoadProfile(name) => Ok(Request::LoadProfile(name)),
             Action::Answer(answer) => match &app.ask {
                 Some((p, _)) => match p.selected_dest() {
                     Some(d) => Ok(Request::Answer { question: p.id, dest: dest_id(d), scope: p.scope, answer }),
@@ -250,6 +259,24 @@ impl Client {
             Tab::Capture | Tab::Rules | Tab::Graph | Tab::Hosts | Tab::Log => Err("select a row in another tab".into()),
         }
     }
+}
+
+/// "default" and the profiles in `dir` (`<name>.toml`), sorted.
+pub(crate) fn list_profiles(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let stem = name.strip_suffix(".toml")?;
+            crate::monitor::check_profile_name(stem).ok()?;
+            (stem != "default").then(|| stem.to_string())
+        })
+        .collect();
+    names.sort();
+    names.insert(0, "default".into());
+    names
 }
 
 /// The next end time for `t` in the Rules tab: none, then 1 hour, then 1

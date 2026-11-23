@@ -270,6 +270,9 @@ pub struct Rules {
     /// Host block lists (files with many names).
     #[serde(default)]
     pub blocklists: Vec<Blocklist>,
+    /// Active rule profile; empty: the rules file netmond started with.
+    #[serde(default)]
+    pub profile: String,
 }
 
 /// A host block list: a file of hostnames, each blocking itself and the

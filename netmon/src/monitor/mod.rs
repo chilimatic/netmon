@@ -37,6 +37,7 @@ mod tests;
 pub(crate) use containers::{ContainerResult, container_of, container_reader};
 pub use ruleset::RulesFileError;
 use ruleset::{GUARD_REFRESH, Guard, read_resolv};
+pub(crate) use ruleset::{PROFILES_DIR, check_profile_name};
 
 /// Options of the monitor itself: in `netmon` local mode and in `netmond`.
 pub(crate) const DEFAULT_INTERVAL_MS: u64 = 1000;
@@ -146,6 +147,9 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) links: Option<LinkWatch>,
     /// Where `s` in the Rules tab saves.
     pub(crate) rules_path: std::path::PathBuf,
+    /// The rules file netmond started with (`--rules` or the default): the
+    /// "default" profile. Profiles live next to it.
+    pub(crate) base_rules_path: std::path::PathBuf,
     /// Hostnames from DNS answers.
     pub(crate) hosts: names::HostNames,
     /// Ask mode: questions waiting for the user.
@@ -266,7 +270,7 @@ impl<K: Kernel> Monitor<K> {
         let mut collector = Collector::new(args.expire_ticks());
         collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new(), conn_log: None, log_done: HashSet::new(), log_pending: HashSet::new() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), base_rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new(), conn_log: None, log_done: HashSet::new(), log_pending: HashSet::new() };
         Ok((mon, errors))
     }
 
@@ -290,6 +294,7 @@ impl<K: Kernel> Monitor<K> {
             Request::BlockHost { pattern, comment } => self.block_host(&pattern, &comment),
             Request::RemoveHost(id) => self.remove_host(id),
             Request::ReloadBlocklists => self.reload_blocklists(),
+            Request::LoadProfile(name) => self.load_profile(&name),
             Request::SaveRules => {
                 let path = &self.rules_path;
                 match rulefile::save(path, &rulefile::render(&self.rules)) {

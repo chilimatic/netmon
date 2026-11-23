@@ -186,6 +186,10 @@ pub struct App {
     pub log: Vec<crate::connlog::Entry>,
     /// Why the log could not be read, empty if it could.
     pub log_error: String,
+    /// The profile picker is open (Rules tab, P): names and selection.
+    pub picking_profile: bool,
+    pub profiles: Vec<String>,
+    pub profile_sel: usize,
 }
 
 impl Default for App {
@@ -218,6 +222,9 @@ impl Default for App {
             host_input: String::new(),
             log: Vec::new(),
             log_error: String::new(),
+            picking_profile: false,
+            profiles: Vec::new(),
+            profile_sel: 0,
         }
     }
 }
@@ -271,6 +278,10 @@ pub enum Action {
     RemoveHost,
     /// Read the host block lists again.
     ReloadBlocklists,
+    /// Open the profile picker (the client lists the profiles).
+    PickProfile,
+    /// Switch to this rule profile.
+    LoadProfile(String),
     /// Block what the selected graph node stands for.
     BlockGraphNode,
     /// Write all rules to the rules file.
@@ -299,6 +310,21 @@ pub const ANSWER_SECS: u64 = 3600;
 
 impl App {
     pub fn on_key(&mut self, key: Key) -> Option<Action> {
+        if self.picking_profile {
+            match key {
+                Key::Up | Key::Char('k') => self.profile_sel = self.profile_sel.saturating_sub(1),
+                Key::Down | Key::Char('j') => {
+                    self.profile_sel = (self.profile_sel + 1).min(self.profiles.len().saturating_sub(1));
+                }
+                Key::Enter => {
+                    self.picking_profile = false;
+                    return self.profiles.get(self.profile_sel).cloned().map(Action::LoadProfile);
+                }
+                Key::Esc | Key::Char('q') => self.picking_profile = false,
+                _ => {}
+            }
+            return None;
+        }
         if self.editing_host {
             match key {
                 Key::Char(c) => self.host_input.push(c),
@@ -431,6 +457,7 @@ impl App {
             Key::Char('Q') if self.tab == Tab::Processes => return Some(Action::ToggleQuicProcess),
             Key::Char('d') if self.tab == Tab::Rules => return Some(Action::RemoveRule),
             Key::Char('t') if self.tab == Tab::Rules => return Some(Action::CycleRuleTimer),
+            Key::Char('P') if self.tab == Tab::Rules => return Some(Action::PickProfile),
             Key::Char('s') if self.tab == Tab::Rules => return Some(Action::SaveRules),
             Key::Enter if matches!(self.tab, Tab::Connections | Tab::Processes | Tab::Interfaces) => {
                 return Some(Action::StartCapture(self.tab));
@@ -849,6 +876,14 @@ mod tests {
         app.tab = Tab::Rules;
         assert_eq!(app.on_key(Key::Char('d')), Some(Action::RemoveRule));
         assert_eq!(app.on_key(Key::Char('t')), Some(Action::CycleRuleTimer));
+        assert_eq!(app.on_key(Key::Char('P')), Some(Action::PickProfile));
+        app.profiles = vec!["default".into(), "home".into()];
+        app.picking_profile = true;
+        assert_eq!(app.on_key(Key::Char('d')), None, "the picker takes the keys");
+        assert_eq!(app.on_key(Key::Down), None);
+        assert_eq!(app.on_key(Key::Down), None, "stops at the end");
+        assert_eq!(app.on_key(Key::Enter), Some(Action::LoadProfile("home".into())));
+        assert!(!app.picking_profile);
         let p = crate::ask::Prompt {
             id: 1,
             pid: 1,

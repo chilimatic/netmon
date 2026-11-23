@@ -152,9 +152,28 @@ pub fn read(path: &Path, required: bool) -> Result<Option<String>, String> {
     std::fs::read_to_string(path).map(Some).map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests that load rules files of their own set this: then files of
+    /// the test user count as root's. Per thread, so other tests still see
+    /// the real check.
+    pub(crate) static TRUST_OWN_FILES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Does `uid` own trusted files? Root only (and the test user in tests that
+/// ask for it).
+fn trusted_uid(uid: u32) -> bool {
+    #[cfg(test)]
+    // SAFETY: geteuid has no preconditions.
+    if TRUST_OWN_FILES.with(|t| t.get()) && uid == unsafe { libc::geteuid() } {
+        return true;
+    }
+    uid == 0
+}
+
 /// Why a file or directory with this owner and mode must not be trusted.
 fn unsafe_owner(uid: u32, mode: u32) -> Option<&'static str> {
-    if uid != 0 {
+    if !trusted_uid(uid) {
         Some("is not owned by root")
     } else if mode & 0o022 != 0 {
         Some("is writable by group or others")
