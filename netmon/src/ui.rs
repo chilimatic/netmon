@@ -494,11 +494,13 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, rules:
     let rows = app.conn_rows(c, names);
     let ids: Vec<RowId> = rows.iter().map(|r| r.id()).collect();
     let [area, detail] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let geo_col = app.geo.loaded();
     let line = match app.selected_in(&ids).map(|i| &rows[i]) {
         Some(r) if !r.source.is_empty() => format!(
-            " {}{}   exe {}   user {}   unit {}   owner from {}{}",
+            " {}{}{}   exe {}   user {}   unit {}   owner from {}{}",
             r.remote_addr,
             name_source(r),
+            if r.geo.is_empty() { String::new() } else { format!("   {}", r.geo) },
             or_dash(&r.exe),
             or_dash(&r.user),
             or_dash(&r.unit),
@@ -519,34 +521,28 @@ fn draw_conns(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, rules:
                 None => rules.denies(r.key.proto, remote, &r.exe, Dir::Out),
             };
             let style = if blocked { Style::new().fg(Color::Red) } else { Style::new() };
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(r.process),
                 Cell::from(r.pid),
                 Cell::from(r.proto),
                 Cell::from(r.local),
                 Cell::from(r.remote),
+            ];
+            if geo_col {
+                cells.push(Cell::from(r.geo));
+            }
+            cells.extend([
                 Cell::from(r.iface),
                 Cell::from(r.state),
                 Cell::from(Line::from(rate(r.tx_rate)).right_aligned()),
                 Cell::from(Line::from(rate(r.rx_rate)).right_aligned()),
                 Cell::from(Line::from(human(r.total as f64)).right_aligned()),
-            ])
-            .style(style)
+            ]);
+            Row::new(cells).style(style)
         }),
-        [
-            Constraint::Length(16),
-            Constraint::Length(7),
-            Constraint::Length(5),
-            Constraint::Fill(1),
-            Constraint::Fill(1),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(8),
-        ],
+        conn_columns(geo_col),
     )
-    .header(header_row(&["Process", "PID", "Proto", "Local", "Remote", "Iface", "State", "↑", "↓", "Total"]));
+    .header(header_row(&conn_headers(geo_col)));
     render_table(f, app, table, &ids, area);
 }
 
@@ -754,6 +750,25 @@ fn draw_hosts(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
     render_table(f, app, table, &ids, area);
 }
 
+/// Column widths of the Connections tab, with the Geo column or without.
+fn conn_columns(geo: bool) -> Vec<Constraint> {
+    let mut c = vec![Constraint::Length(16), Constraint::Length(7), Constraint::Length(5), Constraint::Fill(1), Constraint::Fill(1)];
+    if geo {
+        c.push(Constraint::Fill(1));
+    }
+    c.extend([Constraint::Length(12), Constraint::Length(10), Constraint::Length(10), Constraint::Length(10), Constraint::Length(8)]);
+    c
+}
+
+fn conn_headers(geo: bool) -> Vec<&'static str> {
+    let mut h = vec!["Process", "PID", "Proto", "Local", "Remote"];
+    if geo {
+        h.push("Geo (DB-IP)");
+    }
+    h.extend(["Iface", "State", "↑", "↓", "Total"]);
+    h
+}
+
 /// Row ids of the Hosts tab: the host blocks, then the lists.
 pub fn host_row_ids(rules: &Rules) -> Vec<RowId> {
     rules.hosts.iter().map(|h| h.id).chain(rules.blocklists.iter().map(|l| l.id)).map(RowId::Host).collect()
@@ -946,6 +961,26 @@ mod tests {
         app.log.clear();
         app.log_error = "/var/log/netmon/connections.log: No such file or directory".into();
         assert!(draw_log_tab(&mut app).contains("No such file"));
+    }
+
+    #[test]
+    fn geo_column_only_with_databases() {
+        assert_eq!(conn_columns(false).len(), conn_headers(false).len());
+        assert_eq!(conn_columns(true).len(), conn_headers(true).len());
+        assert!(!render(140, 20, false).contains("Geo (DB-IP)"), "no files, no column");
+        let Some(dir) = std::env::var_os("NETMON_GEO_TEST_DIR") else { return };
+        let mut c = Collector::new(30);
+        let mut k = FlowKey { family: 4, proto: 6, local_port: 1, remote_port: 443, ifindex: 2, ..Default::default() };
+        k.remote_addr[..4].copy_from_slice(&[1, 1, 1, 1]);
+        c.ingest([(k, FlowStats { tx_bytes: 5, ..Default::default() })], 1.0);
+        let mut app = App { show_graph: false, ..App::default() };
+        app.geo = crate::geo::Geo::open(std::path::Path::new(&dir));
+        let mut term = Terminal::new(TestBackend::new(160, 12)).unwrap();
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), None, &Rules::default())).unwrap();
+        let s = screen(&term);
+        assert!(s.contains("Geo (DB-IP)") && s.contains("AS13335 Cloudflare"), "{s}");
+        app.filter = "cloudflare".into();
+        assert_eq!(app.conn_rows(&c, &Names::default()).len(), 1, "the filter finds the AS name");
     }
 
     #[test]

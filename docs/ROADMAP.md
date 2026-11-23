@@ -477,7 +477,11 @@ Small, independent features after the firewall core:
   container) per local date; `/var/lib/netmon/usage.json` (root:netmon
   0640, `StateDirectory`), saved every 60 s and at stop, 90 days. Tab 9
   shows today, yesterday, 7 and 30 days.
-- **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
+- **GeoIP / ASN column: done (2026-11-23).** The UI reads DB-IP Lite
+  (`dbip-country-lite.mmdb`, `dbip-asn-lite.mmdb` in `/var/lib/netmon`,
+  crate `maxminddb`), caches per address, and shows `DE AS3320 Org` in
+  the Connections tab, the detail line and the filter. netmond does not
+  read the files.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.
 - **Capture filters**: `tcp port 443`, `dns`, `host 1.1.1.1` in the Capture

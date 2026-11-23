@@ -12,6 +12,7 @@ mod connlog;
 mod daemon;
 mod decode;
 mod engine;
+mod geo;
 mod graph;
 mod ifaces;
 mod linkwatch;

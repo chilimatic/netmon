@@ -109,6 +109,8 @@ pub struct ConnRow {
     pub host_source: &'static str,
     /// Remote address and port, also when `remote` shows the hostname.
     pub remote_addr: String,
+    /// Country and network owner of the remote address, if known.
+    pub geo: String,
 }
 
 pub struct ProcRow {
@@ -199,6 +201,8 @@ pub struct App {
     pub log: Vec<crate::connlog::Entry>,
     /// Why the log could not be read, empty if it could.
     pub log_error: String,
+    /// Country and AS lookups (DB-IP Lite), if the files exist.
+    pub geo: crate::geo::Geo,
     /// Traffic per program (Usage tab), and why the file could not be read.
     pub usage: Vec<crate::usage::UsageRow>,
     pub usage_error: String,
@@ -238,6 +242,7 @@ impl Default for App {
             host_input: String::new(),
             log: Vec::new(),
             log_error: String::new(),
+            geo: crate::geo::Geo::default(),
             usage: Vec::new(),
             usage_error: String::new(),
             picking_profile: false,
@@ -572,10 +577,14 @@ impl App {
             .flows
             .values()
             .filter(|f| self.show_virtual || !names.kind(f.key.ifindex).is_virtual())
-            .map(|f| conn_row(f, names, self.show_hosts))
+            .map(|f| {
+                let mut r = conn_row(f, names, self.show_hosts);
+                r.geo = self.geo.label(crate::procmap::normalize(crate::collector::addr(f.key.family, &f.key.remote_addr, 0)).ip());
+                r
+            })
             .filter(|r| {
                 let host = r.host.as_deref().unwrap_or("");
-                self.matches(&[&r.process, &r.pid, &r.exe, &r.user, &r.unit, &r.local, &r.remote, host, &r.iface, r.proto])
+                self.matches(&[&r.process, &r.pid, &r.exe, &r.user, &r.unit, &r.local, &r.remote, host, &r.iface, r.proto, &r.geo])
             })
             .collect();
         match self.sort {
@@ -705,6 +714,7 @@ fn conn_row(f: &Flow, names: &Names, show_hosts: bool) -> ConnRow {
             _ => f.remote.to_string(),
         },
         remote_addr: f.remote.to_string(),
+        geo: String::new(),
         host: f.host.clone(),
         host_source: f.host_source,
         iface: names.get(f.key.ifindex),

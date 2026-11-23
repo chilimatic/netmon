@@ -325,6 +325,7 @@ One row per connection and interface.
 | Proto | `tcp`, `udp`, `icmp`, `icmp6` or `other` |
 | Local | Local address and port |
 | Remote | Remote hostname and port, or the address (`h` switches) |
+| Geo (DB-IP) | Country, AS number and network owner of the remote address. Only with the DB-IP files (see [Country and network owner](#country-and-network-owner)). |
 | Iface | Interface |
 | State | TCP state from the socket table (`ESTAB`, `LISTEN`, ...), `container`, `nat` or `closed` |
 | ↑ ↓ | Upload and download rate |
@@ -567,6 +568,34 @@ the file every 10 s while it is open.
   stops. The file belongs to root and group `netmon`, mode 0640. A crash
   loses at most the last minute.
 - With `sudo netmon --local`, no usage is counted.
+
+### Country and network owner
+
+With the free DB-IP Lite databases, the Connections tab gets the column
+`Geo (DB-IP)`, for example `DE AS3320 Deutsche Telekom AG`. The detail
+line shows it too, and `/` filters by it. The UI reads the files, so
+netmond does not need them, and netmon sends no address anywhere.
+
+Download the two files once a month into `/var/lib/netmon/`. Replace
+`2026-11` with the current year and month:
+
+```sh
+for db in country asn; do
+  curl -fsSL "https://download.db-ip.com/free/dbip-$db-lite-2026-11.mmdb.gz" | gunzip | sudo tee /var/lib/netmon/dbip-$db-lite.mmdb > /dev/null
+done
+```
+
+Then start `netmon` again. `--geoip DIR` reads the files from another
+directory.
+
+- Private, loopback, link-local, multicast and CGNAT addresses get no
+  label.
+- A missing file is no error: the column shows only what the other file
+  knows. A file that cannot be read is named in the status line.
+- The country is where DB-IP places the network. For anycast networks
+  (Cloudflare, Google) it is often not where the server is.
+- The databases are licensed under CC BY 4.0: IP Geolocation by DB-IP
+  (https://db-ip.com).
 
 ## Hostnames
 

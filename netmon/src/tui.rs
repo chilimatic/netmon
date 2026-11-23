@@ -43,6 +43,10 @@ struct TuiArgs {
     /// Usage file that netmond writes, for the Usage tab.
     #[arg(long, value_name = "PATH", default_value = crate::usage::DEFAULT_PATH)]
     usage: PathBuf,
+    /// Directory with the DB-IP Lite files dbip-country-lite.mmdb and
+    /// dbip-asn-lite.mmdb, for the Geo column.
+    #[arg(long, value_name = "DIR", default_value = crate::geo::DEFAULT_DIR)]
+    geoip: PathBuf,
 }
 
 /// How often the UI reads netmond's messages.
@@ -110,7 +114,7 @@ pub fn run() -> anyhow::Result<()> {
         let engine = Box::new(Engine::new(mon, args.monitor.interval()));
         let snapshot = engine.mon.snapshot();
         let interval = engine.interval();
-        return run_tui(Backend::Local { engine, out: Vec::new() }, snapshot, interval, errors.join("; "), &args.log, &args.usage);
+        return run_tui(Backend::Local { engine, out: Vec::new() }, snapshot, interval, errors.join("; "), &args);
     }
     let m = &args.monitor;
     if m.rules.is_some() || m.ask {
@@ -123,7 +127,7 @@ pub fn run() -> anyhow::Result<()> {
     if let Some(secs) = args.once {
         return print_remote_once(remote, welcome.snapshot, secs);
     }
-    run_tui(Backend::Remote(remote), welcome.snapshot, welcome.interval, welcome.warnings.join("; "), &args.log, &args.usage)
+    run_tui(Backend::Remote(remote), welcome.snapshot, welcome.interval, welcome.warnings.join("; "), &args)
 }
 
 fn print_once(mon: &mut Monitor, secs: u64) -> anyhow::Result<()> {
@@ -180,10 +184,14 @@ fn run_tui(
     snapshot: Snapshot,
     interval: Duration,
     status: String,
-    log: &std::path::Path,
-    usage: &std::path::Path,
+    args: &TuiArgs,
 ) -> anyhow::Result<()> {
+    let (log, usage) = (args.log.as_path(), args.usage.as_path());
     let mut app = App { interval_secs: interval.as_secs_f64(), status, ..App::default() };
+    app.geo = crate::geo::Geo::open(&args.geoip);
+    if !app.geo.error.is_empty() {
+        app.status = format!("geo databases: {}", app.geo.error);
+    }
     let mut client = Client::new(snapshot, &mut app);
     let mut terminal = ratatui::init();
     let mut frame = std::time::Instant::now();
