@@ -111,7 +111,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     } else if app.tab == Tab::Capture {
         " q quit  ←→/1-8 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
     } else if app.tab == Tab::Hosts {
-        " q quit  ←→/1-8 view  ↑↓ select  a block a host  d remove  s save to rules file".to_string()
+        " q quit  ←→/1-8 view  ↑↓ select  a block a host  d remove  r reload lists  s save to rules file".to_string()
     } else if app.tab == Tab::Graph {
         format!(
             " q quit  ←→/1-8 view  ↑↓ select node  Enter its connections  b block it  z level [{}]  p pause  h names  v veth/bridge [{}]",
@@ -619,20 +619,37 @@ fn draw_log(f: &mut Frame, app: &mut App, area: Rect) {
 /// The Hosts tab: blocked hostnames, the addresses learned for them and
 /// the connections they denied.
 fn draw_hosts(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
-    if rules.hosts.is_empty() {
+    if rules.hosts.is_empty() && rules.blocklists.is_empty() {
         f.render_widget(
             Paragraph::new(
                 "\n  No blocked hosts.\n\n  a blocks a hostname: ads.example.com blocks that name, *.example.com also every\n  \
                  name below it. In Connections, H blocks the hostname of the selected row.\n\n  \
                  netmon learns the addresses from DNS answers and TLS server names and blocks them in\n  \
-                 the kernel, also on open connections. s saves the list with the rules.",
+                 the kernel, also on open connections. s saves the list with the rules.\n\n  \
+                 Lists of many names (hosts files, adblock lists) go in the rules file as [[blocklist]]\n  \
+                 sections (see README). r reads them again.",
             )
             .block(Block::new().borders(Borders::TOP)),
             area,
         );
         return;
     }
-    let ids: Vec<RowId> = rules.hosts.iter().map(|h| RowId::Host(h.id)).collect();
+    let ids = host_row_ids(rules);
+    let lists = rules.blocklists.iter().map(|l| {
+        let what = if l.error.is_empty() {
+            format!("{} names{}", l.count, if l.skipped > 0 { format!(", {} lines skipped", l.skipped) } else { String::new() })
+        } else {
+            format!("not read: {}", l.error)
+        };
+        Row::new(vec![
+            Cell::from(format!("list {}", l.path)),
+            Cell::from(Line::from(l.addrs.to_string()).right_aligned()),
+            Cell::from(what),
+            Cell::from(l.comment.clone()),
+            Cell::from(Line::from(l.hits.to_string()).right_aligned()),
+        ])
+        .style(Style::new().fg(if l.error.is_empty() { Color::Red } else { Color::Yellow }))
+    });
     let table = Table::new(
         rules.hosts.iter().map(|h| {
             let mut addrs: Vec<String> = h.addrs.iter().take(4).map(|a| a.to_string()).collect();
@@ -648,11 +665,17 @@ fn draw_hosts(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
                 Cell::from(Line::from(h.hits.to_string()).right_aligned()),
             ])
             .style(Style::new().fg(Color::Red))
-        }),
+        })
+        .chain(lists),
         [Constraint::Fill(1), Constraint::Length(6), Constraint::Fill(2), Constraint::Fill(1), Constraint::Length(10)],
     )
     .header(header_row(&["Host", "Addrs", "Addresses", "Comment", "Hits"]));
     render_table(f, app, table, &ids, area);
+}
+
+/// Row ids of the Hosts tab: the host blocks, then the lists.
+pub fn host_row_ids(rules: &Rules) -> Vec<RowId> {
+    rules.hosts.iter().map(|h| h.id).chain(rules.blocklists.iter().map(|l| l.id)).map(RowId::Host).collect()
 }
 
 /// " (name from tls)" when the row has a hostname.

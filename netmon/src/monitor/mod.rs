@@ -289,6 +289,7 @@ impl<K: Kernel> Monitor<K> {
             Request::SetRuleTimer { id, secs } => self.set_rule_timer(id, secs),
             Request::BlockHost { pattern, comment } => self.block_host(&pattern, &comment),
             Request::RemoveHost(id) => self.remove_host(id),
+            Request::ReloadBlocklists => self.reload_blocklists(),
             Request::SaveRules => {
                 let path = &self.rules_path;
                 match rulefile::save(path, &rulefile::render(&self.rules)) {

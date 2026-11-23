@@ -40,7 +40,7 @@ impl<K: Kernel> Engine<K> {
         }
         // Questions must show before the first TCP retransmit (~1 s), and
         // an address of a blocked hostname must reach the kernel soon.
-        if self.mon.links.is_some() || self.mon.rules.default == rules::Action::Ask || !self.mon.rules.hosts.is_empty() {
+        if self.mon.links.is_some() || self.mon.rules.default == rules::Action::Ask || self.mon.rules.has_host_blocks() {
             t = t.min(LINK_POLL);
         }
         t
@@ -71,7 +71,7 @@ impl<K: Kernel> Engine<K> {
         self.mon.drain_capture(DRAIN_BATCH);
         let mut out = self.packets();
         let mut changed = self.mon.poll_asks(now);
-        if !self.mon.rules.hosts.is_empty() {
+        if self.mon.rules.has_host_blocks() {
             changed |= self.mon.poll_names(now);
         }
         let mut errors = self.mon.check_links();

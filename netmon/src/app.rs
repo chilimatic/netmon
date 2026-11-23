@@ -265,8 +265,10 @@ pub enum Action {
     BlockHost(String),
     /// Block the hostname of the selected connection.
     BlockHostOfRow,
-    /// Remove the selected host block in the Hosts tab.
+    /// Remove the selected host block or list in the Hosts tab.
     RemoveHost,
+    /// Read the host block lists again.
+    ReloadBlocklists,
     /// Block what the selected graph node stands for.
     BlockGraphNode,
     /// Write all rules to the rules file.
@@ -418,6 +420,7 @@ impl App {
             Key::Char('8') => self.set_tab(Tab::Log),
             Key::Char('a') if self.tab == Tab::Hosts => self.editing_host = true,
             Key::Char('d') if self.tab == Tab::Hosts => return Some(Action::RemoveHost),
+            Key::Char('r') if self.tab == Tab::Hosts => return Some(Action::ReloadBlocklists),
             Key::Char('s') if self.tab == Tab::Hosts => return Some(Action::SaveRules),
             Key::Char('H') if self.tab == Tab::Connections => return Some(Action::BlockHostOfRow),
             Key::Char('b') if self.tab == Tab::Connections => return Some(Action::ToggleBlockRemote),
@@ -888,6 +891,7 @@ mod tests {
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Hosts);
         assert_eq!(app.on_key(Key::Char('d')), Some(Action::RemoveHost));
+        assert_eq!(app.on_key(Key::Char('r')), Some(Action::ReloadBlocklists));
         assert_eq!(app.on_key(Key::Char('a')), None);
         for c in "*.ads.example".chars() {
             assert_eq!(app.on_key(Key::Char(c)), None, "typing, not keys");

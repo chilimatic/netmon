@@ -29,6 +29,18 @@ struct RawFile {
     /// Blocked hostnames.
     #[serde(default)]
     host: Vec<toml::Spanned<RawHost>>,
+    /// Host block lists.
+    #[serde(default)]
+    blocklist: Vec<toml::Spanned<RawBlocklist>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBlocklist {
+    /// Absolute path of the list file.
+    path: String,
+    #[serde(default)]
+    comment: String,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +100,15 @@ pub struct RulesFile {
     pub default: Option<Action>,
     pub rules: Vec<FileRule>,
     pub hosts: Vec<FileHost>,
+    pub blocklists: Vec<FileBlocklist>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct FileBlocklist {
+    /// 1-based line of the `[[blocklist]]` header.
+    pub line: usize,
+    pub path: String,
+    pub comment: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -171,7 +192,19 @@ pub fn parse(text: &str) -> Result<RulesFile, String> {
                 .map_err(|e| format!("line {line}: {e}"))
         })
         .collect::<Result<_, _>>()?;
-    Ok(RulesFile { default: raw.default.map(action), rules, hosts })
+    let blocklists = raw
+        .blocklist
+        .into_iter()
+        .map(|b| {
+            let line = line_of(text, b.span().start);
+            let b = b.into_inner();
+            if !b.path.starts_with('/') {
+                return Err(format!("line {line}: blocklist path {:?}: use an absolute path", b.path));
+            }
+            Ok(FileBlocklist { line, path: b.path, comment: b.comment })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(RulesFile { default: raw.default.map(action), rules, hosts, blocklists })
 }
 
 fn action(a: RawAction) -> Action {
@@ -334,6 +367,12 @@ pub fn render(rules: &Rules) -> String {
         let _ = write!(out, "\n[[host]]\nname = {}\n", q(&h.pattern));
         if !h.comment.is_empty() {
             let _ = writeln!(out, "comment = {}", q(&h.comment));
+        }
+    }
+    for l in &rules.blocklists {
+        let _ = write!(out, "\n[[blocklist]]\npath = {}\n", q(&l.path));
+        if !l.comment.is_empty() {
+            let _ = writeln!(out, "comment = {}", q(&l.comment));
         }
     }
     out

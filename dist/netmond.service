@@ -16,6 +16,8 @@ RequiresMountsFor=/sys/fs/bpf
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/netmond
+# Reads the host block lists again; the rules stay.
+ExecReload=/bin/kill -HUP $MAINPID
 # SIGTERM is a clean stop: netmond removes its pins and rules. A crash
 # leaves them in force; the restart replaces them with the rules file.
 Restart=on-failure

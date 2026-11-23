@@ -1,5 +1,7 @@
 //! Rules: edits, the rules file, exe marks and the lockout guard.
 
+use std::path::Path;
+
 use super::*;
 
 /// Ticks between two reads of /etc/resolv.conf for the guard.
@@ -47,7 +49,29 @@ impl<K: Kernel> Monitor<K> {
         })
     }
 
+    /// Reads every host block list again (SIGHUP, r in the Hosts tab).
+    pub(crate) fn reload_blocklists(&mut self) -> String {
+        if self.rules.blocklists.is_empty() {
+            return "no blocklists in the rules file".into();
+        }
+        let mut left = crate::blocklist::MAX_NAMES;
+        let mut parts = Vec::new();
+        for l in &mut self.rules.blocklists {
+            let names = read_blocklist(Path::new(&l.path), left);
+            left -= names.as_ref().map_or(0, |(n, _)| n.len());
+            l.set_names(names);
+            parts.push(if l.error.is_empty() { format!("{} {}", l.path, l.count) } else { format!("{} failed: {}", l.path, l.error) });
+        }
+        let err = self.sync_host_blocks(Instant::now()).map(|e| format!("; {e}")).unwrap_or_default();
+        format!("blocklists reloaded: {}{err}", parts.join(", "))
+    }
+
     pub(crate) fn remove_host(&mut self, id: u32) -> String {
+        if self.rules.blocklists.iter().any(|l| l.id == id) {
+            let path = self.rules.remove_blocklist(id).unwrap_or_default();
+            let err = self.sync_host_blocks(Instant::now()).map(|e| format!("; {e}")).unwrap_or_default();
+            return format!("removed blocklist {path} (s saves the rules file without it){err}");
+        }
         let mut name = String::new();
         let msg = self.change_rules(|r| {
             name = r.remove_host(id).ok_or("host block already removed")?;
@@ -60,7 +84,7 @@ impl<K: Kernel> Monitor<K> {
     /// patterns match names learned before, removed patterns and old
     /// answers drop out. Fills the addresses and hits each pattern shows.
     pub(crate) fn sync_host_blocks(&mut self, now: Instant) -> Option<String> {
-        if self.rules.hosts.is_empty() && self.blocked.is_empty() && self.kernel_blocked.is_empty() {
+        if !self.rules.has_host_blocks() && self.blocked.is_empty() && self.kernel_blocked.is_empty() {
             return None;
         }
         let rules = &self.rules;
@@ -94,6 +118,11 @@ impl<K: Kernel> Monitor<K> {
             addrs.sort();
             h.hits = addrs.iter().filter_map(|a| hits.get(a)).sum();
             h.addrs = addrs;
+        }
+        for l in &mut self.rules.blocklists {
+            let addrs: Vec<_> = self.blocked.iter().filter(|(_, (n, _))| l.matches(n)).map(|(ip, _)| *ip).collect();
+            l.hits = addrs.iter().filter_map(|a| hits.get(a)).sum();
+            l.addrs = addrs.len();
         }
         error
     }
@@ -209,6 +238,18 @@ impl<K: Kernel> Monitor<K> {
         let n = rules_in.len();
         let hosts = parsed.hosts;
         let default = parsed.default;
+        // A list that cannot be read is no error of the rules file: it
+        // stays in the Hosts tab with its error, and a reload tries again.
+        let mut left = crate::blocklist::MAX_NAMES;
+        let lists: Vec<_> = parsed
+            .blocklists
+            .into_iter()
+            .map(|l| {
+                let names = read_blocklist(Path::new(&l.path), left);
+                left -= names.as_ref().map_or(0, |(n, _)| n.len());
+                (l, names)
+            })
+            .collect();
         let mut failed = false;
         let msg = self.change_rules(|rules| {
             if let Some(d) = default {
@@ -228,8 +269,18 @@ impl<K: Kernel> Monitor<K> {
                     format!("line {}: {e}", x.line)
                 })?;
             }
+            for (l, names) in lists {
+                rules.add_blocklist(&l.path, &l.comment, names).map_err(|e| {
+                    failed = true;
+                    format!("line {}: {e}", l.line)
+                })?;
+            }
             let d = if rules.default == rules::Action::Allow { String::new() } else { format!(", default {}", rules.default) };
             let h = if h == 0 { String::new() } else { format!(", {h} blocked hosts") };
+            let h = match rules.blocklists.len() {
+                0 => h,
+                n => format!("{h}, {n} blocklists ({} names)", rules.blocklist_names()),
+            };
             let e = if ended.is_empty() { String::new() } else { format!(", {} ended rules left out", ended.len()) };
             Ok(format!("{n} rules from {}{d}{h}{e}", path.display()))
         });
@@ -258,4 +309,15 @@ impl<K: Kernel> Monitor<K> {
         }
         (lost > 0).then(|| format!("exe marks full: exe rules do not apply to {lost} processes")).or(inode_error)
     }
+}
+
+/// Reads a host block list file with the checks of the rules file (owner
+/// root, not writable by group or others), at most `max` names.
+pub(crate) fn read_blocklist(path: &Path, max: usize) -> Result<(HashSet<String>, usize), String> {
+    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if size > crate::blocklist::MAX_FILE_BYTES {
+        return Err(format!("file larger than {} MB", crate::blocklist::MAX_FILE_BYTES / 1024 / 1024));
+    }
+    let text = rulefile::read(path, true)?.unwrap_or_default();
+    crate::blocklist::parse(&text, max)
 }

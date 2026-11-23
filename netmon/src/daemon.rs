@@ -85,7 +85,8 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-/// SIGHUP (a closed terminal, `kill -HUP`) must not remove the rules.
+/// SIGHUP (`systemctl reload netmond`, a closed terminal) reads the host
+/// block lists again. It never removes the rules.
 extern "C" fn on_hup(_: libc::c_int) {
     HUP.store(true, Ordering::Relaxed);
 }
@@ -216,7 +217,10 @@ fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> a
     let mut clients: HashMap<u64, Arc<Outbox>> = HashMap::new();
     while !STOP.load(Ordering::Relaxed) {
         if HUP.swap(false, Ordering::Relaxed) {
-            eprintln!("netmond: SIGHUP ignored: the rules stay; systemctl restart netmond reloads the rules file");
+            let msg = engine.mon.reload_blocklists();
+            eprintln!("netmond: SIGHUP: {msg}");
+            send(&mut clients, None, &ToClient::Status(msg));
+            send(&mut clients, None, &engine.snapshot());
         }
         let mut next = rx.recv_timeout(engine.wait().min(MAX_WAIT));
         // Requests that wait together get one snapshot, not one each.

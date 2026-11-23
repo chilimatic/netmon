@@ -295,7 +295,8 @@ default `netmon`), `--log PATH` (the connection log, default
 | `s` | Rules | Save all rules to the rules file |
 | `s` `c` `x` `f` `End` | Capture | Save `.pcap`, clear, stop, follow new packets |
 | `a` | Hosts | Type a hostname to block. `Enter` blocks it, `Esc` cancels. |
-| `d` | Hosts | Remove the selected host block |
+| `d` | Hosts | Remove the selected host block or list |
+| `r` | Hosts | Read the host block lists again |
 | `s` | Hosts | Save the rules and the host blocks to the rules file |
 | `↑` `↓` | Graph | Select a node |
 | `Enter` | Graph | Show the Connections tab, filtered to the selected node |
@@ -447,6 +448,46 @@ it reads, and blocks those addresses in the kernel (`HOST_BLOCKS`).
   connection that starts right after the DNS answer can pass in that time.
 - An address leaves the block 1 hour after the last answer for the name,
   like the names in the UI.
+
+#### Host block lists
+
+A host block list is a file with many names, for example the StevenBlack
+hosts file or an OISD list. Each name in a list blocks that name and every
+name below it, like a `*.name` pattern. netmond does not download lists.
+Download them yourself, for example with a systemd timer, then run
+`systemctl reload netmond`.
+
+1. Download a list into `/etc/netmon/lists/`. The file and its directory
+   must belong to root and must not be writable by group or others, as the
+   rules file:
+
+   ```sh
+   sudo install -d -o root -g root -m 0755 /etc/netmon/lists
+   curl -fsSL https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts | sudo tee /etc/netmon/lists/stevenblack.txt > /dev/null
+   ```
+
+2. Add a section to `/etc/netmon/rules.toml`:
+
+   ```toml
+   [[blocklist]]
+   path = "/etc/netmon/lists/stevenblack.txt"
+   comment = "ads and trackers"
+   ```
+
+3. Restart netmond: `sudo systemctl restart netmond`.
+
+- Formats, one entry per line: hosts file (`0.0.0.0 ads.example.com`),
+  adblock (`||ads.example.com^`), or one name per line. `#` starts a
+  comment. Lines that start with `!` or `[` are skipped.
+- The Hosts tab shows one row per list: the number of names, the
+  addresses learned for them and the hits. A list that cannot be read
+  shows its error in yellow. The other rules still load.
+- `r` in the Hosts tab and `systemctl reload netmond` (SIGHUP) read every
+  list again. The rules stay.
+- `d` removes the selected list from the running rules. `s` saves the
+  rules file without it. The list file stays.
+- At most 32 lists, 2 000 000 names together, and 128 MB per file.
+  Top-level names (`com`) and addresses in a list are ignored.
 
 Limits:
 

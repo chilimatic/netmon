@@ -257,7 +257,60 @@ pub struct Rules {
     /// Blocked hostnames, in the order they were added.
     #[serde(default)]
     pub hosts: Vec<HostBlock>,
+    /// Host block lists (files with many names).
+    #[serde(default)]
+    pub blocklists: Vec<Blocklist>,
 }
+
+/// A host block list: a file of hostnames, each blocking itself and the
+/// names below it.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Blocklist {
+    pub id: u32,
+    /// Absolute path of the file.
+    pub path: String,
+    pub comment: String,
+    /// Names read from the file.
+    pub count: usize,
+    /// Lines that held no hostname.
+    pub skipped: usize,
+    /// Why the file could not be read, empty if it was read.
+    pub error: String,
+    /// Addresses learned for its names, as last synced.
+    pub addrs: usize,
+    /// Connections denied for it since the start.
+    pub hits: u64,
+    /// The names. Not sent to the UI: lists hold up to millions of names.
+    #[serde(skip)]
+    pub names: std::sync::Arc<std::collections::HashSet<String>>,
+}
+
+impl Blocklist {
+    /// Takes the names read from the file, or the read error.
+    pub fn set_names(&mut self, names: Result<(std::collections::HashSet<String>, usize), String>) {
+        match names {
+            Ok((n, skipped)) => {
+                self.count = n.len();
+                self.skipped = skipped;
+                self.error.clear();
+                self.names = std::sync::Arc::new(n);
+            }
+            Err(e) => {
+                self.count = 0;
+                self.skipped = 0;
+                self.error = e;
+                self.names = Default::default();
+            }
+        }
+    }
+
+    pub fn matches(&self, name: &str) -> bool {
+        crate::blocklist::contains(&self.names, name)
+    }
+}
+
+/// Host block lists at most.
+pub const MAX_BLOCKLISTS: usize = 32;
 
 /// Patterns a host block list holds at most.
 pub const MAX_HOST_BLOCKS: usize = 256;
@@ -331,9 +384,52 @@ impl Rules {
         Some(self.hosts.remove(i).pattern)
     }
 
-    /// Is a hostname blocked by any pattern?
+    /// Is a hostname blocked by any pattern or list?
     pub fn host_blocked(&self, name: &str) -> bool {
-        self.hosts.iter().any(|h| h.matches(name))
+        self.hosts.iter().any(|h| h.matches(name)) || self.blocklists.iter().any(|l| l.matches(name))
+    }
+
+    /// Are there host blocks of any kind?
+    pub fn has_host_blocks(&self) -> bool {
+        !self.hosts.is_empty() || self.blocklists.iter().any(|l| l.count > 0)
+    }
+
+    /// Adds a host block list with the names read from it (`Err`: why the
+    /// file could not be read; the list stays, with no names). Returns its id.
+    pub fn add_blocklist(
+        &mut self,
+        path: &str,
+        comment: &str,
+        names: Result<(std::collections::HashSet<String>, usize), String>,
+    ) -> Result<u32, String> {
+        if !path.starts_with('/') || path.chars().any(char::is_control) {
+            return Err(format!("blocklist {path:?}: use an absolute path"));
+        }
+        if comment.chars().any(char::is_control) {
+            return Err("comment: control characters".into());
+        }
+        if self.blocklists.iter().any(|l| l.path == path) {
+            return Err(format!("blocklist {path} is already loaded"));
+        }
+        if self.blocklists.len() >= MAX_BLOCKLISTS {
+            return Err(format!("blocklist limit {MAX_BLOCKLISTS} reached"));
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut l = Blocklist { id, path: path.to_string(), comment: comment.to_string(), ..Blocklist::default() };
+        l.set_names(names);
+        self.blocklists.push(l);
+        Ok(id)
+    }
+
+    /// Names in all lists together.
+    pub fn blocklist_names(&self) -> usize {
+        self.blocklists.iter().map(|l| l.count).sum()
+    }
+
+    pub fn remove_blocklist(&mut self, id: u32) -> Option<String> {
+        let i = self.blocklists.iter().position(|l| l.id == id)?;
+        Some(self.blocklists.remove(i).path)
     }
 
     /// Inserts a rule at position `at` (clamped). Returns its id.

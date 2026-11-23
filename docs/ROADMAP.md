@@ -458,6 +458,12 @@ Small, independent features after the firewall core:
   (`DENIES`, one event per denied outbound connection, with the thread
   name), at most once per destination and minute. Tab 8 (Log) shows the
   newest 5000 lines.
+- **Host block lists: done (2026-11-23).** `[[blocklist]] path = ...` in
+  the rules file loads a hosts, adblock or plain list (root-owned, like
+  the rules file). Each name blocks itself and the names below it. The
+  names stay in the daemon (an `Arc` set, not in snapshots). `r` in the
+  Hosts tab and SIGHUP (`systemctl reload netmond`) read the lists again.
+  Protocol version 4.
 - **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.

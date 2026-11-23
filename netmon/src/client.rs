@@ -166,10 +166,13 @@ impl Client {
                 _ => Err("nothing to block for this node: select a process or a remote end".into()),
             },
             Action::RemoveHost => {
-                let hosts = &self.snap.rules.hosts;
-                let ids: Vec<_> = hosts.iter().map(|h| crate::app::RowId::Host(h.id)).collect();
-                app.selected_in(&ids).map(|i| Request::RemoveHost(hosts[i].id)).ok_or_else(|| "no host selected".into())
+                let ids = crate::ui::host_row_ids(&self.snap.rules);
+                match app.selected_in(&ids).map(|i| &ids[i]) {
+                    Some(crate::app::RowId::Host(id)) => Ok(Request::RemoveHost(*id)),
+                    _ => Err("no host selected".into()),
+                }
             }
+            Action::ReloadBlocklists => Ok(Request::ReloadBlocklists),
             Action::Answer(answer) => match &app.ask {
                 Some((p, _)) => match p.selected_dest() {
                     Some(d) => Ok(Request::Answer { question: p.id, dest: dest_id(d), scope: p.scope, answer }),

@@ -508,6 +508,45 @@ fn blocked_hostnames_reach_the_kernel_and_leave_it() {
 }
 
 #[test]
+fn blocklists_block_names_below_their_entries() {
+    let (mut m, t0) = monitor();
+    let names: HashSet<String> = ["example.com".to_string()].into();
+    m.rules.add_blocklist("/etc/netmon/lists/test.txt", "test", Ok((names, 2))).unwrap();
+    m.rules.add_blocklist("/etc/netmon/lists/gone.txt", "", Err("No such file or directory".into())).unwrap();
+    assert!(m.rules.has_host_blocks());
+    // An answer for cdn.example.com: below a listed name, so blocked at once.
+    let mut dns = vec![0, 2, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+    dns.extend_from_slice(b"\x03cdn\x07example\x03com\x00\x00\x01\x00\x01");
+    dns.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 5]);
+    let mut ev = netmon_common::NameEvent {
+        key: key(53),
+        len: dns.len() as u16,
+        kind: netmon_common::NAME_DNS,
+        _pad: 0,
+        data: [0; netmon_common::NAME_DATA],
+    };
+    ev.data[..dns.len()].copy_from_slice(&dns);
+    m.probe.names.push_back(ev);
+    assert!(m.poll_names(secs(t0, 1)));
+    let ip: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+    assert_eq!(m.probe.blocked, HashSet::from([ip]));
+    assert_eq!((m.rules.blocklists[0].addrs, m.rules.blocklists[1].addrs), (1, 0));
+    // The names never go to the UI; the counts do.
+    let snap = serde_json::to_string(&m.snapshot()).unwrap();
+    assert!(!snap.contains("\"example.com\"") && snap.contains("\"count\":1"), "{snap}");
+    let text = rulefile::render(&m.rules);
+    assert!(text.contains("[[blocklist]]\npath = \"/etc/netmon/lists/test.txt\"\ncomment = \"test\"\n"), "{text}");
+    assert_eq!(rulefile::parse(&text).unwrap().blocklists.len(), 2);
+    // d removes the list, and its addresses leave the kernel.
+    let id = m.rules.blocklists[0].id;
+    assert!(m.request(Request::RemoveHost(id)).starts_with("removed blocklist /etc/netmon/lists/test.txt"));
+    assert!(m.probe.blocked.is_empty());
+    // A reload reads the files again: here they do not exist.
+    let msg = m.request(Request::ReloadBlocklists);
+    assert!(msg.contains("/etc/netmon/lists/gone.txt failed"), "{msg}");
+}
+
+#[test]
 fn dns_answers_name_flows() {
     let (mut m, t0) = monitor();
     m.probe.flows = vec![(key(50001), tx(10))];

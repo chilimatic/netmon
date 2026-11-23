@@ -3,6 +3,7 @@
 
 mod app;
 mod ask;
+mod blocklist;
 mod btf;
 mod capture;
 mod client;
