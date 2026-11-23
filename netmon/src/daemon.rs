@@ -49,6 +49,12 @@ struct DaemonArgs {
     /// Group whose members may connect. If it does not exist, only root can.
     #[arg(long, default_value = "netmon")]
     group: String,
+    /// Connection log: new connections and denials, JSON lines.
+    #[arg(long, value_name = "PATH", default_value = crate::connlog::DEFAULT_PATH)]
+    log: PathBuf,
+    /// Write no connection log.
+    #[arg(long)]
+    no_log: bool,
 }
 
 /// Local TCP port netmond never blocks unless --guard-port says otherwise.
@@ -172,13 +178,16 @@ pub fn run() -> anyhow::Result<()> {
     // First the socket: it also makes sure no other netmond runs, whose
     // pins the load below would remove.
     let listener = bind(&args.socket, gid)?;
-    let (mon, warnings) = match Monitor::new(&args.monitor, Some(Path::new(PIN_DIR))) {
+    let (mut mon, warnings) = match Monitor::new(&args.monitor, Some(Path::new(PIN_DIR))) {
         Ok(m) => m,
         Err(e) => {
             let _ = std::fs::remove_file(&args.socket);
             return Err(e);
         }
     };
+    if !args.no_log {
+        mon.conn_log = Some(crate::connlog::ConnLog::new(&args.log, gid));
+    }
     // Start messages: problems and the rules file summary.
     for w in &warnings {
         eprintln!("netmond: {w}");

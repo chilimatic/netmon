@@ -64,6 +64,7 @@ pub struct Probe {
     packets: RingBuf<MapData>,
     names: RingBuf<MapData>,
     asks: RingBuf<MapData>,
+    denies: RingBuf<MapData>,
     drops: PerCpuArray<MapData, u64>,
     sock_owner: HashMap<MapData, u64, SockOwner>,
     listeners: HashMap<MapData, ListenKey, ListenOwner>,
@@ -203,6 +204,7 @@ impl Probe {
         let packets = RingBuf::try_from(take("PACKETS")?)?;
         let names = RingBuf::try_from(take("NAMES")?)?;
         let asks = RingBuf::try_from(take("ASKS")?)?;
+        let denies = RingBuf::try_from(take("DENIES")?)?;
         let drops = PerCpuArray::try_from(take("CAPTURE_DROPS")?)?;
         let sock_owner = HashMap::try_from(take("SOCK_OWNER")?)?;
         let listeners = HashMap::try_from(take("LISTENERS")?)?;
@@ -242,6 +244,7 @@ impl Probe {
             packets,
             names,
             asks,
+            denies,
             drops,
             sock_owner,
             listeners,
@@ -568,6 +571,8 @@ pub trait Kernel {
     fn drain_names(&mut self, max: usize, f: impl FnMut(&NameEvent));
     /// Takes up to `max` ask events (ask mode).
     fn drain_asks(&mut self, max: usize, f: impl FnMut(&AskEvent));
+    /// Takes up to `max` deny events (outbound connections denied).
+    fn drain_denies(&mut self, max: usize, f: impl FnMut(&netmon_common::DenyEvent));
     /// Answers an asked outbound connection: writes `action` (ACTION_*)
     /// as its verdict for the current rules.
     fn set_verdict(&mut self, key: &ConnKey, action: u8) -> anyhow::Result<()>;
@@ -736,6 +741,19 @@ impl Kernel for Probe {
             if item.len() >= size_of::<AskEvent>() {
                 // SAFETY: the kernel wrote an AskEvent; the read is unaligned-safe.
                 let ev = unsafe { std::ptr::read_unaligned(item.as_ptr() as *const AskEvent) };
+                f(&ev);
+            }
+        }
+    }
+
+    fn drain_denies(&mut self, max: usize, mut f: impl FnMut(&netmon_common::DenyEvent)) {
+        use netmon_common::DenyEvent;
+        for _ in 0..max {
+            let Some(item) = self.denies.next() else { break };
+            if item.len() >= size_of::<DenyEvent>() {
+                // SAFETY: the kernel wrote a DenyEvent; the read is
+                // unaligned-safe.
+                let ev = unsafe { std::ptr::read_unaligned(item.as_ptr() as *const DenyEvent) };
                 f(&ev);
             }
         }

@@ -29,6 +29,7 @@ mod capturing;
 mod containers;
 mod hosts;
 pub(crate) mod listen;
+mod logging;
 mod ruleset;
 #[cfg(test)]
 mod tests;
@@ -160,6 +161,11 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) listen_watch: listen::ListenWatch,
     /// New listeners found by the last ticks, for the clients.
     pub(crate) new_listeners: Vec<listen::NewListener>,
+    /// The connection log (daemon only).
+    pub(crate) conn_log: Option<crate::connlog::ConnLog>,
+    /// Flows already logged, and flows seen once without an owner.
+    pub(crate) log_done: HashSet<netmon_common::FlowKey>,
+    pub(crate) log_pending: HashSet<netmon_common::FlowKey>,
     /// Unowned flows the container tables were already read for.
     pub(crate) containers_tried: HashSet<netmon_common::FlowKey>,
     /// Asked connections without a process the container tables were
@@ -260,7 +266,7 @@ impl<K: Kernel> Monitor<K> {
         let mut collector = Collector::new(args.expire_ticks());
         collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new(), conn_log: None, log_done: HashSet::new(), log_pending: HashSet::new() };
         Ok((mon, errors))
     }
 
@@ -414,6 +420,11 @@ impl<K: Kernel> Monitor<K> {
         if let Some(m) = self.expire_rules(rules::unix_now()) {
             errors.push(m);
         }
+        let t = Instant::now();
+        if let Some(e) = self.log_connections(now) {
+            errors.push(e);
+        }
+        self.prof.add("connection log", t);
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {
             errors.push(format!("capture: {e:#}"));

@@ -29,14 +29,16 @@ RestartPreventExitStatus=78
 #   CAP_SYS_PTRACE           read /proc/<pid>/fd, exe and net of others
 #   CAP_DAC_READ_SEARCH      read /proc and tracefs files of other users
 #   CAP_SYS_RESOURCE         locked memory for maps on kernels < 5.11
-#   CAP_CHOWN, CAP_FOWNER    give the socket to group netmon
+#   CAP_CHOWN, CAP_FOWNER    give the socket and the connection log to group netmon
 # Kernels before 5.8 have no CAP_BPF: add CAP_SYS_ADMIN there.
 CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE CAP_CHOWN CAP_FOWNER
 NoNewPrivileges=yes
-# It writes only the socket in /run, its pins and /etc/netmon (s in the
-# Rules tab saves there).
+# It writes only the socket in /run, its pins, /etc/netmon (s in the
+# Rules tab saves there) and the connection log in /var/log/netmon.
 ProtectSystem=strict
 ReadWritePaths=/run /sys/fs/bpf -/etc/netmon
+LogsDirectory=netmon
+LogsDirectoryMode=0755
 ProtectHome=read-only
 PrivateTmp=yes
 PrivateDevices=yes

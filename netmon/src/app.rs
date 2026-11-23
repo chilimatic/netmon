@@ -19,11 +19,12 @@ pub enum Tab {
     Rules,
     Graph,
     Hosts,
+    Log,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 7] =
-        [Tab::Connections, Tab::Processes, Tab::Interfaces, Tab::Capture, Tab::Rules, Tab::Graph, Tab::Hosts];
+    pub const ALL: [Tab; 8] =
+        [Tab::Connections, Tab::Processes, Tab::Interfaces, Tab::Capture, Tab::Rules, Tab::Graph, Tab::Hosts, Tab::Log];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -34,6 +35,7 @@ impl Tab {
             Tab::Rules => "Rules",
             Tab::Graph => "Graph",
             Tab::Hosts => "Hosts",
+            Tab::Log => "Log",
         }
     }
 
@@ -65,6 +67,8 @@ pub enum RowId {
     Iface(u32),
     Rule(u32),
     Host(u32),
+    /// A line of the connection log, by its content.
+    Log(u64),
 }
 
 pub struct ConnRow {
@@ -178,6 +182,10 @@ pub struct App {
     /// Typing a hostname to block (Hosts tab, a).
     pub editing_host: bool,
     pub host_input: String,
+    /// The newest lines of the connection log, newest first (Log tab).
+    pub log: Vec<crate::connlog::Entry>,
+    /// Why the log could not be read, empty if it could.
+    pub log_error: String,
 }
 
 impl Default for App {
@@ -208,6 +216,8 @@ impl Default for App {
             anim_drawn: 0.0,
             editing_host: false,
             host_input: String::new(),
+            log: Vec::new(),
+            log_error: String::new(),
         }
     }
 }
@@ -405,6 +415,7 @@ impl App {
             Key::Char('5') => self.set_tab(Tab::Rules),
             Key::Char('6') => self.set_tab(Tab::Graph),
             Key::Char('7') => self.set_tab(Tab::Hosts),
+            Key::Char('8') => self.set_tab(Tab::Log),
             Key::Char('a') if self.tab == Tab::Hosts => self.editing_host = true,
             Key::Char('d') if self.tab == Tab::Hosts => return Some(Action::RemoveHost),
             Key::Char('s') if self.tab == Tab::Hosts => return Some(Action::SaveRules),
@@ -480,6 +491,23 @@ impl App {
         }
         let needle = self.filter.to_lowercase();
         fields.iter().any(|f| f.to_lowercase().contains(&needle))
+    }
+
+    /// The log lines that match the filter, newest first, with their ids.
+    pub fn log_rows(&self) -> Vec<(&crate::connlog::Entry, RowId)> {
+        use std::hash::{Hash, Hasher};
+        self.log
+            .iter()
+            .filter(|e| {
+                let (remote, port, pid) = (e.remote.to_string(), e.port.to_string(), e.pid.to_string());
+                self.matches(&[&e.event, &e.dir, &e.proto, &remote, &port, &e.host, &pid, &e.comm, &e.exe, &e.time])
+            })
+            .map(|e| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                e.hash(&mut h);
+                (e, RowId::Log(h.finish()))
+            })
+            .collect()
     }
 
     pub fn conn_rows(&self, c: &Collector, names: &Names) -> Vec<ConnRow> {
@@ -722,7 +750,7 @@ mod tests {
     fn arrows_switch_tabs_and_esc_does_not_quit() {
         let mut app = App::default();
         app.on_key(Key::Left);
-        assert_eq!(app.tab, Tab::Hosts, "wraps around");
+        assert_eq!(app.tab, Tab::Log, "wraps around");
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Connections);
         app.on_key(Key::Right);
@@ -866,6 +894,8 @@ mod tests {
         }
         assert_eq!(app.on_key(Key::Enter), Some(Action::BlockHost("*.ads.example".into())));
         assert!(!app.editing_host && app.host_input.is_empty());
+        app.on_key(Key::Right);
+        assert_eq!(app.tab, Tab::Log);
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Connections, "wraps");
         assert_eq!(app.on_key(Key::Char('H')), Some(Action::BlockHostOfRow));

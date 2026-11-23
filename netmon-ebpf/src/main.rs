@@ -15,7 +15,7 @@ use aya_ebpf::{
     programs::{SockAddrContext, SockContext, TcContext, TracePointContext},
 };
 use netmon_common::{
-    ACTION_ALLOW, ACTION_ASK, ACTION_DENY, ASK_RING_BYTES, AskEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
+    ACTION_ALLOW, ACTION_ASK, ACTION_DENY, ASK_RING_BYTES, AskEvent, DENY_RING_BYTES, DenyEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
@@ -165,6 +165,25 @@ fn ask_event(c: &ConnKey, tgid: u32) -> bool {
     }
     e.submit(0);
     true
+}
+
+/// Outbound connections that were denied, for the connection log.
+#[map]
+static DENIES: RingBuf = RingBuf::with_byte_size(DENY_RING_BYTES, 0);
+
+/// Sends a deny event. A full ring loses the event: the log misses it,
+/// the verdict does not change.
+#[inline(never)]
+fn deny_event(c: &ConnKey, tgid: u32) {
+    let Some(mut e) = DENIES.reserve::<DenyEvent>(0) else { return };
+    let ev = e.as_mut_ptr();
+    unsafe {
+        (*ev).key = *c;
+        (*ev).tgid = tgid;
+        (*ev)._pad = 0;
+        (*ev).comm = bpf_get_current_comm().unwrap_or([0; 16]);
+    }
+    e.submit(0);
 }
 
 /// Connection -> direction and cached verdict. LRU is fine here: an
@@ -344,6 +363,11 @@ fn packet_denied(key: &FlowKey, egress: bool, tgid: u32) -> bool {
     }
     let (action, answered) = keep_answer(decide(&c, tgid, dir), prev_action, prev_answered);
     // A lost ask event is not cached: the retransmit asks again.
+    // Only the decision that turns a connection to deny is logged, not each
+    // dropped packet.
+    if action == ACTION_DENY && dir == DIR_OUT && prev_action != ACTION_DENY {
+        deny_event(&c, tgid);
+    }
     if action == ACTION_ASK && !ask_event(&c, tgid) {
         return true;
     }
@@ -397,7 +421,13 @@ fn sock_denied(c: &ConnKey, tgid: u32) -> bool {
         prev_action = st.action;
         prev_answered = st.answered;
     }
-    keep_answer(decide(c, tgid, dir), prev_action, prev_answered).0 == ACTION_DENY
+    let denied = keep_answer(decide(c, tgid, dir), prev_action, prev_answered).0 == ACTION_DENY;
+    // Socket calls are not cached: a program that retries sends one event
+    // per try. Userspace logs one line per destination and minute.
+    if denied && dir == DIR_OUT {
+        deny_event(c, tgid);
+    }
+    denied
 }
 
 /// Process of the socket that sent an egress packet, from its cookie.

@@ -37,6 +37,9 @@ struct TuiArgs {
     /// Monitor in this process (needs root), even if netmond runs.
     #[arg(long)]
     local: bool,
+    /// Connection log that netmond writes, for the Log tab.
+    #[arg(long, value_name = "PATH", default_value = crate::connlog::DEFAULT_PATH)]
+    log: PathBuf,
 }
 
 /// How often the UI reads netmond's messages.
@@ -104,7 +107,7 @@ pub fn run() -> anyhow::Result<()> {
         let engine = Box::new(Engine::new(mon, args.monitor.interval()));
         let snapshot = engine.mon.snapshot();
         let interval = engine.interval();
-        return run_tui(Backend::Local { engine, out: Vec::new() }, snapshot, interval, errors.join("; "));
+        return run_tui(Backend::Local { engine, out: Vec::new() }, snapshot, interval, errors.join("; "), &args.log);
     }
     let m = &args.monitor;
     if m.rules.is_some() || m.ask {
@@ -117,7 +120,7 @@ pub fn run() -> anyhow::Result<()> {
     if let Some(secs) = args.once {
         return print_remote_once(remote, welcome.snapshot, secs);
     }
-    run_tui(Backend::Remote(remote), welcome.snapshot, welcome.interval, welcome.warnings.join("; "))
+    run_tui(Backend::Remote(remote), welcome.snapshot, welcome.interval, welcome.warnings.join("; "), &args.log)
 }
 
 fn print_once(mon: &mut Monitor, secs: u64) -> anyhow::Result<()> {
@@ -158,16 +161,35 @@ fn print_rows(snap: &Snapshot) {
     }
 }
 
+/// How often the Log tab reads the connection log.
+const LOG_READ: Duration = Duration::from_secs(2);
+/// Log lines the Log tab shows at most.
+const LOG_LINES: usize = 5000;
+
 /// Time between two frames of the graph animation.
 const ANIM_FRAME: Duration = Duration::from_millis(100);
 
-fn run_tui(mut backend: Backend, snapshot: Snapshot, interval: Duration, status: String) -> anyhow::Result<()> {
+fn run_tui(
+    mut backend: Backend,
+    snapshot: Snapshot,
+    interval: Duration,
+    status: String,
+    log: &std::path::Path,
+) -> anyhow::Result<()> {
     let mut app = App { interval_secs: interval.as_secs_f64(), status, ..App::default() };
     let mut client = Client::new(snapshot, &mut app);
     let mut terminal = ratatui::init();
     let mut frame = std::time::Instant::now();
+    let mut log_read: Option<Instant> = None;
     let result = (|| -> anyhow::Result<()> {
         while !app.quit {
+            if app.tab == Tab::Log && log_read.is_none_or(|t| t.elapsed() >= LOG_READ) {
+                log_read = Some(Instant::now());
+                match crate::connlog::tail(log, LOG_LINES) {
+                    Ok(l) => (app.log, app.log_error) = (l, String::new()),
+                    Err(e) => (app.log, app.log_error) = (Vec::new(), e),
+                }
+            }
             // The graph's dots move only while it shows and runs.
             let now = std::time::Instant::now();
             if app.tab == Tab::Graph && !app.paused {
@@ -182,6 +204,9 @@ fn run_tui(mut backend: Backend, snapshot: Snapshot, interval: Duration, status:
             let mut wait = backend.wait();
             if app.tab == Tab::Graph && !app.paused {
                 wait = wait.min(ANIM_FRAME);
+            }
+            if app.tab == Tab::Log {
+                wait = wait.min(LOG_READ);
             }
             if event::poll(wait).context("poll terminal events")?
                 && let Event::Key(k) = event::read()?

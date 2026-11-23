@@ -232,9 +232,11 @@ Options of the monitor:
 With a daemon, give these options to `netmond`, not to `netmon`. `netmon`
 refuses `--rules` and `--ask` when it connects to a daemon.
 
-Options of the UI: `--socket PATH` (another socket) and `--local` (no
-daemon). Options of the daemon: `--socket PATH` and `--group NAME` (the group
-that can connect, default `netmon`).
+Options of the UI: `--socket PATH` (another socket), `--local` (no daemon)
+and `--log PATH` (the connection log for the Log tab). Options of the
+daemon: `--socket PATH`, `--group NAME` (the group that can connect,
+default `netmon`), `--log PATH` (the connection log, default
+`/var/log/netmon/connections.log`) and `--no-log` (no connection log).
 
 ## The user interface
 
@@ -247,12 +249,12 @@ that can connect, default `netmon`).
  │─────────────────────────────── 120 samples ────────────────────────────│
  │ ↑ upload (magenta) below the zero line                                 │
  └────────────────────────────────────────────────────────────────────────┘
-  1 Connections  2 Processes  3 Interfaces  4 Capture  5 Rules  6 Graph  7 Hosts 3
+  1 Connections  2 Processes  3 Interfaces  4 Capture  5 Rules  6 Graph  7 Hosts  8 Log  3
  Process      PID   Proto Local            Remote             Iface  State ...  4
  firefox      4242  tcp   10.0.0.2:51234   example.com:443    enp5s0 ESTAB
  ...
  93.184.215.14:443 (name from tls)   exe /usr/lib/firefox/firefox   ...         5
- q quit  ←→/1-7 view  Enter capture  b/B block ip/port  r/t/n sort ...         6
+ q quit  ←→/1-8 view  Enter capture  b/B block ip/port  r/t/n sort ...         6
 ```
 
 1. Header. It shows the total upload and download rate of the physical
@@ -274,7 +276,7 @@ that can connect, default `netmon`).
 | Key | Where | Action |
 |---|---|---|
 | `q`, `Ctrl-C` | everywhere | Quit |
-| `←` `→` `Tab` `1`-`7` | everywhere | Select a tab |
+| `←` `→` `Tab` `1`-`8` | everywhere | Select a tab |
 | `↑` `↓` `PgUp` `PgDn` `Home` | tables | Select a row |
 | `/` | tables | Type a filter. `Enter` keeps it, `Esc` clears it. |
 | `Esc` | tables | Clear the filter (never quits) |
@@ -473,6 +475,34 @@ connect. While it is open, its keys have priority: in the Capture tab `x`
 denies, in the Rules tab `d` denies. `Esc` puts the questions aside, and the
 header then shows `n QUESTIONS WAITING (? shows)`. `?` shows them again.
 The section [Ask mode](#ask-mode) explains the answers.
+
+### Log tab
+
+The Log tab shows the newest 5000 lines of the connection log, newest
+first: time (UTC), event, direction, protocol, remote address, hostname,
+PID and program. Denials are red. `/` filters the lines. The tab reads the
+file every 2 s while it is open.
+
+`netmond` writes the log to `/var/log/netmon/connections.log`, one JSON
+object per line:
+
+```json
+{"time":"2026-11-23T13:37:23Z","event":"new","dir":"out","proto":"tcp","remote":"172.66.147.243","port":443,"host":"example.com","pid":72735,"comm":"curl","exe":"/usr/bin/curl"}
+```
+
+- `new`: the first connection of a program to a destination (address,
+  port, protocol and direction) while `netmond` runs. A flow is logged
+  when its owner is known, or on its second tick without one.
+- `denied`: an outbound connection that a rule, a host block or the
+  default denied. The kernel sends one event per denied connection. A
+  program that retries gets one line per destination and minute.
+- Inbound denials are not logged, because a port scan would fill the log.
+- `dir` is empty and `pid` is 0 when they are unknown. `exe` is empty if
+  the process exited before `netmond` read it.
+- At 10 MB, the file moves to `connections.log.1`, and the old `.1` goes.
+- The file belongs to root and group `netmon`, mode 0640. It shows which
+  program talks to which host, so only the group can read it.
+- With `sudo netmon --local`, no log is written.
 
 ## Hostnames
 

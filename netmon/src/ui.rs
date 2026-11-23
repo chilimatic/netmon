@@ -96,6 +96,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         Tab::Capture => draw_capture(f, cap, names, body),
         Tab::Graph => draw_conn_graph(f, app, c, names, body),
         Tab::Hosts => draw_hosts(f, app, rules, body),
+        Tab::Log => draw_log(f, app, body),
     }
 
     let sort = match app.sort {
@@ -108,17 +109,19 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     } else if app.editing_filter {
         format!(" filter: {}█   (Enter keep, Esc clear)", app.filter)
     } else if app.tab == Tab::Capture {
-        " q quit  ←→/1-7 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
+        " q quit  ←→/1-8 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
     } else if app.tab == Tab::Hosts {
-        " q quit  ←→/1-7 view  ↑↓ select  a block a host  d remove  s save to rules file".to_string()
+        " q quit  ←→/1-8 view  ↑↓ select  a block a host  d remove  s save to rules file".to_string()
     } else if app.tab == Tab::Graph {
         format!(
-            " q quit  ←→/1-7 view  ↑↓ select node  Enter its connections  b block it  z level [{}]  p pause  h names  v veth/bridge [{}]",
+            " q quit  ←→/1-8 view  ↑↓ select node  Enter its connections  b block it  z level [{}]  p pause  h names  v veth/bridge [{}]",
             app.graph_level.label(),
             if app.show_virtual { "on" } else { "off" }
         )
+    } else if app.tab == Tab::Log {
+        format!(" q quit  ←→/1-8 view  ↑↓ select  / filter [{}]   newest first, read every 2 s", app.filter)
     } else if app.tab == Tab::Rules {
-        " q quit  ←→/1-7 view  ↑↓ select  d remove rule  t end time 1h/1d/never  s save to rules file   tmp rules end when the monitor stops".to_string()
+        " q quit  ←→/1-8 view  ↑↓ select  d remove rule  t end time 1h/1d/never  s save to rules file   tmp rules end when the monitor stops".to_string()
     } else {
         let block = match app.tab {
             Tab::Connections => "  b/B/H block ip/port/host",
@@ -126,7 +129,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             _ => "",
         };
         format!(
-            " q quit  ←→/1-7 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  v veth/bridge [{}]  p pause  g graph",
+            " q quit  ←→/1-8 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  v veth/bridge [{}]  p pause  g graph",
             app.filter,
             if app.show_virtual { "on" } else { "off" }
         )
@@ -560,6 +563,59 @@ fn action_label(r: &crate::rules::Rule, now: u64) -> String {
     s
 }
 
+/// The Log tab: the newest lines of the connection log.
+fn draw_log(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.log.is_empty() {
+        let why = if app.log_error.is_empty() { "The log is empty.".to_string() } else { app.log_error.clone() };
+        f.render_widget(
+            Paragraph::new(format!(
+                "\n  {why}\n\n  netmond writes one line per new connection of a program to a destination, and per\n  \
+                 denied outbound connection, to {} (see README).",
+                crate::connlog::DEFAULT_PATH
+            ))
+            .block(Block::new().borders(Borders::TOP)),
+            area,
+        );
+        return;
+    }
+    let rows = app.log_rows();
+    let ids: Vec<RowId> = rows.iter().map(|(_, id)| id.clone()).collect();
+    let lines: Vec<Row> = rows
+        .iter()
+        .map(|(e, _)| {
+            let color = if e.event == "denied" { Color::Red } else { Color::Reset };
+            let program = if e.exe.is_empty() { e.comm.clone() } else { format!("{} ({})", e.comm, e.exe) };
+            let host = if e.host.is_empty() { String::new() } else { e.host.clone() };
+            Row::new(vec![
+                Cell::from(e.time.replace('T', " ").trim_end_matches('Z').to_string()),
+                Cell::from(e.event.clone()),
+                Cell::from(e.dir.clone()),
+                Cell::from(e.proto.clone()),
+                Cell::from(std::net::SocketAddr::new(e.remote, e.port).to_string()),
+                Cell::from(host),
+                Cell::from(if e.pid == 0 { "?".to_string() } else { e.pid.to_string() }),
+                Cell::from(program),
+            ])
+            .style(Style::new().fg(color))
+        })
+        .collect();
+    let table = Table::new(
+        lines,
+        [
+            Constraint::Length(19),
+            Constraint::Length(6),
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Length(30),
+            Constraint::Fill(1),
+            Constraint::Length(8),
+            Constraint::Fill(2),
+        ],
+    )
+    .header(header_row(&["Time (UTC)", "Event", "Dir", "Proto", "Remote", "Host", "PID", "Program"]));
+    render_table(f, app, table, &ids, area);
+}
+
 /// The Hosts tab: blocked hostnames, the addresses learned for them and
 /// the connections they denied.
 fn draw_hosts(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
@@ -754,6 +810,38 @@ mod tests {
         assert!(screen.contains("[SYN] seq 1000"));
         assert!(screen.contains("TCP     40000 → 443"));
         assert!(screen.contains("0000  aa bb cc dd ee ff"));
+    }
+
+    #[test]
+    fn log_tab_lists_entries_and_filters() {
+        let e = |event: &str, port: u16, comm: &str| crate::connlog::Entry {
+            time: "2026-11-23T14:08:08Z".into(),
+            event: event.into(),
+            dir: "out".into(),
+            proto: "tcp".into(),
+            remote: "1.1.1.1".parse().unwrap(),
+            port,
+            host: "one.one.one.one".into(),
+            pid: 7,
+            comm: comm.into(),
+            exe: format!("/usr/bin/{comm}"),
+        };
+        let mut app = App { tab: Tab::Log, show_graph: false, ..App::default() };
+        app.log = vec![e("denied", 25, "curl"), e("new", 443, "firefox")];
+        let draw_log_tab = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(140, 12)).unwrap();
+            term.draw(|f| draw(f, app, &Collector::new(1), &Names::default(), None, &Rules::default())).unwrap();
+            screen(&term)
+        };
+        let s = draw_log_tab(&mut app);
+        assert!(s.contains("8 Log") && s.contains("Time (UTC)"), "{s}");
+        assert!(s.contains("2026-11-23 14:08:08") && s.contains("1.1.1.1:25") && s.contains("curl (/usr/bin/curl)"), "{s}");
+        app.filter = "firefox".into();
+        let s = draw_log_tab(&mut app);
+        assert!(s.contains("1.1.1.1:443") && !s.contains("1.1.1.1:25"), "{s}");
+        app.log.clear();
+        app.log_error = "/var/log/netmon/connections.log: No such file or directory".into();
+        assert!(draw_log_tab(&mut app).contains("No such file"));
     }
 
     #[test]

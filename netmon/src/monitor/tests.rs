@@ -64,6 +64,7 @@ struct Fake {
     conns: HashMap<netmon_common::ConnKey, netmon_common::ConnState>,
     names: VecDeque<netmon_common::NameEvent>,
     asks: VecDeque<netmon_common::AskEvent>,
+    denies: VecDeque<netmon_common::DenyEvent>,
     verdicts: Vec<(netmon_common::ConnKey, u8)>,
     fail_block: bool,
     fail_capture: bool,
@@ -148,6 +149,12 @@ impl Kernel for Fake {
             f(&ev);
         }
     }
+    fn drain_denies(&mut self, max: usize, mut f: impl FnMut(&netmon_common::DenyEvent)) {
+        for _ in 0..max {
+            let Some(ev) = self.denies.pop_front() else { break };
+            f(&ev);
+        }
+    }
     fn set_verdict(&mut self, key: &netmon_common::ConnKey, action: u8) -> anyhow::Result<()> {
         self.verdicts.push((*key, action));
         Ok(())
@@ -205,6 +212,7 @@ fn monitor() -> (Monitor<Fake>, Instant) {
         conns: HashMap::new(),
         names: VecDeque::new(),
         asks: VecDeque::new(),
+        denies: VecDeque::new(),
         verdicts: Vec::new(),
         fail_block: false,
         fail_capture: false,
@@ -367,6 +375,37 @@ fn block_toggle_and_remove_from_rules_tab() {
     app.on_key(crate::app::Key::Char('5'));
     act(&mut m, &mut app, Action::RemoveRule);
     assert!(m.probe.table.is_empty() && m.rules.rules.is_empty(), "{}", app.status);
+}
+
+#[test]
+fn connection_log_gets_new_flows_and_denials() {
+    let (mut m, t0) = monitor();
+    let dir = std::env::temp_dir().join(format!("netmon-connlog-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("connections.log");
+    m.conn_log = Some(crate::connlog::ConnLog::new(&path, None));
+    // A flow without an owner is logged on its second tick.
+    m.probe.flows = vec![(key(40000), tx(100))];
+    let mut deny = netmon_common::DenyEvent { tgid: 4_000_000_000, ..Default::default() };
+    deny.comm[..4].copy_from_slice(b"bash");
+    deny.key.family = 4;
+    deny.key.proto = IPPROTO_TCP;
+    deny.key.remote_port = 25;
+    deny.key.remote_addr[..4].copy_from_slice(&[198, 51, 100, 7]);
+    m.probe.denies.push_back(deny);
+    m.probe.denies.push_back(deny);
+    m.tick_at(secs(t0, 1));
+    let got: Vec<_> = crate::connlog::tail(&path, 10).unwrap().into_iter().map(|e| (e.event, e.remote.to_string(), e.port)).collect();
+    assert_eq!(got, vec![("denied".to_string(), "198.51.100.7".to_string(), 25)], "two events, one line");
+    let e = &crate::connlog::tail(&path, 1).unwrap()[0];
+    assert_eq!((e.comm.as_str(), e.exe.as_str()), ("bash", ""), "name from the event: the pid is gone");
+    m.probe.flows = vec![(key(40000), tx(200))];
+    m.tick_at(secs(t0, 2));
+    m.tick_at(secs(t0, 3));
+    let got: Vec<_> = crate::connlog::tail(&path, 10).unwrap().into_iter().map(|e| (e.event, e.remote.to_string(), e.port)).collect();
+    assert_eq!(got[0], ("new".to_string(), "198.51.100.9".to_string(), 443), "{got:?}");
+    assert_eq!(got.len(), 2, "logged once: {got:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

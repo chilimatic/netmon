@@ -227,7 +227,7 @@ fn unix_secs(d: &toml::value::Datetime) -> Result<u64, String> {
 }
 
 /// Seconds since 1970 as a TOML date and time in UTC.
-fn utc(secs: u64) -> String {
+pub(crate) fn utc(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (y, m, d) = civil_from_days(days);

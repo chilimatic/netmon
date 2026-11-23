@@ -75,6 +75,9 @@ pub const ACTION_ASK: u8 = 3;
 
 /// Size of the ring buffer for ask events.
 pub const ASK_RING_BYTES: u32 = 256 * 1024;
+/// Ring for deny events (outbound connections a rule or the default
+/// denied), for the connection log.
+pub const DENY_RING_BYTES: u32 = 64 * 1024;
 
 /// An outbound connection that no rule decides, in ask mode.
 #[repr(C)]
@@ -84,6 +87,19 @@ pub struct AskEvent {
     /// Process that sent the packet, 0 if unknown.
     pub tgid: u32,
     pub _pad: u32,
+}
+
+/// An outbound connection that was denied, for the connection log.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DenyEvent {
+    pub key: ConnKey,
+    /// Process that connected or sent, 0 if unknown.
+    pub tgid: u32,
+    pub _pad: u32,
+    /// Name of the thread that connected: the process can be gone before
+    /// userspace reads /proc.
+    pub comm: [u8; 16],
 }
 
 /// This host opened the connection (or sends the datagram).

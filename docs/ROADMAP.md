@@ -452,6 +452,12 @@ Small, independent features after the firewall core:
   hosts can reach (not loopback, not multicast, UDP not in the ephemeral
   range) after the start goes to the journal, the UI status line and
   `netmon-notify`. Once per program, protocol and port. Protocol version 3.
+- **Connection log: done (2026-11-23).** `netmond` writes JSON lines to
+  `/var/log/netmon/connections.log` (root:netmon 0640, rotation at 10 MB):
+  `new` once per program and destination, `denied` from a new kernel ring
+  (`DENIES`, one event per denied outbound connection, with the thread
+  name), at most once per destination and minute. Tab 8 (Log) shows the
+  newest 5000 lines.
 - **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.

@@ -7,6 +7,7 @@ mod btf;
 mod capture;
 mod client;
 mod collector;
+mod connlog;
 mod daemon;
 mod decode;
 mod engine;

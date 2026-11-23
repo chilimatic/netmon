@@ -242,7 +242,7 @@ impl Client {
                     label: format!("{} {} → {} on {}", r.proto, r.local, r.remote, r.iface),
                 })
             }
-            Tab::Capture | Tab::Rules | Tab::Graph | Tab::Hosts => Err("select a row in another tab".into()),
+            Tab::Capture | Tab::Rules | Tab::Graph | Tab::Hosts | Tab::Log => Err("select a row in another tab".into()),
         }
     }
 }
