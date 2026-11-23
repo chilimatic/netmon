@@ -970,6 +970,38 @@ systemctl --user daemon-reload
 systemctl --user enable --now netmon-notify
 ```
 
+### Alerts
+
+`netmond` can send two kinds of alerts. Both are off until the rules file
+(or the active profile) has an `[alerts]` table. Put it after the
+`default` line, before the first `[[rule]]`:
+
+```toml
+[alerts]
+rate_mb = 50          # a program above 50 MB/s (up and down together)
+rate_seconds = 10     # for this many seconds in a row (default 10)
+new_country = true    # a program connects to a country it never used
+```
+
+An alert goes to the journal (`netmond: alert: ...`), the UI status line
+(`ALERT: ...`) and `netmon-notify` (`--no-alerts` turns these off).
+
+- Rate: the traffic of all connections of a program on the counted
+  interfaces. One alert per program every 10 minutes at most.
+- New country: the country comes from the DB-IP file (see
+  [Country and network owner](#country-and-network-owner)). Without it,
+  no country alert is possible. `netmond` keeps the pairs of program and
+  country in `/var/lib/netmon/countries.json` (root, group `netmon`,
+  0640), so a restart does not alert again.
+- Without that file, the first 10 minutes only learn. A desktop reaches
+  dozens of countries in its first minutes, and every one would alert.
+- At most 5 country alerts per tick. Further new pairs are remembered
+  without an alert.
+- Each program is the exe, or the process name if the process exited
+  before `netmond` read it. Then one program can show under two names.
+- With `new_country`, netmond reads the two DB-IP files into memory
+  (about 18 MB).
+
 ### New listeners
 
 When a program binds a port that other hosts can reach, `netmond` writes

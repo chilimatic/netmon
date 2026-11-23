@@ -73,6 +73,16 @@ impl Geo {
         self.country.is_some() || self.asn.is_some()
     }
 
+    /// The ISO country code of a public address, if the country database
+    /// knows it.
+    pub fn country(&self, ip: IpAddr) -> Option<String> {
+        if !is_public(ip) {
+            return None;
+        }
+        let c = self.country.as_ref()?.lookup(ip).ok()?.decode::<CountryRecord>().ok()??;
+        c.country?.iso_code.filter(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()))
+    }
+
     /// "DE AS3320 Deutsche Telekom AG" for a public address; empty for a
     /// private one or when nothing is known.
     pub fn label(&self, ip: IpAddr) -> String {

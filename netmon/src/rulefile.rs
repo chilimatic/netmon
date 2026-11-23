@@ -32,6 +32,17 @@ struct RawFile {
     /// Host block lists.
     #[serde(default)]
     blocklist: Vec<toml::Spanned<RawBlocklist>>,
+    /// When netmond sends alerts.
+    alerts: Option<toml::Spanned<RawAlerts>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAlerts {
+    rate_mb: Option<f64>,
+    rate_seconds: Option<u32>,
+    #[serde(default)]
+    new_country: bool,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +114,8 @@ pub struct RulesFile {
     pub rules: Vec<FileRule>,
     pub hosts: Vec<FileHost>,
     pub blocklists: Vec<FileBlocklist>,
+    /// None: the file has no `[alerts]` table.
+    pub alerts: Option<crate::rules::AlertConfig>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -231,7 +244,21 @@ pub fn parse(text: &str) -> Result<RulesFile, String> {
             Ok(FileBlocklist { line, path: b.path, comment: b.comment, url })
         })
         .collect::<Result<_, _>>()?;
-    Ok(RulesFile { default: raw.default.map(action), rules, hosts, blocklists })
+    let alerts = raw
+        .alerts
+        .map(|a| {
+            let line = line_of(text, a.span().start);
+            let a = a.into_inner();
+            if a.rate_mb.is_some_and(|r| !(r > 0.0 && r.is_finite())) {
+                return Err(format!("line {line}: alerts rate_mb: use a number above 0"));
+            }
+            if a.rate_seconds.is_some_and(|s| !(1..=3600).contains(&s)) {
+                return Err(format!("line {line}: alerts rate_seconds: use 1 to 3600"));
+            }
+            Ok(crate::rules::AlertConfig { rate_mb: a.rate_mb, rate_seconds: a.rate_seconds.unwrap_or(0), new_country: a.new_country })
+        })
+        .transpose()?;
+    Ok(RulesFile { default: raw.default.map(action), rules, hosts, blocklists, alerts })
 }
 
 fn action(a: RawAction) -> Action {
@@ -357,6 +384,19 @@ pub fn render(rules: &Rules) -> String {
     let q = |s: &str| toml::Value::String(s.to_string()).to_string();
     let mut out = String::from("# netmon rules, first match wins. Written by netmon.\n");
     let _ = writeln!(out, "default = {}", q(&rules.default.to_string()));
+    let a = &rules.alerts;
+    if a.any() || a.rate_seconds != 0 {
+        out.push_str("\n[alerts]\n");
+        if let Some(r) = a.rate_mb {
+            let _ = writeln!(out, "rate_mb = {r:?}");
+        }
+        if a.rate_seconds != 0 {
+            let _ = writeln!(out, "rate_seconds = {}", a.rate_seconds);
+        }
+        if a.new_country {
+            out.push_str("new_country = true\n");
+        }
+    }
     for r in rules.rules.iter().filter(|r| !r.temporary) {
         let m = &r.m;
         let _ = write!(out, "\n[[rule]]\naction = {}\n", q(&r.action.to_string()));
@@ -485,6 +525,22 @@ port = "8000-8100"
 action = "deny"
 remote = "2001:db8::1"
 "#;
+
+    #[test]
+    fn alerts_table_parses_checks_and_round_trips() {
+        let f = parse("default = \"allow\"\n\n[alerts]\nrate_mb = 50\nnew_country = true\n\n[[rule]]\naction = \"deny\"\nport = 25\n").unwrap();
+        let a = f.alerts.unwrap();
+        assert_eq!((a.rate_mb, a.rate_seconds(), a.new_country), (Some(50.0), 10, true));
+        assert!(parse("").unwrap().alerts.is_none());
+        assert!(err("[alerts]\nrate_mb = 0\n").contains("above 0"));
+        assert!(err("[alerts]\nrate_seconds = 0\n").contains("1 to 3600"));
+        assert!(err("[alerts]\nrate = 5\n").starts_with("line"), "unknown field");
+        let mut rules = Rules::default();
+        rules.alerts = a;
+        let back = parse(&render(&rules)).unwrap();
+        assert_eq!(back.alerts, Some(a));
+        assert!(!render(&Rules::default()).contains("[alerts]"));
+    }
 
     #[test]
     fn blocklist_url_round_trips_and_must_be_https() {

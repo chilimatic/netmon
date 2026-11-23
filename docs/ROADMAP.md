@@ -487,8 +487,12 @@ Small, independent features after the firewall core:
   read the files. Optional monthly update: `dist/netmon-geoip-update` with
   `netmon-geoip.service`/`.timer` (5th of the month, previous month as
   fallback, MaxMind marker check, atomic replace, sandboxed unit).
-- **Alerts**: highlight a process above a rate, or contacting a new country or
-  port.
+- **Alerts: done (2026-11-23).** `[alerts]` in the rules file: `rate_mb` and
+  `rate_seconds` per program (one alert per 10 minutes), `new_country`
+  from DB-IP with (program, country) pairs in
+  `/var/lib/netmon/countries.json`; 10 minutes of learning without that
+  file, 5 alerts per tick at most. Journal, UI status line, notifier.
+  Protocol version 7.
 - **Capture filters: done (2026-11-23).** `/` in the Capture tab sets a
   display filter (tcpdump subset: proto, port, host, net, dns/http/tls/
   quic, not/and/or). Fields are parsed once per packet; all packets stay;

@@ -254,6 +254,7 @@ fn run_tui(
                     ToClient::Reply { req, msg } => client.replied(&mut app, &req, msg),
                     ToClient::Status(s) => app.status = s,
                     ToClient::Listener(l) => app.status = crate::monitor::listen::describe(&l),
+                    ToClient::Alert(a) => app.status = format!("ALERT: {a}"),
                     ToClient::Error(e) => bail!("netmond: {e}"),
                     ToClient::Hello { .. } => {}
                 }

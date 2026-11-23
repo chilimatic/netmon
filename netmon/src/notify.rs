@@ -42,6 +42,9 @@ struct NotifyArgs {
     /// No notifications about new listeners.
     #[arg(long)]
     no_listeners: bool,
+    /// No notifications about rate and new-country alerts.
+    #[arg(long)]
+    no_alerts: bool,
 }
 
 /// How often the notifier reads netmond's messages.
@@ -78,7 +81,7 @@ pub fn run() -> anyhow::Result<()> {
         match Remote::connect(&args.socket) {
             Ok((remote, welcome)) => {
                 eprintln!("netmon-notify: connected to {}", args.socket.display());
-                let e = serve(remote, welcome.snapshot.questions, !args.no_listeners);
+                let e = serve(remote, welcome.snapshot.questions, !args.no_listeners, !args.no_alerts);
                 eprintln!("netmon-notify: {e:#}");
             }
             // The first error is shown, later ones repeat it.
@@ -97,7 +100,7 @@ struct Shown {
 }
 
 /// Serves one connection to netmond. Returns when it ends.
-fn serve(mut remote: Remote, questions: Vec<Prompt>, listeners: bool) -> anyhow::Error {
+fn serve(mut remote: Remote, questions: Vec<Prompt>, listeners: bool, alerts: bool) -> anyhow::Error {
     let (tx, clicks) = mpsc::channel::<(u64, String)>();
     let mut shown: HashMap<u64, Shown> = HashMap::new();
     let mut questions = questions;
@@ -120,6 +123,13 @@ fn serve(mut remote: Remote, questions: Vec<Prompt>, listeners: bool) -> anyhow:
                 ToClient::Snapshot(s) => questions = s.questions,
                 ToClient::Reply { req: Request::Answer { .. }, msg } => note("netmon", &msg),
                 ToClient::Error(e) => note("netmon", &e),
+                ToClient::Alert(a) if alerts => {
+                    let _ = Command::new("notify-send")
+                        .args(["-a", "netmon", "-u", "normal", "-t", &LISTENER_MS.to_string(), "--", "netmon alert", &escape(&a)])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
                 ToClient::Listener(l) if listeners => {
                     let (title, body) = listener_text(&l);
                     let _ = Command::new("notify-send")

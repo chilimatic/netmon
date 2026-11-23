@@ -273,6 +273,33 @@ pub struct Rules {
     /// Active rule profile; empty: the rules file netmond started with.
     #[serde(default)]
     pub profile: String,
+    /// When netmond sends alerts (`[alerts]` in the rules file).
+    #[serde(default)]
+    pub alerts: AlertConfig,
+}
+
+/// `[alerts]` in the rules file. All off by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AlertConfig {
+    /// Alert when a program sends and receives more than this many MB/s
+    /// (10^6 bytes) ...
+    pub rate_mb: Option<f64>,
+    /// ... for this many seconds in a row (0: the default, 10).
+    pub rate_seconds: u32,
+    /// Alert when a program connects to a country it never used before.
+    pub new_country: bool,
+}
+
+impl AlertConfig {
+    pub const DEFAULT_RATE_SECONDS: u32 = 10;
+
+    pub fn rate_seconds(&self) -> u32 {
+        if self.rate_seconds == 0 { Self::DEFAULT_RATE_SECONDS } else { self.rate_seconds }
+    }
+
+    pub fn any(&self) -> bool {
+        self.rate_mb.is_some() || self.new_country
+    }
 }
 
 /// A host block list: a file of hostnames, each blocking itself and the

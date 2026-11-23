@@ -287,6 +287,7 @@ impl<K: Kernel> Monitor<K> {
         let n = rules_in.len();
         let hosts = parsed.hosts;
         let default = parsed.default;
+        let alerts = parsed.alerts;
         // A list that cannot be read is no error of the rules file: it
         // stays in the Hosts tab with its error, and a reload tries again.
         let mut left = crate::blocklist::MAX_NAMES;
@@ -309,9 +310,13 @@ impl<K: Kernel> Monitor<K> {
                 rules.hosts.clear();
                 rules.blocklists.clear();
                 rules.default = rules::Action::Allow;
+                rules.alerts = rules::AlertConfig::default();
             }
             if let Some(d) = default {
                 rules.default = d;
+            }
+            if let Some(a) = alerts {
+                rules.alerts = a;
             }
             for r in rules_in {
                 let id = rules.insert(usize::MAX, r.action, r.m, &r.comment).map_err(|e| {

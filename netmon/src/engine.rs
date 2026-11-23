@@ -84,6 +84,7 @@ impl<K: Kernel> Engine<K> {
             }
             errors.extend(self.mon.tick_at(now));
             out.extend(self.mon.new_listeners.drain(..).map(ToClient::Listener));
+            out.extend(self.mon.new_alerts.drain(..).map(ToClient::Alert));
             changed = true;
         }
         if !errors.is_empty() {

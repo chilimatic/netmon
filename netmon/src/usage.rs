@@ -21,7 +21,7 @@ const KEEP_DAYS: usize = 90;
 /// Programs per day at most; the rest add up in OTHER.
 const MAX_PROGRAMS: usize = 2000;
 const OTHER: &str = "(other programs)";
-const UNKNOWN: &str = "(unknown)";
+pub(crate) const UNKNOWN: &str = "(unknown)";
 /// How often `netmond` writes the file.
 pub const SAVE_EVERY: Duration = Duration::from_secs(60);
 const LOOPBACK_IFINDEX: u32 = 1;
@@ -196,24 +196,31 @@ impl Usage {
     }
 
     fn write(&self) -> std::io::Result<()> {
-        let dir = self.path.parent().unwrap_or(Path::new("."));
-        std::fs::create_dir_all(dir)?;
-        let tmp = self.path.with_extension("json.tmp");
-        let _ = std::fs::remove_file(&tmp);
-        let mut f =
-            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o640).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
-        if let Some(gid) = self.gid {
-            std::os::unix::fs::fchown(&f, None, Some(gid))?;
-        }
-        f.set_permissions(std::fs::Permissions::from_mode(0o640))?;
-        f.write_all(serde_json::to_string(&self.file).unwrap_or_default().as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, &self.path)
+        write_private(&self.path, serde_json::to_string(&self.file).unwrap_or_default().as_bytes(), self.gid)
     }
 }
 
+/// Writes `data` to `path` through a temporary file and rename, mode 0640,
+/// group `gid`: readers never see half a file.
+pub(crate) fn write_private(path: &Path, data: &[u8], gid: Option<u32>) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o640).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+    if let Some(gid) = gid {
+        std::os::unix::fs::fchown(&f, None, Some(gid))?;
+    }
+    f.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
 /// The program a flow counts for.
-fn program(f: &Flow) -> String {
+pub(crate) fn program(f: &Flow) -> String {
     let Some(o) = &f.owner else { return UNKNOWN.into() };
     let exe = o.details.as_ref().map(|d| d.exe.as_str()).filter(|e| !e.is_empty());
     match (&o.container, exe) {

@@ -28,6 +28,7 @@ mod asks;
 mod capturing;
 mod containers;
 mod hosts;
+mod alerts;
 pub(crate) mod listen;
 mod logging;
 mod ruleset;
@@ -37,6 +38,7 @@ mod tests;
 pub(crate) use containers::{ContainerResult, container_of, container_reader};
 pub use ruleset::RulesFileError;
 use ruleset::{GUARD_REFRESH, Guard, read_resolv};
+pub(crate) use alerts::COUNTRIES_PATH;
 pub(crate) use ruleset::{PROFILES_DIR, check_profile_name};
 
 /// Options of the monitor itself: in `netmon` local mode and in `netmond`.
@@ -169,6 +171,9 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) conn_log: Option<crate::connlog::ConnLog>,
     /// Traffic per program and day (daemon only).
     pub(crate) usage: Option<crate::usage::Usage>,
+    /// Rate and new-country alerts, and the ones not sent yet.
+    pub(crate) alerts: alerts::Alerts,
+    pub(crate) new_alerts: Vec<String>,
     /// Flows already logged, and flows seen once without an owner.
     pub(crate) log_done: HashSet<netmon_common::FlowKey>,
     pub(crate) log_pending: HashSet<netmon_common::FlowKey>,
@@ -272,7 +277,7 @@ impl<K: Kernel> Monitor<K> {
         let mut collector = Collector::new(args.expire_ticks());
         collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), base_rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new(), conn_log: None, usage: None, log_done: HashSet::new(), log_pending: HashSet::new() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), base_rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new(), conn_log: None, usage: None, alerts: Default::default(), new_alerts: Vec::new(), log_done: HashSet::new(), log_pending: HashSet::new() };
         Ok((mon, errors))
     }
 
@@ -433,6 +438,16 @@ impl<K: Kernel> Monitor<K> {
             errors.push(e);
         }
         self.prof.add("connection log", t);
+        if self.rules.alerts.any() {
+            let t = Instant::now();
+            let cfg = self.rules.alerts;
+            let found = self.alerts.check(&cfg, &self.collector.flows, &self.collector.counted, dt, now);
+            self.new_alerts.extend(found);
+            if let Some(e) = self.alerts.save(now, false) {
+                errors.push(e);
+            }
+            self.prof.add("alerts", t);
+        }
         if let Some(u) = self.usage.as_mut() {
             let t = Instant::now();
             u.count(&self.collector.flows, &self.collector.counted, &crate::usage::today());

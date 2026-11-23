@@ -195,6 +195,8 @@ pub fn run() -> anyhow::Result<()> {
     if !args.no_log {
         mon.conn_log = Some(crate::connlog::ConnLog::new(&args.log, gid));
     }
+    mon.alerts.path = Some(crate::monitor::COUNTRIES_PATH.into());
+    mon.alerts.gid = gid;
     if !args.no_usage {
         let (u, err) = crate::usage::Usage::new(&args.usage, gid);
         if let Some(e) = err {
@@ -222,6 +224,9 @@ pub fn run() -> anyhow::Result<()> {
     // leaves the pins, and with them the rules.
     engine.mon.probe.unpin();
     if let Some(e) = engine.mon.usage.as_mut().and_then(|u| u.save(Instant::now(), true)) {
+        eprintln!("netmond: {e}");
+    }
+    if let Some(e) = engine.mon.alerts.save(Instant::now(), true) {
         eprintln!("netmond: {e}");
     }
     let _ = std::fs::remove_file(&args.socket);
@@ -283,6 +288,7 @@ fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> a
             match m {
                 ToClient::Status(s) => eprintln!("netmond: {s}"),
                 ToClient::Listener(l) => eprintln!("netmond: {}", crate::monitor::listen::describe(l)),
+                ToClient::Alert(a) => eprintln!("netmond: alert: {a}"),
                 _ => {}
             }
             send(&mut clients, None, m);
