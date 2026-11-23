@@ -29,6 +29,7 @@ mod proto;
 mod remote;
 mod rulefile;
 mod rules;
+mod stream;
 mod text;
 mod tui;
 mod ui;

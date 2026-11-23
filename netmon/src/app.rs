@@ -197,6 +197,8 @@ pub struct App {
     /// Typing a hostname to block (Hosts tab, a).
     pub editing_host: bool,
     pub host_input: String,
+    /// The "follow stream" view, while open.
+    pub stream: Option<StreamView>,
     /// Typing the display filter of the capture (Capture tab, /).
     pub editing_capture_filter: bool,
     pub capture_filter_input: String,
@@ -243,6 +245,7 @@ impl Default for App {
             anim_drawn: 0.0,
             editing_host: false,
             host_input: String::new(),
+            stream: None,
             editing_capture_filter: false,
             capture_filter_input: String::new(),
             log: Vec::new(),
@@ -271,6 +274,17 @@ pub enum Key {
     PageDown,
     Home,
     End,
+}
+
+/// The open "follow stream" view (Capture tab, S).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StreamView {
+    pub title: String,
+    /// One entry per text line: Some(true) client, Some(false) server,
+    /// None a note (missing bytes).
+    pub lines: Vec<(Option<bool>, String)>,
+    /// First shown line.
+    pub scroll: usize,
 }
 
 /// Work the main loop must do after a key press.
@@ -310,6 +324,8 @@ pub enum Action {
     PickProfile,
     /// Set the display filter of the capture; empty clears it.
     SetCaptureFilter(String),
+    /// Show the TCP stream of the selected packet.
+    FollowStream,
     /// Switch to this rule profile.
     LoadProfile(String),
     /// Block what the selected graph node stands for.
@@ -340,6 +356,20 @@ pub const ANSWER_SECS: u64 = 3600;
 
 impl App {
     pub fn on_key(&mut self, key: Key) -> Option<Action> {
+        if let Some(v) = self.stream.as_mut() {
+            let last = v.lines.len().saturating_sub(1);
+            match key {
+                Key::Up | Key::Char('k') => v.scroll = v.scroll.saturating_sub(1),
+                Key::Down | Key::Char('j') => v.scroll = (v.scroll + 1).min(last),
+                Key::PageUp => v.scroll = v.scroll.saturating_sub(20),
+                Key::PageDown => v.scroll = (v.scroll + 20).min(last),
+                Key::Home => v.scroll = 0,
+                Key::End => v.scroll = last,
+                Key::Esc | Key::Char('q') | Key::Char('S') => self.stream = None,
+                _ => {}
+            }
+            return None;
+        }
         if self.picking_profile {
             match key {
                 Key::Up | Key::Char('k') => self.profile_sel = self.profile_sel.saturating_sub(1),
@@ -442,6 +472,7 @@ impl App {
                 Key::Char('x') => return Some(Action::StopCapture),
                 Key::Char('s') => return Some(Action::SavePcap),
                 Key::Char('c') => return Some(Action::ClearCapture),
+                Key::Char('S') => return Some(Action::FollowStream),
                 // The input keeps the last filter, to edit it.
                 Key::Char('/') => {
                     self.editing_capture_filter = true;
@@ -876,6 +907,15 @@ mod tests {
             assert_eq!(app.on_key(Key::Char(c)), None, "typing, not keys");
         }
         assert_eq!(app.on_key(Key::Enter), Some(Action::SetCaptureFilter("dns".into())));
+        assert_eq!(app.on_key(Key::Char('S')), Some(Action::FollowStream));
+        app.stream = Some(StreamView { lines: vec![(None, "a".into()), (None, "b".into())], ..StreamView::default() });
+        assert_eq!(app.on_key(Key::Char('x')), None, "the view takes the keys");
+        app.on_key(Key::End);
+        assert_eq!(app.stream.as_ref().unwrap().scroll, 1);
+        app.on_key(Key::Down);
+        assert_eq!(app.stream.as_ref().unwrap().scroll, 1, "stops at the last line");
+        app.on_key(Key::Esc);
+        assert!(app.stream.is_none());
         assert_eq!(app.filter, "", "the table filter stays");
         // Outside the capture tab, 's' and 'x' do nothing.
         app.on_key(Key::Char('1'));

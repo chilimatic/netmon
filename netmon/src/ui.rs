@@ -117,7 +117,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     } else if app.editing_filter {
         format!(" filter: {}█   (Enter keep, Esc clear)", app.filter)
     } else if app.tab == Tab::Capture {
-        " q quit  ←→/1-9 view  ↑↓ PgUp/PgDn Home select  End/f follow  / filter  s save shown as .pcap  c clear  x stop  g graph".to_string()
+        " q quit  ←→/1-9 view  ↑↓ PgUp/PgDn Home select  End/f follow  / filter  S tcp stream  s save shown as .pcap  c clear  x stop  g graph".to_string()
     } else if app.tab == Tab::Hosts {
         " q quit  ←→/1-9 view  ↑↓ select  a block a host  d remove  r reload lists  s save to rules file".to_string()
     } else if app.tab == Tab::Graph {
@@ -148,11 +148,40 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     if app.picking_profile {
         draw_profiles(f, app, rules);
     }
+    if let Some(v) = &app.stream {
+        draw_stream(f, v);
+    }
     if let Some((p, more)) = &app.ask
         && !app.ask_hidden
     {
         draw_ask(f, p, *more, &app.status);
     }
+}
+
+/// The "follow stream" view over the whole screen.
+fn draw_stream(f: &mut Frame, v: &crate::app::StreamView) {
+    let r = f.area();
+    let height = r.height.saturating_sub(3) as usize;
+    let lines: Vec<Line> = v
+        .lines
+        .iter()
+        .skip(v.scroll)
+        .take(height)
+        .map(|(side, text)| {
+            let style = match side {
+                Some(true) => Style::new().fg(Color::Red),
+                Some(false) => Style::new().fg(Color::Blue),
+                None => Style::new().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+            };
+            Line::from(Span::styled(text.clone(), style))
+        })
+        .collect();
+    let footer = format!(" ↑↓ PgUp/PgDn Home/End scroll   Esc close   line {}/{} ", v.scroll + 1, v.lines.len().max(1));
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(v.title.clone()).title_bottom(footer).border_style(Style::new().fg(Color::Cyan))),
+        r,
+    );
 }
 
 /// The profile picker over the Rules tab.
@@ -945,6 +974,28 @@ mod tests {
         term.draw(|f| draw(f, &mut app, &c, &Names::default(), Some(&cap), &Rules::default())).unwrap();
         let s = self::screen(&term);
         assert!(s.contains("filter [dns] shows 0") && !s.contains("[SYN] seq 1000"), "{s}");
+    }
+
+    #[test]
+    fn stream_view_colors_sides_and_notes() {
+        let v = crate::app::StreamView {
+            title: " tcp stream 10.0.0.2:40000 ↔ 1.1.1.1:80 ".into(),
+            lines: vec![
+                (Some(true), "GET / HTTP/1.1".into()),
+                (None, "[4 bytes from the server missing: not captured]".into()),
+                (Some(false), "HTTP/1.1 200 OK".into()),
+            ],
+            scroll: 0,
+        };
+        let mut app = App { tab: Tab::Capture, show_graph: false, stream: Some(v), ..App::default() };
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| draw(f, &mut app, &Collector::new(1), &Names::default(), None, &Rules::default())).unwrap();
+        let s = self::screen(&term);
+        assert!(s.contains("tcp stream 10.0.0.2:40000") && s.contains("GET / HTTP/1.1") && s.contains("line 1/3"), "{s}");
+        let buf = term.backend().buffer();
+        let row = (0..12).find(|y| (0..100).map(|x| buf[(x, *y)].symbol()).collect::<String>().contains("200 OK")).unwrap();
+        let x = (0..100).find(|x| buf[(*x, row)].symbol() == "H").unwrap();
+        assert_eq!(buf[(x, row)].fg, Color::Blue, "server text is blue");
     }
 
     #[test]

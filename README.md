@@ -299,6 +299,7 @@ usage file for the Usage tab). Options of the daemon: `--socket PATH`,
 | `s` | Rules | Save all rules to the rules file |
 | `s` `c` `x` `f` `End` | Capture | Save the shown packets as `.pcap`, clear, stop, follow new packets |
 | `/` | Capture | Type a display filter, for example `tcp port 443` (see [Packet capture](#packet-capture)) |
+| `S` | Capture | Show the TCP stream of the selected packet as text |
 | `a` | Hosts | Type a hostname to block. `Enter` blocks it, `Esc` cancels. |
 | `d` | Hosts | Remove the selected host block or list |
 | `r` | Hosts | Read the host block lists again |
@@ -1032,7 +1033,7 @@ netmon opens the Capture tab and shows:
 - a hex and ASCII dump of the bytes
 
 Keys: `↑` `↓` `PgUp` `PgDn` `Home` select, `End` or `f` follow new packets,
-`/` filter, `s` save, `c` clear, `x` stop.
+`/` filter, `S` follow the TCP stream, `s` save, `c` clear, `x` stop.
 
 `/` sets a display filter, a subset of the tcpdump syntax. Only matching
 packets show, and `s` saves only those. All packets stay in memory, so a
@@ -1051,6 +1052,22 @@ new filter or an empty one (`/`, `Enter`) shows them again.
 - `and` and `or` join terms, and `and` binds first. `not` negates the
   next term: `dns or not tcp`. Parentheses are not supported.
 - The header line shows the filter and the number of shown packets.
+
+`S` shows the payload of the TCP connection of the selected packet as
+text, over the whole screen: the client (the side that sent the SYN) in
+red, the server in blue. `↑` `↓` `PgUp` `PgDn` `Home` `End` scroll, `Esc`
+closes.
+
+- netmon puts the segments of each direction together in the order they
+  arrived. A retransmitted byte shows once.
+- A hole shows as `[N bytes from the client missing: not captured]`: a
+  packet the capture lost, a packet from before the capture started, or
+  a segment longer than the 1500 bytes that the kernel copies (GRO/TSO).
+- Bytes that are not printable ASCII show as `.`. TLS is encrypted, and
+  the view says so in its first line. Plain protocols (HTTP, SMTP, DNS
+  over TCP, Redis) are readable.
+- The stream uses all captured packets, also the ones the display filter
+  hides.
 
 - A process capture follows the process. Its new connections join within
   one tick, so the first packets of a new connection (the SYN) can be

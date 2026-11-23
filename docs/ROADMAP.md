@@ -497,7 +497,11 @@ Small, independent features after the firewall core:
   display filter (tcpdump subset: proto, port, host, net, dns/http/tls/
   quic, not/and/or). Fields are parsed once per packet; all packets stay;
   `s` saves the shown ones.
-- **Follow stream**: rebuild one TCP stream and show its plaintext.
+- **Follow stream: done (2026-11-23).** `S` in the Capture tab: the TCP
+  payload of the selected connection per direction in arrival order,
+  retransmits once, holes and cut segments as "missing", sequence numbers
+  across 2^32, FIN counted. Client red, server blue, TLS noted.
+  Tested on a recorded HTTP exchange.
 - **History**: per-process daily totals in SQLite.
 
 ## Phase 9 – Connection graph

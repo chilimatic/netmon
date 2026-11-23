@@ -98,6 +98,21 @@ impl Client {
                 };
                 return None;
             }
+            Action::FollowStream => {
+                let Some(cap) = self.capture.as_ref() else {
+                    app.status = "no capture".into();
+                    return None;
+                };
+                let Some(at) = cap.packets.get(cap.selected) else {
+                    app.status = "no packet selected".into();
+                    return None;
+                };
+                match crate::stream::follow(&cap.packets, at) {
+                    Some(s) => app.stream = Some(stream_view(&s)),
+                    None => app.status = "follow stream: the selected packet is not TCP".into(),
+                }
+                return None;
+            }
             Action::SetCaptureFilter(text) => {
                 let Some(cap) = self.capture.as_mut() else {
                     app.status = "no capture".into();
@@ -277,6 +292,34 @@ impl Client {
             }
             Tab::Capture | Tab::Rules | Tab::Graph | Tab::Hosts | Tab::Log | Tab::Usage => Err("select a row in another tab".into()),
         }
+    }
+}
+
+/// The lines of a followed stream, for the view.
+pub(crate) fn stream_view(s: &crate::stream::Stream) -> crate::app::StreamView {
+    use crate::stream::{Piece, looks_like_tls, text};
+    let mut lines = Vec::new();
+    if looks_like_tls(s) {
+        lines.push((None, "TLS: the payload is encrypted; netmon cannot show it as text.".to_string()));
+    }
+    for p in &s.pieces {
+        match p {
+            Piece::Data { client, bytes } => {
+                lines.extend(text(bytes).split('\n').map(|l| (Some(*client), l.to_string())));
+            }
+            Piece::Missing { client, bytes } => {
+                let side = if *client { "client" } else { "server" };
+                lines.push((None, format!("[{bytes} bytes from the {side} missing: not captured]")));
+            }
+        }
+    }
+    crate::app::StreamView {
+        title: format!(
+            " tcp stream {} (client, red, {} bytes) ↔ {} (server, blue, {} bytes) ",
+            s.client, s.bytes.0, s.server, s.bytes.1
+        ),
+        lines,
+        scroll: 0,
     }
 }
 
