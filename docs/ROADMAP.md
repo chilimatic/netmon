@@ -464,6 +464,9 @@ Small, independent features after the firewall core:
   names stay in the daemon (an `Arc` set, not in snapshots). `r` in the
   Hosts tab and SIGHUP (`systemctl reload netmond`) read the lists again.
   Protocol version 4.
+- **Notifier 1-hour buttons, QUIC off per program: done (2026-11-23).**
+  The notifier buttons are Allow 1 h, Deny 1 h, Allow always, Deny always.
+  `Q` in the Processes tab toggles "deny out exe X udp port 443".
 - **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.

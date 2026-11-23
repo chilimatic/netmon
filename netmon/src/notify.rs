@@ -59,8 +59,8 @@ const LISTED_DESTS: usize = 3;
 
 /// The buttons, with the action names that `notify-send` prints.
 const BUTTONS: [(&str, &str); 4] = [
-    ("allow", "Allow"),
-    ("deny", "Deny"),
+    ("allow", "Allow 1 h"),
+    ("deny", "Deny 1 h"),
     ("allow-always", "Allow always"),
     ("deny-always", "Deny always"),
 ];
@@ -209,21 +209,21 @@ fn handle_clicks(remote: &mut Remote, clicks: &Receiver<(u64, String)>, question
 }
 
 /// The requests for button `action` on question `q`. Allow and deny add a
-/// rule until netmond stops, the "always" buttons a saved rule. The rule
-/// covers the program, or the destination when the program is unknown.
+/// rule that ends after 1 hour, the "always" buttons a saved rule. The
+/// rule covers the program, or the destination when the program is
+/// unknown.
 pub(crate) fn requests(q: &Prompt, action: &str) -> Vec<Request> {
-    let (allow, always) = match action {
-        "allow" => (true, false),
-        "deny" => (false, false),
-        "allow-always" => (true, true),
-        "deny-always" => (false, true),
+    let (answer, save) = match action {
+        "allow" => (Answer::Timed { allow: true, secs: crate::app::ANSWER_SECS }, false),
+        "deny" => (Answer::Timed { allow: false, secs: crate::app::ANSWER_SECS }, false),
+        "allow-always" => (Answer::Rule { allow: true, always: true }, true),
+        "deny-always" => (Answer::Rule { allow: false, always: true }, true),
         _ => return Vec::new(),
     };
     let Some(d) = q.selected_dest() else { return Vec::new() };
     let scope = if q.exe.is_empty() { Scope::Destination } else { Scope::Program };
-    let mut out =
-        vec![Request::Answer { question: q.id, dest: DestId::from(d), scope, answer: Answer::Rule { allow, always } }];
-    if always {
+    let mut out = vec![Request::Answer { question: q.id, dest: DestId::from(d), scope, answer }];
+    if save {
         out.push(Request::SaveRules);
     }
     out
@@ -324,7 +324,7 @@ mod tests {
         let dest = DestId::from(&q.dests[0]);
         assert_eq!(
             requests(&q, "allow"),
-            vec![Request::Answer { question: 7, dest, scope: Scope::Program, answer: Answer::Rule { allow: true, always: false } }]
+            vec![Request::Answer { question: 7, dest, scope: Scope::Program, answer: Answer::Timed { allow: true, secs: 3600 } }]
         );
         assert_eq!(
             requests(&q, "deny-always"),

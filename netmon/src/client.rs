@@ -124,10 +124,12 @@ impl Client {
                 0 => Err("this connection has no port".into()),
                 port => Ok(Request::ToggleBlock(BlockTarget::Port(k.proto, port))),
             }),
-            Action::ToggleBlockProcess => {
+            Action::ToggleBlockProcess | Action::ToggleQuicProcess => {
                 let rows = app.proc_rows(&self.snap.collector, &self.snap.names);
                 let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
+                let quic = action == Action::ToggleQuicProcess;
                 match app.selected_in(&ids).map(|i| &rows[i]) {
+                    Some(r) if !r.exe.is_empty() && quic => Ok(Request::ToggleBlock(BlockTarget::Quic(r.exe.clone()))),
                     Some(r) if !r.exe.is_empty() => Ok(Request::ToggleBlock(BlockTarget::Exe(r.exe.clone()))),
                     Some(_) => Err("exe unknown for this process: block its remote address instead".into()),
                     None => Err("no process selected".into()),

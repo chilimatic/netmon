@@ -131,7 +131,7 @@ impl<K: Kernel> Monitor<K> {
         if let Some(rule) = self.rules.find_block(&target) {
             return self.remove_rule(rule.id);
         }
-        let msg = format!("blocked {target} (until the monitor stops; b again or Rules tab to undo)");
+        let msg = format!("blocked {target} (until the monitor stops; the same key again or the Rules tab undoes it)");
         self.change_rules(|r| r.block(target).map(|_| msg))
     }
 

@@ -24,6 +24,9 @@ pub enum BlockTarget {
     Port(u8, u16),
     /// Every process running this binary (absolute exe path).
     Exe(String),
+    /// QUIC (outbound UDP 443) of this binary: it falls back to TCP,
+    /// where netmon sees the TLS server name.
+    Quic(String),
 }
 
 impl BlockTarget {
@@ -40,6 +43,13 @@ impl From<BlockTarget> for Match {
             BlockTarget::Net(ip, len) => Match { net: Some((ip, len)), ..Match::default() },
             BlockTarget::Port(p, port) => Match { proto: Some(p), ports: Some((port, port)), ..Match::default() },
             BlockTarget::Exe(path) => Match { exe: Some(path), ..Match::default() },
+            BlockTarget::Quic(path) => Match {
+                exe: Some(path),
+                dir: Some(Dir::Out),
+                proto: Some(IPPROTO_UDP),
+                ports: Some((443, 443)),
+                ..Match::default()
+            },
         }
     }
 }
@@ -654,6 +664,19 @@ mod tests {
 
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn quic_block_denies_only_outbound_udp_443_of_the_exe() {
+        let mut r = Rules::default();
+        r.block(BlockTarget::Quic("/usr/lib/firefox/firefox".into())).unwrap();
+        assert_eq!(r.rules[0].to_string(), "deny out exe /usr/lib/firefox/firefox udp port 443");
+        let ff = "/usr/lib/firefox/firefox";
+        assert!(r.denies(IPPROTO_UDP, sa("1.1.1.1:443"), ff, Dir::Out));
+        assert!(!r.denies(IPPROTO_TCP, sa("1.1.1.1:443"), ff, Dir::Out), "TCP stays");
+        assert!(!r.denies(IPPROTO_UDP, sa("1.1.1.1:53"), ff, Dir::Out));
+        assert!(!r.denies(IPPROTO_UDP, sa("1.1.1.1:443"), "/usr/bin/curl", Dir::Out));
+        assert!(r.find_block(&BlockTarget::Quic(ff.into())).is_some());
     }
 
     #[test]

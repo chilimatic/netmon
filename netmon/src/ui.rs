@@ -125,7 +125,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     } else {
         let block = match app.tab {
             Tab::Connections => "  b/B/H block ip/port/host",
-            Tab::Processes => "  b block exe",
+            Tab::Processes => "  b block exe  Q QUIC off",
             _ => "",
         };
         format!(

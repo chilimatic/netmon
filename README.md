@@ -290,6 +290,7 @@ default `netmon`), `--log PATH` (the connection log, default
 | `B` | Connections | Block or unblock the remote port |
 | `H` | Connections | Block the hostname of the connection (see [Hosts tab](#hosts-tab)) |
 | `b` | Processes | Block or unblock the exe of the process |
+| `Q` | Processes | Turn QUIC (HTTP/3) off or on for the exe: a rule denies its outbound UDP port 443. Browsers then use TCP, where netmon sees the TLS server name. |
 | `d` | Rules | Remove the selected rule |
 | `t` | Rules | Set the end time of the selected rule: 1 hour, then 1 day, then none |
 | `s` | Rules | Save all rules to the rules file |
@@ -569,7 +570,9 @@ Limits:
   opened before shows its address until the next lookup of that name.
 - Encrypted DNS (DNS over TLS or HTTPS) gives no DNS names. SNI still names
   the TLS connections.
-- QUIC (HTTP/3) encrypts its ClientHello, so it has no SNI name. With
+- QUIC (HTTP/3) encrypts its ClientHello, so it has no SNI name. `Q` in
+  the Processes tab turns QUIC off for a program: the browser then uses
+  TCP. With
   Encrypted Client Hello (ECH), the name is the outer one, for example
   `cloudflare-ech.com`.
 - A browser ClientHello is about 1.8 KB and can use two TCP segments. The
@@ -811,7 +814,7 @@ buttons:
 
 | Button | Answer |
 |---|---|
-| Allow / Deny | A temporary rule for the program, like `a` / `d` |
+| Allow 1 h / Deny 1 h | A rule for the program that ends after 1 hour, like `h` / `H` |
 | Allow always / Deny always | A lasting rule for the program, like `A` / `D`. The notifier also saves the rules file. |
 
 - If the program is unknown, the rule covers the selected destination

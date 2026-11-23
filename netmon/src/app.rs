@@ -257,6 +257,8 @@ pub enum Action {
     ToggleBlockPort,
     /// Block (or unblock) the exe of the selected process.
     ToggleBlockProcess,
+    /// Block (or unblock) QUIC of the exe of the selected process.
+    ToggleQuicProcess,
     /// Remove the selected rule in the Rules tab.
     RemoveRule,
     /// Step the end time of the selected rule: 1 hour, 1 day, never.
@@ -426,6 +428,7 @@ impl App {
             Key::Char('b') if self.tab == Tab::Connections => return Some(Action::ToggleBlockRemote),
             Key::Char('B') if self.tab == Tab::Connections => return Some(Action::ToggleBlockPort),
             Key::Char('b') if self.tab == Tab::Processes => return Some(Action::ToggleBlockProcess),
+            Key::Char('Q') if self.tab == Tab::Processes => return Some(Action::ToggleQuicProcess),
             Key::Char('d') if self.tab == Tab::Rules => return Some(Action::RemoveRule),
             Key::Char('t') if self.tab == Tab::Rules => return Some(Action::CycleRuleTimer),
             Key::Char('s') if self.tab == Tab::Rules => return Some(Action::SaveRules),
@@ -775,6 +778,7 @@ mod tests {
         let mut app = App::default();
         app.on_key(Key::Char('2'));
         assert_eq!(app.on_key(Key::Enter), Some(Action::StartCapture(Tab::Processes)));
+        assert_eq!(app.on_key(Key::Char('Q')), Some(Action::ToggleQuicProcess));
         app.on_key(Key::Char('4'));
         assert_eq!(app.on_key(Key::Enter), None);
         assert_eq!(app.on_key(Key::Char('s')), Some(Action::SavePcap));
