@@ -63,6 +63,9 @@ impl Tab {
     }
 }
 
+/// The column titles of the Usage tab. The `s` key steps through them to pick the sort column.
+pub const USAGE_COLUMNS: [&str; 6] = ["Program", "Today ↓", "Today ↑", "Yesterday", "7 days", "30 days"];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sort {
     Rate,
@@ -155,6 +158,9 @@ impl IfaceRow {
 pub struct App {
     pub tab: Tab,
     pub sort: Sort,
+    /// The Usage column that sorts the rows (index into `USAGE_COLUMNS`), and whether the order is reversed.
+    pub usage_sort: usize,
+    pub usage_reverse: bool,
     pub filter: String,
     pub editing_filter: bool,
     pub paused: bool,
@@ -222,6 +228,8 @@ impl Default for App {
         App {
             tab: Tab::Connections,
             sort: Sort::Rate,
+            usage_sort: 1,
+            usage_reverse: false,
             filter: String::new(),
             editing_filter: false,
             paused: false,
@@ -541,6 +549,11 @@ impl App {
             Key::Char('t') if self.tab == Tab::Rules => return Some(Action::CycleRuleTimer),
             Key::Char('P') if self.tab == Tab::Rules => return Some(Action::PickProfile),
             Key::Char('s') if self.tab == Tab::Rules => return Some(Action::SaveRules),
+            Key::Char('s') if self.tab == Tab::Usage => {
+                self.usage_sort = (self.usage_sort + 1) % USAGE_COLUMNS.len();
+                self.usage_reverse = false;
+            }
+            Key::Char('S') if self.tab == Tab::Usage => self.usage_reverse = !self.usage_reverse,
             Key::Enter if matches!(self.tab, Tab::Connections | Tab::Processes | Tab::Interfaces) => {
                 return Some(Action::StartCapture(self.tab));
             }
@@ -625,9 +638,27 @@ impl App {
             .collect()
     }
 
-    /// The Usage rows that match the filter.
+    /// The Usage rows that match the filter, sorted by the chosen column.
+    /// Programs sort A to Z, byte counts largest first. `usage_reverse` flips the order.
     pub fn usage_rows(&self) -> Vec<&crate::usage::UsageRow> {
-        self.usage.iter().filter(|r| self.matches(&[&r.program])).collect()
+        let mut rows: Vec<&crate::usage::UsageRow> = self.usage.iter().filter(|r| self.matches(&[&r.program])).collect();
+        let sum = |w: [u64; 2]| w[0] + w[1];
+        let key = |r: &crate::usage::UsageRow| match self.usage_sort {
+            1 => r.today[1],
+            2 => r.today[0],
+            3 => sum(r.yesterday),
+            4 => sum(r.week),
+            _ => sum(r.month),
+        };
+        if self.usage_sort == 0 {
+            rows.sort_by(|a, b| a.program.cmp(&b.program));
+        } else {
+            rows.sort_by(|a, b| key(b).cmp(&key(a)).then(a.program.cmp(&b.program)));
+        }
+        if self.usage_reverse {
+            rows.reverse();
+        }
+        rows
     }
 
     pub fn conn_rows(&self, c: &Collector, names: &Names) -> Vec<ConnRow> {

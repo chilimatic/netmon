@@ -479,7 +479,8 @@ Small, independent features after the firewall core:
   byte deltas on the counted interfaces to the program (exe, process name,
   container) per local date; `/var/lib/netmon/usage.json` (root:netmon
   0640, `StateDirectory`), saved every 60 s and at stop, 90 days. Tab 9
-  shows today, yesterday, 7 and 30 days.
+  shows today, yesterday, 7 and 30 days. `s` picks the sort column, `S`
+  reverses it.
 - **GeoIP / ASN column: done (2026-11-23).** The UI reads DB-IP Lite
   (`dbip-country-lite.mmdb`, `dbip-asn-lite.mmdb` in `/var/lib/netmon`,
   crate `maxminddb`), caches per address, and shows `DE AS3320 Org` in

@@ -127,7 +127,11 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             if app.show_virtual { "on" } else { "off" }
         )
     } else if app.tab == Tab::Usage {
-        format!(" q quit  ←→/1-9 view  ↑↓ select  / filter [{}]   local days; netmond writes every 60 s", app.filter)
+        format!(
+            " q quit  ←→/1-9 view  ↑↓ select  s sort column [{}]  S reverse  / filter [{}]   local days; netmond writes every 60 s",
+            crate::app::USAGE_COLUMNS[app.usage_sort],
+            app.filter
+        )
     } else if app.tab == Tab::Log {
         format!(" q quit  ←→/1-9 view  ↑↓ select  / filter [{}]   newest first, read every 2 s", app.filter)
     } else if app.tab == Tab::Rules {
@@ -514,6 +518,14 @@ fn draw_capture(f: &mut Frame, cap: Option<&Capture>, names: &Names, area: Rect)
     f.render_widget(Paragraph::new(dump).block(Block::bordered().title(" bytes ")), hex);
 }
 
+/// The Usage header. An arrow marks the sort column: ▼ for the normal order, ▲ when reversed.
+fn usage_header(sort: usize, reverse: bool) -> Row<'static> {
+    let cells = crate::app::USAGE_COLUMNS.iter().enumerate().map(|(i, c)| {
+        if i == sort { format!("{c} {}", if reverse { "▲" } else { "▼" }) } else { c.to_string() }
+    });
+    Row::new(cells).style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+}
+
 fn header_row(cols: &[&'static str]) -> Row<'static> {
     Row::new(cols.iter().copied()).style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
 }
@@ -676,7 +688,7 @@ fn draw_usage(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(11),
         ],
     )
-    .header(header_row(&["Program", "Today ↓", "Today ↑", "Yesterday", "7 days", "30 days"]));
+    .header(usage_header(app.usage_sort, app.usage_reverse));
     render_table(f, app, table, &ids, area);
 }
 
@@ -1065,6 +1077,30 @@ mod tests {
         let ff = s.lines().find(|l| l.contains("firefox")).unwrap();
         assert!(ff.contains(&human(300_000_000.0)) && ff.contains(&human(1_000_000_000.0)), "{ff}");
         assert!(s.find("firefox").unwrap() < s.find("curl").unwrap(), "busiest first");
+        assert!(s.contains("Today ↓ ▼"), "{s}");
+    }
+
+    #[test]
+    fn usage_sorts_by_the_chosen_column() {
+        let mut app = App { tab: Tab::Usage, ..App::default() };
+        let mut f = crate::usage::UsageFile::default();
+        f.add("2026-11-23", "b", 500, 10);
+        f.add("2026-11-23", "a", 1, 20);
+        f.add("2026-11-20", "c", 0, 9999);
+        app.usage = f.rows("2026-11-23");
+        let names = |app: &App| app.usage_rows().iter().map(|r| r.program.clone()).collect::<Vec<_>>().join(",");
+        assert_eq!(names(&app), "a,b,c", "today down, then name");
+        app.on_key(crate::app::Key::Char('s'));
+        assert_eq!(names(&app), "b,a,c", "today up");
+        app.on_key(crate::app::Key::Char('S'));
+        assert_eq!(names(&app), "c,a,b", "reversed");
+        for _ in 0..3 {
+            app.on_key(crate::app::Key::Char('s'));
+        }
+        assert!(!app.usage_reverse, "a new column starts in the normal order");
+        assert_eq!(names(&app), "c,b,a", "30 days");
+        app.on_key(crate::app::Key::Char('s'));
+        assert_eq!(names(&app), "a,b,c", "program A to Z");
     }
 
     #[test]

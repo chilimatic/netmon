@@ -586,8 +586,10 @@ object per line:
 
 The Usage tab shows the traffic of each program: today down and up, and
 the sum of both for yesterday, the last 7 days and the last 30 days. The
-busiest program today comes first. `/` filters by program. The tab reads
-the file every 10 s while it is open.
+program with the most download today comes first. `s` moves the sort to the
+next column, and `S` reverses the order. An arrow in the header marks the
+sort column. Programs sort from A to Z, byte counts from the largest.
+`/` filters by program. The tab reads the file every 10 s while it is open.
 
 - `netmond` adds the bytes of each connection to its program: the exe
   path, else the process name, `container:<name>/<process>` for a
