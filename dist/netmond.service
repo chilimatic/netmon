@@ -36,11 +36,15 @@ RestartPreventExitStatus=78
 CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE CAP_CHOWN CAP_FOWNER
 NoNewPrivileges=yes
 # It writes only the socket in /run, its pins, /etc/netmon (s in the
-# Rules tab saves there) and the connection log in /var/log/netmon.
+# Rules tab saves there), the connection log in /var/log/netmon and the
+# usage file in /var/lib/netmon.
 ProtectSystem=strict
 ReadWritePaths=/run /sys/fs/bpf -/etc/netmon
 LogsDirectory=netmon
 LogsDirectoryMode=0755
+# Traffic per program and day: /var/lib/netmon/usage.json.
+StateDirectory=netmon
+StateDirectoryMode=0755
 ProtectHome=read-only
 PrivateTmp=yes
 PrivateDevices=yes

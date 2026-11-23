@@ -99,6 +99,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         Tab::Graph => draw_conn_graph(f, app, c, names, body),
         Tab::Hosts => draw_hosts(f, app, rules, body),
         Tab::Log => draw_log(f, app, body),
+        Tab::Usage => draw_usage(f, app, body),
     }
 
     let sort = match app.sort {
@@ -111,19 +112,21 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     } else if app.editing_filter {
         format!(" filter: {}█   (Enter keep, Esc clear)", app.filter)
     } else if app.tab == Tab::Capture {
-        " q quit  ←→/1-8 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
+        " q quit  ←→/1-9 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
     } else if app.tab == Tab::Hosts {
-        " q quit  ←→/1-8 view  ↑↓ select  a block a host  d remove  r reload lists  s save to rules file".to_string()
+        " q quit  ←→/1-9 view  ↑↓ select  a block a host  d remove  r reload lists  s save to rules file".to_string()
     } else if app.tab == Tab::Graph {
         format!(
-            " q quit  ←→/1-8 view  ↑↓ select node  Enter its connections  b block it  z level [{}]  p pause  h names  v veth/bridge [{}]",
+            " q quit  ←→/1-9 view  ↑↓ select node  Enter its connections  b block it  z level [{}]  p pause  h names  v veth/bridge [{}]",
             app.graph_level.label(),
             if app.show_virtual { "on" } else { "off" }
         )
+    } else if app.tab == Tab::Usage {
+        format!(" q quit  ←→/1-9 view  ↑↓ select  / filter [{}]   local days; netmond writes every 60 s", app.filter)
     } else if app.tab == Tab::Log {
-        format!(" q quit  ←→/1-8 view  ↑↓ select  / filter [{}]   newest first, read every 2 s", app.filter)
+        format!(" q quit  ←→/1-9 view  ↑↓ select  / filter [{}]   newest first, read every 2 s", app.filter)
     } else if app.tab == Tab::Rules {
-        " q quit  ←→/1-8 view  ↑↓ select  d remove rule  t end time 1h/1d/never  P profile  s save to rules file   tmp rules end when the monitor stops".to_string()
+        " q quit  ←→/1-9 view  ↑↓ select  d remove rule  t end time 1h/1d/never  P profile  s save to rules file   tmp rules end when the monitor stops".to_string()
     } else {
         let block = match app.tab {
             Tab::Connections => "  b/B/H block ip/port/host",
@@ -131,7 +134,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             _ => "",
         };
         format!(
-            " q quit  ←→/1-8 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  v veth/bridge [{}]  p pause  g graph",
+            " q quit  ←→/1-9 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  v veth/bridge [{}]  p pause  g graph",
             app.filter,
             if app.show_virtual { "on" } else { "off" }
         )
@@ -594,6 +597,53 @@ fn action_label(r: &crate::rules::Rule, now: u64) -> String {
     s
 }
 
+/// The Usage tab: traffic per program for today, yesterday, 7 and 30 days.
+fn draw_usage(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.usage.is_empty() {
+        let why = if app.usage_error.is_empty() { "No traffic counted yet.".to_string() } else { app.usage_error.clone() };
+        f.render_widget(
+            Paragraph::new(format!(
+                "\n  {why}\n\n  netmond adds up the traffic of each program per day in {} and writes it every\n  \
+                 60 s (see README).",
+                crate::usage::DEFAULT_PATH
+            ))
+            .block(Block::new().borders(Borders::TOP)),
+            area,
+        );
+        return;
+    }
+    let rows = app.usage_rows();
+    let ids: Vec<RowId> = rows.iter().map(|r| RowId::Usage(r.program.clone())).collect();
+    let bytes = |n: u64| Cell::from(Line::from(human(n as f64)).right_aligned());
+    let sum = |w: [u64; 2]| w[0] + w[1];
+    let lines: Vec<Row> = rows
+        .iter()
+        .map(|r| {
+            Row::new(vec![
+                Cell::from(r.program.clone()),
+                bytes(r.today[1]),
+                bytes(r.today[0]),
+                bytes(sum(r.yesterday)),
+                bytes(sum(r.week)),
+                bytes(sum(r.month)),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        lines,
+        [
+            Constraint::Fill(1),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(11),
+        ],
+    )
+    .header(header_row(&["Program", "Today ↓", "Today ↑", "Yesterday", "7 days", "30 days"]));
+    render_table(f, app, table, &ids, area);
+}
+
 /// The Log tab: the newest lines of the connection log.
 fn draw_log(f: &mut Frame, app: &mut App, area: Rect) {
     if app.log.is_empty() {
@@ -896,6 +946,23 @@ mod tests {
         app.log.clear();
         app.log_error = "/var/log/netmon/connections.log: No such file or directory".into();
         assert!(draw_log_tab(&mut app).contains("No such file"));
+    }
+
+    #[test]
+    fn usage_tab_lists_programs() {
+        let mut app = App { tab: Tab::Usage, show_graph: false, ..App::default() };
+        let mut f = crate::usage::UsageFile::default();
+        f.add("2026-11-23", "/usr/lib/firefox/firefox", 2_000_000, 300_000_000);
+        f.add("2026-11-22", "/usr/lib/firefox/firefox", 0, 1_000_000_000);
+        f.add("2026-11-23", "/usr/bin/curl", 10, 1000);
+        app.usage = f.rows("2026-11-23");
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|fr| draw(fr, &mut app, &Collector::new(1), &Names::default(), None, &Rules::default())).unwrap();
+        let s = screen(&term);
+        assert!(s.contains("9 Usage") && s.contains("Today ↓") && s.contains("30 days"), "{s}");
+        let ff = s.lines().find(|l| l.contains("firefox")).unwrap();
+        assert!(ff.contains(&human(300_000_000.0)) && ff.contains(&human(1_000_000_000.0)), "{ff}");
+        assert!(s.find("firefox").unwrap() < s.find("curl").unwrap(), "busiest first");
     }
 
     #[test]

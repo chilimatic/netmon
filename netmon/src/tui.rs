@@ -40,6 +40,9 @@ struct TuiArgs {
     /// Connection log that netmond writes, for the Log tab.
     #[arg(long, value_name = "PATH", default_value = crate::connlog::DEFAULT_PATH)]
     log: PathBuf,
+    /// Usage file that netmond writes, for the Usage tab.
+    #[arg(long, value_name = "PATH", default_value = crate::usage::DEFAULT_PATH)]
+    usage: PathBuf,
 }
 
 /// How often the UI reads netmond's messages.
@@ -107,7 +110,7 @@ pub fn run() -> anyhow::Result<()> {
         let engine = Box::new(Engine::new(mon, args.monitor.interval()));
         let snapshot = engine.mon.snapshot();
         let interval = engine.interval();
-        return run_tui(Backend::Local { engine, out: Vec::new() }, snapshot, interval, errors.join("; "), &args.log);
+        return run_tui(Backend::Local { engine, out: Vec::new() }, snapshot, interval, errors.join("; "), &args.log, &args.usage);
     }
     let m = &args.monitor;
     if m.rules.is_some() || m.ask {
@@ -120,7 +123,7 @@ pub fn run() -> anyhow::Result<()> {
     if let Some(secs) = args.once {
         return print_remote_once(remote, welcome.snapshot, secs);
     }
-    run_tui(Backend::Remote(remote), welcome.snapshot, welcome.interval, welcome.warnings.join("; "), &args.log)
+    run_tui(Backend::Remote(remote), welcome.snapshot, welcome.interval, welcome.warnings.join("; "), &args.log, &args.usage)
 }
 
 fn print_once(mon: &mut Monitor, secs: u64) -> anyhow::Result<()> {
@@ -165,6 +168,9 @@ fn print_rows(snap: &Snapshot) {
 const LOG_READ: Duration = Duration::from_secs(2);
 /// Log lines the Log tab shows at most.
 const LOG_LINES: usize = 5000;
+/// How often the Usage tab reads the usage file (netmond writes it every
+/// 60 s).
+const USAGE_READ: Duration = Duration::from_secs(10);
 
 /// Time between two frames of the graph animation.
 const ANIM_FRAME: Duration = Duration::from_millis(100);
@@ -175,14 +181,23 @@ fn run_tui(
     interval: Duration,
     status: String,
     log: &std::path::Path,
+    usage: &std::path::Path,
 ) -> anyhow::Result<()> {
     let mut app = App { interval_secs: interval.as_secs_f64(), status, ..App::default() };
     let mut client = Client::new(snapshot, &mut app);
     let mut terminal = ratatui::init();
     let mut frame = std::time::Instant::now();
     let mut log_read: Option<Instant> = None;
+    let mut usage_read: Option<Instant> = None;
     let result = (|| -> anyhow::Result<()> {
         while !app.quit {
+            if app.tab == Tab::Usage && usage_read.is_none_or(|t| t.elapsed() >= USAGE_READ) {
+                usage_read = Some(Instant::now());
+                match crate::usage::load(usage) {
+                    Ok(f) => (app.usage, app.usage_error) = (f.rows(&crate::usage::today()), String::new()),
+                    Err(e) => (app.usage, app.usage_error) = (Vec::new(), e),
+                }
+            }
             if app.tab == Tab::Log && log_read.is_none_or(|t| t.elapsed() >= LOG_READ) {
                 log_read = Some(Instant::now());
                 match crate::connlog::tail(log, LOG_LINES) {
@@ -207,6 +222,9 @@ fn run_tui(
             }
             if app.tab == Tab::Log {
                 wait = wait.min(LOG_READ);
+            }
+            if app.tab == Tab::Usage {
+                wait = wait.min(USAGE_READ);
             }
             if event::poll(wait).context("poll terminal events")?
                 && let Event::Key(k) = event::read()?

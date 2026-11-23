@@ -472,6 +472,11 @@ Small, independent features after the firewall core:
   default, host blocks and lists; temporary rules stay; an error changes
   nothing. The active name goes to `/etc/netmon/profile` and loads at the
   next start (not with `--rules`). Protocol version 6.
+- **Usage per program and day: done (2026-11-23).** `netmond` adds flow
+  byte deltas on the counted interfaces to the program (exe, process name,
+  container) per local date; `/var/lib/netmon/usage.json` (root:netmon
+  0640, `StateDirectory`), saved every 60 s and at stop, 90 days. Tab 9
+  shows today, yesterday, 7 and 30 days.
 - **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.

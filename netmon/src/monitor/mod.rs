@@ -167,6 +167,8 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) new_listeners: Vec<listen::NewListener>,
     /// The connection log (daemon only).
     pub(crate) conn_log: Option<crate::connlog::ConnLog>,
+    /// Traffic per program and day (daemon only).
+    pub(crate) usage: Option<crate::usage::Usage>,
     /// Flows already logged, and flows seen once without an owner.
     pub(crate) log_done: HashSet<netmon_common::FlowKey>,
     pub(crate) log_pending: HashSet<netmon_common::FlowKey>,
@@ -270,7 +272,7 @@ impl<K: Kernel> Monitor<K> {
         let mut collector = Collector::new(args.expire_ticks());
         collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), base_rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new(), conn_log: None, log_done: HashSet::new(), log_pending: HashSet::new() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), base_rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new(), conn_log: None, usage: None, log_done: HashSet::new(), log_pending: HashSet::new() };
         Ok((mon, errors))
     }
 
@@ -431,6 +433,14 @@ impl<K: Kernel> Monitor<K> {
             errors.push(e);
         }
         self.prof.add("connection log", t);
+        if let Some(u) = self.usage.as_mut() {
+            let t = Instant::now();
+            u.count(&self.collector.flows, &self.collector.counted, &crate::usage::today());
+            if let Some(e) = u.save(now, false) {
+                errors.push(e);
+            }
+            self.prof.add("usage per program", t);
+        }
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {
             errors.push(format!("capture: {e:#}"));

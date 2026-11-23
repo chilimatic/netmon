@@ -233,10 +233,12 @@ With a daemon, give these options to `netmond`, not to `netmon`. `netmon`
 refuses `--rules` and `--ask` when it connects to a daemon.
 
 Options of the UI: `--socket PATH` (another socket), `--local` (no daemon)
-and `--log PATH` (the connection log for the Log tab). Options of the
-daemon: `--socket PATH`, `--group NAME` (the group that can connect,
-default `netmon`), `--log PATH` (the connection log, default
-`/var/log/netmon/connections.log`) and `--no-log` (no connection log).
+`--log PATH` (the connection log for the Log tab) and `--usage PATH` (the
+usage file for the Usage tab). Options of the daemon: `--socket PATH`,
+`--group NAME` (the group that can connect, default `netmon`), `--log PATH`
+(the connection log, default `/var/log/netmon/connections.log`),
+`--no-log` (no connection log), `--usage PATH` (the usage file, default
+`/var/lib/netmon/usage.json`) and `--no-usage` (no usage count).
 
 ## The user interface
 
@@ -249,12 +251,12 @@ default `netmon`), `--log PATH` (the connection log, default
  │─────────────────────────────── 120 samples ────────────────────────────│
  │ ↑ upload (magenta) below the zero line                                 │
  └────────────────────────────────────────────────────────────────────────┘
-  1 Connections  2 Processes  3 Interfaces  4 Capture  5 Rules  6 Graph  7 Hosts  8 Log  3
+  1 Connections  2 Processes  3 Interfaces  4 Capture  5 Rules  6 Graph  7 Hosts  8 Log  9 Usage  3
  Process      PID   Proto Local            Remote             Iface  State ...  4
  firefox      4242  tcp   10.0.0.2:51234   example.com:443    enp5s0 ESTAB
  ...
  93.184.215.14:443 (name from tls)   exe /usr/lib/firefox/firefox   ...         5
- q quit  ←→/1-8 view  Enter capture  b/B block ip/port  r/t/n sort ...         6
+ q quit  ←→/1-9 view  Enter capture  b/B block ip/port  r/t/n sort ...         6
 ```
 
 1. Header. It shows the total upload and download rate of the physical
@@ -276,7 +278,7 @@ default `netmon`), `--log PATH` (the connection log, default
 | Key | Where | Action |
 |---|---|---|
 | `q`, `Ctrl-C` | everywhere | Quit |
-| `←` `→` `Tab` `1`-`8` | everywhere | Select a tab |
+| `←` `→` `Tab` `1`-`9` | everywhere | Select a tab |
 | `↑` `↓` `PgUp` `PgDn` `Home` | tables | Select a row |
 | `/` | tables | Type a filter. `Enter` keeps it, `Esc` clears it. |
 | `Esc` | tables | Clear the filter (never quits) |
@@ -546,6 +548,25 @@ object per line:
 - The file belongs to root and group `netmon`, mode 0640. It shows which
   program talks to which host, so only the group can read it.
 - With `sudo netmon --local`, no log is written.
+
+### Usage tab
+
+The Usage tab shows the traffic of each program: today down and up, and
+the sum of both for yesterday, the last 7 days and the last 30 days. The
+busiest program today comes first. `/` filters by program. The tab reads
+the file every 10 s while it is open.
+
+- `netmond` adds the bytes of each connection to its program: the exe
+  path, else the process name, `container:<name>/<process>` for a
+  container, or `(unknown)`.
+- It counts the interfaces that the header counts (the physical ones), so
+  traffic that passes a bridge, a veth and the uplink counts once.
+- Days are local dates. The file keeps 90 days and at most 2000 programs
+  per day. More programs add up in `(other programs)`.
+- `netmond` writes `/var/lib/netmon/usage.json` every 60 s and when it
+  stops. The file belongs to root and group `netmon`, mode 0640. A crash
+  loses at most the last minute.
+- With `sudo netmon --local`, no usage is counted.
 
 ## Hostnames
 

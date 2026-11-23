@@ -29,6 +29,7 @@ mod rules;
 mod text;
 mod tui;
 mod ui;
+mod usage;
 
 /// Tests that create directories hold this lock: the socket bind test sets
 /// a narrow umask for a moment, and a directory made in that moment gets

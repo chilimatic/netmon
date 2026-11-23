@@ -55,6 +55,12 @@ struct DaemonArgs {
     /// Write no connection log.
     #[arg(long)]
     no_log: bool,
+    /// Traffic per program and day.
+    #[arg(long, value_name = "PATH", default_value = crate::usage::DEFAULT_PATH)]
+    usage: PathBuf,
+    /// Count no traffic per program and day.
+    #[arg(long)]
+    no_usage: bool,
 }
 
 /// Local TCP port netmond never blocks unless --guard-port says otherwise.
@@ -189,6 +195,13 @@ pub fn run() -> anyhow::Result<()> {
     if !args.no_log {
         mon.conn_log = Some(crate::connlog::ConnLog::new(&args.log, gid));
     }
+    if !args.no_usage {
+        let (u, err) = crate::usage::Usage::new(&args.usage, gid);
+        if let Some(e) = err {
+            eprintln!("netmond: {e}");
+        }
+        mon.usage = Some(u);
+    }
     // Start messages: problems and the rules file summary.
     for w in &warnings {
         eprintln!("netmond: {w}");
@@ -208,6 +221,9 @@ pub fn run() -> anyhow::Result<()> {
     // A clean stop: the kernel side goes with the process. Only a crash
     // leaves the pins, and with them the rules.
     engine.mon.probe.unpin();
+    if let Some(e) = engine.mon.usage.as_mut().and_then(|u| u.save(Instant::now(), true)) {
+        eprintln!("netmond: {e}");
+    }
     let _ = std::fs::remove_file(&args.socket);
     eprintln!("netmond: stopped, rules removed");
     result

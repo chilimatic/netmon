@@ -20,11 +20,21 @@ pub enum Tab {
     Graph,
     Hosts,
     Log,
+    Usage,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 8] =
-        [Tab::Connections, Tab::Processes, Tab::Interfaces, Tab::Capture, Tab::Rules, Tab::Graph, Tab::Hosts, Tab::Log];
+    pub const ALL: [Tab; 9] = [
+        Tab::Connections,
+        Tab::Processes,
+        Tab::Interfaces,
+        Tab::Capture,
+        Tab::Rules,
+        Tab::Graph,
+        Tab::Hosts,
+        Tab::Log,
+        Tab::Usage,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -36,6 +46,7 @@ impl Tab {
             Tab::Graph => "Graph",
             Tab::Hosts => "Hosts",
             Tab::Log => "Log",
+            Tab::Usage => "Usage",
         }
     }
 
@@ -69,6 +80,8 @@ pub enum RowId {
     Host(u32),
     /// A line of the connection log, by its content.
     Log(u64),
+    /// A program in the Usage tab.
+    Usage(String),
 }
 
 pub struct ConnRow {
@@ -186,6 +199,9 @@ pub struct App {
     pub log: Vec<crate::connlog::Entry>,
     /// Why the log could not be read, empty if it could.
     pub log_error: String,
+    /// Traffic per program (Usage tab), and why the file could not be read.
+    pub usage: Vec<crate::usage::UsageRow>,
+    pub usage_error: String,
     /// The profile picker is open (Rules tab, P): names and selection.
     pub picking_profile: bool,
     pub profiles: Vec<String>,
@@ -222,6 +238,8 @@ impl Default for App {
             host_input: String::new(),
             log: Vec::new(),
             log_error: String::new(),
+            usage: Vec::new(),
+            usage_error: String::new(),
             picking_profile: false,
             profiles: Vec::new(),
             profile_sel: 0,
@@ -446,6 +464,7 @@ impl App {
             Key::Char('6') => self.set_tab(Tab::Graph),
             Key::Char('7') => self.set_tab(Tab::Hosts),
             Key::Char('8') => self.set_tab(Tab::Log),
+            Key::Char('9') => self.set_tab(Tab::Usage),
             Key::Char('a') if self.tab == Tab::Hosts => self.editing_host = true,
             Key::Char('d') if self.tab == Tab::Hosts => return Some(Action::RemoveHost),
             Key::Char('r') if self.tab == Tab::Hosts => return Some(Action::ReloadBlocklists),
@@ -541,6 +560,11 @@ impl App {
                 (e, RowId::Log(h.finish()))
             })
             .collect()
+    }
+
+    /// The Usage rows that match the filter.
+    pub fn usage_rows(&self) -> Vec<&crate::usage::UsageRow> {
+        self.usage.iter().filter(|r| self.matches(&[&r.program])).collect()
     }
 
     pub fn conn_rows(&self, c: &Collector, names: &Names) -> Vec<ConnRow> {
@@ -783,7 +807,7 @@ mod tests {
     fn arrows_switch_tabs_and_esc_does_not_quit() {
         let mut app = App::default();
         app.on_key(Key::Left);
-        assert_eq!(app.tab, Tab::Log, "wraps around");
+        assert_eq!(app.tab, Tab::Usage, "wraps around");
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Connections);
         app.on_key(Key::Right);
@@ -939,6 +963,8 @@ mod tests {
         assert!(!app.editing_host && app.host_input.is_empty());
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Log);
+        app.on_key(Key::Right);
+        assert_eq!(app.tab, Tab::Usage);
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Connections, "wraps");
         assert_eq!(app.on_key(Key::Char('H')), Some(Action::BlockHostOfRow));
