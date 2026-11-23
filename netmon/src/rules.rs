@@ -283,6 +283,9 @@ pub struct Blocklist {
     /// Absolute path of the file.
     pub path: String,
     pub comment: String,
+    /// Download URL for netmon-blocklist-update, empty if none.
+    #[serde(default)]
+    pub url: String,
     /// Names read from the file.
     pub count: usize,
     /// Lines that held no hostname.

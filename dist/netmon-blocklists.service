@@ -1,0 +1,37 @@
+# Optional: downloads the host block lists that have a url in
+# /etc/netmon/rules.toml or a profile, then makes netmond read them again.
+# Started by netmon-blocklists.timer; see README, "Host block lists".
+[Unit]
+Description=Update the netmon host block lists
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/netmon-blocklist-update
+# "+": outside the sandbox below; "-": netmond may not run.
+ExecStartPost=-+/usr/bin/systemctl reload netmond
+# It only downloads and replaces list files. The lists must be under
+# /etc/netmon (for example /etc/netmon/lists); other places need a
+# drop-in with ReadWritePaths.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/netmon
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service

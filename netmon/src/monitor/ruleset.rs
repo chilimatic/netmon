@@ -328,10 +328,13 @@ impl<K: Kernel> Monitor<K> {
                 })?;
             }
             for (l, names) in lists {
-                rules.add_blocklist(&l.path, &l.comment, names).map_err(|e| {
+                let id = rules.add_blocklist(&l.path, &l.comment, names).map_err(|e| {
                     failed = true;
                     format!("line {}: {e}", l.line)
                 })?;
+                if let Some(b) = rules.blocklists.iter_mut().find(|b| b.id == id) {
+                    b.url = l.url;
+                }
             }
             let d = if rules.default == rules::Action::Allow { String::new() } else { format!(", default {}", rules.default) };
             let h = if h == 0 { String::new() } else { format!(", {h} blocked hosts") };

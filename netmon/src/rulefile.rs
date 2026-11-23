@@ -41,6 +41,8 @@ struct RawBlocklist {
     path: String,
     #[serde(default)]
     comment: String,
+    /// Where netmon-blocklist-update downloads the list (https only).
+    url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -109,6 +111,8 @@ pub struct FileBlocklist {
     pub line: usize,
     pub path: String,
     pub comment: String,
+    /// Download URL, empty if none.
+    pub url: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -220,7 +224,11 @@ pub fn parse(text: &str) -> Result<RulesFile, String> {
             if !b.path.starts_with('/') {
                 return Err(format!("line {line}: blocklist path {:?}: use an absolute path", b.path));
             }
-            Ok(FileBlocklist { line, path: b.path, comment: b.comment })
+            let url = b.url.unwrap_or_default();
+            if !url.is_empty() && (!url.starts_with("https://") || url.chars().any(|c| c.is_control() || c.is_whitespace())) {
+                return Err(format!("line {line}: blocklist url {url:?}: use an https:// URL"));
+            }
+            Ok(FileBlocklist { line, path: b.path, comment: b.comment, url })
         })
         .collect::<Result<_, _>>()?;
     Ok(RulesFile { default: raw.default.map(action), rules, hosts, blocklists })
@@ -390,6 +398,9 @@ pub fn render(rules: &Rules) -> String {
     }
     for l in &rules.blocklists {
         let _ = write!(out, "\n[[blocklist]]\npath = {}\n", q(&l.path));
+        if !l.url.is_empty() {
+            let _ = writeln!(out, "url = {}", q(&l.url));
+        }
         if !l.comment.is_empty() {
             let _ = writeln!(out, "comment = {}", q(&l.comment));
         }
@@ -474,6 +485,20 @@ port = "8000-8100"
 action = "deny"
 remote = "2001:db8::1"
 "#;
+
+    #[test]
+    fn blocklist_url_round_trips_and_must_be_https() {
+        let f = parse("[[blocklist]]\npath = \"/etc/netmon/lists/a.txt\"\nurl = \"https://x.example/hosts\"\n").unwrap();
+        assert_eq!(f.blocklists[0].url, "https://x.example/hosts");
+        let mut rules = Rules::default();
+        let id = rules.add_blocklist("/etc/netmon/lists/a.txt", "", Ok((Default::default(), 0))).unwrap();
+        rules.blocklists.iter_mut().find(|b| b.id == id).unwrap().url = "https://x.example/hosts".into();
+        assert_eq!(parse(&render(&rules)).unwrap().blocklists[0].url, "https://x.example/hosts");
+        for bad in ["http://x.example/hosts", "file:///etc/passwd", "https://x.example/a b"] {
+            let e = err(&format!("[[blocklist]]\npath = \"/a\"\nurl = \"{bad}\"\n"));
+            assert!(e.contains("use an https:// URL"), "{bad}: {e}");
+        }
+    }
 
     #[test]
     fn until_reads_and_writes_utc() {

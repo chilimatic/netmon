@@ -463,7 +463,10 @@ Small, independent features after the firewall core:
   the rules file). Each name blocks itself and the names below it. The
   names stay in the daemon (an `Arc` set, not in snapshots). `r` in the
   Hosts tab and SIGHUP (`systemctl reload netmond`) read the lists again.
-  Protocol version 4.
+  Protocol version 4. Optional updates: `url = "https://..."` per list;
+  `netmon-blocklist-update` (rules file and profiles, parser check, atomic
+  replace) with `netmon-blocklists.service`/`.timer` (weekly, then
+  `systemctl reload netmond`).
 - **Notifier 1-hour buttons, QUIC off per program: done (2026-11-23).**
   The notifier buttons are Allow 1 h, Deny 1 h, Allow always, Deny always.
   `Q` in the Processes tab toggles "deny out exe X udp port 443".

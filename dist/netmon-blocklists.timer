@@ -1,0 +1,12 @@
+# Optional: updates the netmon host block lists once a week. Persistent: a
+# run missed while the host was off happens at the next boot.
+[Unit]
+Description=Weekly update of the netmon host block lists
+
+[Timer]
+OnCalendar=Sun 05:00
+RandomizedDelaySec=4h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

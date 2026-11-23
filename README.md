@@ -494,6 +494,36 @@ Download them yourself, for example with a systemd timer, then run
 - At most 32 lists, 2 000 000 names together, and 128 MB per file.
   Top-level names (`com`) and addresses in a list are ignored.
 
+Optional: automatic updates. Give a list a `url` (https only):
+
+```toml
+[[blocklist]]
+path = "/etc/netmon/lists/stevenblack.txt"
+url = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+```
+
+`netmon-blocklist-update` downloads every list with a `url` in the rules
+file and in the profiles. It checks each download with the list parser
+and replaces the old file only if the download holds at least one name.
+A systemd timer runs it every Sunday, then runs
+`systemctl reload netmond`. Install it from the repository directory:
+
+```sh
+sudo install -o root -g root -m 0755 target/release/netmon-blocklist-update /usr/local/bin/
+sudo install -o root -g root -m 0644 dist/netmon-blocklists.service dist/netmon-blocklists.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now netmon-blocklists.timer
+```
+
+- `sudo systemctl start netmon-blocklists.service` updates at once.
+  `journalctl -u netmon-blocklists.service` shows the result.
+- The service can write only below `/etc/netmon`. Keep the lists there,
+  for example in `/etc/netmon/lists`.
+- The same path with two different urls (for example in two profiles) is
+  not updated, and the run fails with a message.
+- With `default = "deny"` or `"ask"`, give the download a rule: outbound
+  TCP 443 for `/usr/bin/curl` to the list host.
+
 Limits:
 
 - A program that uses encrypted DNS (DNS over HTTPS or TLS) gives netmon
@@ -1394,6 +1424,7 @@ Limits of the `/proc` sources:
 | `dist/netmond.service` | systemd unit |
 | `dist/netmon-notify.service` | systemd user unit for `netmon-notify` |
 | `dist/netmon-geoip-update`, `dist/netmon-geoip.service`, `dist/netmon-geoip.timer` | Optional monthly download of the DB-IP Lite files |
+| `netmon/src/listupdate.rs`, `dist/netmon-blocklists.service`, `dist/netmon-blocklists.timer` | Optional weekly download of host block lists with a `url` |
 | `docs/ROADMAP.md`, `docs/REVIEW.md`, `docs/REVIEW2.md` | Phases, reviews and decisions |
 
 ### Tests

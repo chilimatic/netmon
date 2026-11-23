@@ -35,3 +35,7 @@ path = "src/bin/netmond.rs"
 [[bin]]
 name = "netmon-notify"
 path = "src/bin/netmon-notify.rs"
+
+[[bin]]
+name = "netmon-blocklist-update"
+path = "src/bin/netmon-blocklist-update.rs"

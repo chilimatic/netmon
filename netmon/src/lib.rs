@@ -16,6 +16,7 @@ mod geo;
 mod graph;
 mod ifaces;
 mod linkwatch;
+mod listupdate;
 mod monitor;
 mod names;
 mod netns;
@@ -43,5 +44,6 @@ pub(crate) fn test_fs_lock() -> std::sync::MutexGuard<'static, ()> {
 
 pub use daemon::run as run_daemon;
 pub use monitor::RulesFileError;
+pub use listupdate::run as run_blocklist_update;
 pub use notify::run as run_notify;
 pub use tui::run;
