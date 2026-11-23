@@ -98,6 +98,25 @@ impl Client {
                 };
                 return None;
             }
+            Action::SetCaptureFilter(text) => {
+                let Some(cap) = self.capture.as_mut() else {
+                    app.status = "no capture".into();
+                    return None;
+                };
+                if text.is_empty() {
+                    cap.set_filter(None);
+                    app.status = "capture filter cleared".into();
+                } else {
+                    match crate::pfilter::Filter::parse(&text) {
+                        Ok(f) => {
+                            app.status = format!("capture filter: {}", f.text());
+                            cap.set_filter(Some(f));
+                        }
+                        Err(e) => app.status = format!("capture filter: {e}"),
+                    }
+                }
+                return None;
+            }
             Action::ClearCapture => {
                 if let Some(cap) = self.capture.as_mut() {
                     cap.clear();

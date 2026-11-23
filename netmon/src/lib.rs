@@ -20,6 +20,7 @@ mod listupdate;
 mod monitor;
 mod names;
 mod netns;
+mod pfilter;
 mod notify;
 mod probe;
 mod profile;

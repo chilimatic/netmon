@@ -197,6 +197,9 @@ pub struct App {
     /// Typing a hostname to block (Hosts tab, a).
     pub editing_host: bool,
     pub host_input: String,
+    /// Typing the display filter of the capture (Capture tab, /).
+    pub editing_capture_filter: bool,
+    pub capture_filter_input: String,
     /// The newest lines of the connection log, newest first (Log tab).
     pub log: Vec<crate::connlog::Entry>,
     /// Why the log could not be read, empty if it could.
@@ -240,6 +243,8 @@ impl Default for App {
             anim_drawn: 0.0,
             editing_host: false,
             host_input: String::new(),
+            editing_capture_filter: false,
+            capture_filter_input: String::new(),
             log: Vec::new(),
             log_error: String::new(),
             geo: crate::geo::Geo::default(),
@@ -303,6 +308,8 @@ pub enum Action {
     ReloadBlocklists,
     /// Open the profile picker (the client lists the profiles).
     PickProfile,
+    /// Set the display filter of the capture; empty clears it.
+    SetCaptureFilter(String),
     /// Switch to this rule profile.
     LoadProfile(String),
     /// Block what the selected graph node stands for.
@@ -344,6 +351,21 @@ impl App {
                     return self.profiles.get(self.profile_sel).cloned().map(Action::LoadProfile);
                 }
                 Key::Esc | Key::Char('q') => self.picking_profile = false,
+                _ => {}
+            }
+            return None;
+        }
+        if self.editing_capture_filter {
+            match key {
+                Key::Char(c) => self.capture_filter_input.push(c),
+                Key::Backspace => {
+                    self.capture_filter_input.pop();
+                }
+                Key::Enter => {
+                    self.editing_capture_filter = false;
+                    return Some(Action::SetCaptureFilter(self.capture_filter_input.trim().to_string()));
+                }
+                Key::Esc => self.editing_capture_filter = false,
                 _ => {}
             }
             return None;
@@ -420,6 +442,11 @@ impl App {
                 Key::Char('x') => return Some(Action::StopCapture),
                 Key::Char('s') => return Some(Action::SavePcap),
                 Key::Char('c') => return Some(Action::ClearCapture),
+                // The input keeps the last filter, to edit it.
+                Key::Char('/') => {
+                    self.editing_capture_filter = true;
+                    return None;
+                }
                 _ => {}
             }
         }
@@ -844,6 +871,12 @@ mod tests {
         assert_eq!(app.on_key(Key::Enter), None);
         assert_eq!(app.on_key(Key::Char('s')), Some(Action::SavePcap));
         assert_eq!(app.on_key(Key::Down), Some(Action::MovePacket(1)));
+        assert_eq!(app.on_key(Key::Char('/')), None);
+        for c in "dns".chars() {
+            assert_eq!(app.on_key(Key::Char(c)), None, "typing, not keys");
+        }
+        assert_eq!(app.on_key(Key::Enter), Some(Action::SetCaptureFilter("dns".into())));
+        assert_eq!(app.filter, "", "the table filter stays");
         // Outside the capture tab, 's' and 'x' do nothing.
         app.on_key(Key::Char('1'));
         assert_eq!(app.on_key(Key::Char('s')), None);

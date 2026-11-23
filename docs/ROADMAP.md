@@ -489,8 +489,10 @@ Small, independent features after the firewall core:
   fallback, MaxMind marker check, atomic replace, sandboxed unit).
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.
-- **Capture filters**: `tcp port 443`, `dns`, `host 1.1.1.1` in the Capture
-  tab.
+- **Capture filters: done (2026-11-23).** `/` in the Capture tab sets a
+  display filter (tcpdump subset: proto, port, host, net, dns/http/tls/
+  quic, not/and/or). Fields are parsed once per packet; all packets stay;
+  `s` saves the shown ones.
 - **Follow stream**: rebuild one TCP stream and show its plaintext.
 - **History**: per-process daily totals in SQLite.
 

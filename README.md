@@ -297,7 +297,8 @@ usage file for the Usage tab). Options of the daemon: `--socket PATH`,
 | `t` | Rules | Set the end time of the selected rule: 1 hour, then 1 day, then none |
 | `P` | Rules | Pick a rule profile (`↑↓`, `Enter` loads, `Esc` cancels) |
 | `s` | Rules | Save all rules to the rules file |
-| `s` `c` `x` `f` `End` | Capture | Save `.pcap`, clear, stop, follow new packets |
+| `s` `c` `x` `f` `End` | Capture | Save the shown packets as `.pcap`, clear, stop, follow new packets |
+| `/` | Capture | Type a display filter, for example `tcp port 443` (see [Packet capture](#packet-capture)) |
 | `a` | Hosts | Type a hostname to block. `Enter` blocks it, `Esc` cancels. |
 | `d` | Hosts | Remove the selected host block or list |
 | `r` | Hosts | Read the host block lists again |
@@ -999,7 +1000,25 @@ netmon opens the Capture tab and shows:
 - a hex and ASCII dump of the bytes
 
 Keys: `↑` `↓` `PgUp` `PgDn` `Home` select, `End` or `f` follow new packets,
-`s` save, `c` clear, `x` stop.
+`/` filter, `s` save, `c` clear, `x` stop.
+
+`/` sets a display filter, a subset of the tcpdump syntax. Only matching
+packets show, and `s` saves only those. All packets stay in memory, so a
+new filter or an empty one (`/`, `Enter`) shows them again.
+
+| Term | Matches |
+|---|---|
+| `tcp` `udp` `icmp` `icmp6` | IP protocol |
+| `ip` `ip6` `arp` | Ethernet type |
+| `port N`, `src port N`, `dst port N` | TCP or UDP port |
+| `host IP`, `src host IP`, `dst host IP`, or only the address | Source or destination address |
+| `net 10.0.0.0/8` | Source or destination in the network |
+| `dns` `http` `tls` `quic` | Port 53, TCP 80, TCP 443, UDP 443 |
+
+- Terms next to each other must all match: `tcp port 443`.
+- `and` and `or` join terms, and `and` binds first. `not` negates the
+  next term: `dns or not tcp`. Parentheses are not supported.
+- The header line shows the filter and the number of shown packets.
 
 - A process capture follows the process. Its new connections join within
   one tick, so the first packets of a new connection (the SYN) can be

@@ -45,6 +45,8 @@ pub struct Captured {
     /// Ethernet-framed bytes, at most CAPTURE_LEN (+14 if a header was added).
     pub data: Vec<u8>,
     pub decoded: Decoded,
+    /// Protocol, addresses and ports, for the display filter.
+    pub fields: crate::pfilter::Fields,
 }
 
 /// Builds a packet from a ring buffer event. Devices without a link layer
@@ -74,7 +76,8 @@ impl Captured {
     /// Decodes a packet from the monitor.
     pub fn from_raw(p: RawPacket) -> Self {
         let decoded = decode(&p.data);
-        Captured { time: p.time, ifindex: p.ifindex, egress: p.egress, orig_len: p.orig_len, data: p.data, decoded }
+        let fields = crate::pfilter::fields(&p.data);
+        Captured { time: p.time, ifindex: p.ifindex, egress: p.egress, orig_len: p.orig_len, data: p.data, decoded, fields }
     }
 
     #[cfg(test)]
@@ -97,6 +100,9 @@ pub struct Capture {
     pub selected: usize,
     /// Packets this capture lost because the ring buffer was full.
     pub dropped: u64,
+    /// Display filter: only matching packets show and are saved. All
+    /// packets stay in memory.
+    pub filter: Option<crate::pfilter::Filter>,
 }
 
 impl Capture {
@@ -110,7 +116,25 @@ impl Capture {
             follow: true,
             selected: 0,
             dropped: 0,
+            filter: None,
         }
+    }
+
+    fn shows(&self, p: &Captured) -> bool {
+        self.filter.as_ref().is_none_or(|f| f.matches(&p.fields))
+    }
+
+    /// Indexes of the packets the filter shows, oldest first.
+    pub fn shown(&self) -> Vec<usize> {
+        self.packets.iter().enumerate().filter(|(_, p)| self.shows(p)).map(|(i, _)| i).collect()
+    }
+
+    /// Sets or clears the display filter and selects the newest shown
+    /// packet.
+    pub fn set_filter(&mut self, filter: Option<crate::pfilter::Filter>) {
+        self.filter = filter;
+        self.selected = self.shown().last().copied().unwrap_or(0);
+        self.follow = true;
     }
 
     pub fn push(&mut self, p: Captured) {
@@ -119,8 +143,9 @@ impl Capture {
             self.packets.pop_front();
             self.selected = self.selected.saturating_sub(1);
         }
+        let shown = self.shows(&p);
         self.packets.push_back(p);
-        if self.follow {
+        if self.follow && shown {
             self.selected = self.packets.len() - 1;
         }
     }
@@ -130,10 +155,16 @@ impl Capture {
         self.selected = 0;
     }
 
+    /// Moves the selection by `delta` shown packets.
     pub fn select(&mut self, delta: isize) {
-        let max = self.packets.len().saturating_sub(1);
-        self.selected = self.selected.saturating_add_signed(delta).min(max);
-        self.follow = self.selected == max;
+        let shown = self.shown();
+        let Some(last) = shown.len().checked_sub(1) else { return };
+        // The position of the selected packet, or of the last shown one
+        // before it.
+        let pos = shown.partition_point(|i| *i <= self.selected).saturating_sub(1);
+        let pos = pos.saturating_add_signed(delta).min(last);
+        self.selected = shown[pos];
+        self.follow = pos == last;
     }
 }
 
@@ -197,7 +228,7 @@ pub fn save(cap: &Capture, dir: &Path) -> std::io::Result<PathBuf> {
         fchown(&file, Some(uid), Some(gid))?;
     }
     let mut w = BufWriter::new(file);
-    write_pcap(&mut w, &cap.packets)?;
+    write_pcap(&mut w, cap.packets.iter().filter(|p| cap.shows(p)))?;
     w.flush()?;
     Ok(path)
 }
@@ -259,6 +290,39 @@ mod tests {
         let mut c = Capture::new(Target::Interface { index: 1, name: "lo".into() });
         c.push(Captured::from_event(&event(&tcp_syn(), true), 0));
         c
+    }
+
+    /// The SYN of tcp_syn, turned into UDP to port 53.
+    fn dns_packet() -> Captured {
+        let mut d = tcp_syn();
+        d[23] = 17;
+        d[36..38].copy_from_slice(&53u16.to_be_bytes());
+        Captured::from_raw(RawPacket { time: SystemTime::now(), ifindex: 1, egress: true, orig_len: 54, data: d })
+    }
+
+    #[test]
+    fn display_filter_hides_selects_and_saves_only_matches() {
+        let mut c = one_packet();
+        c.push(dns_packet());
+        c.push(Captured::from_event(&event(&tcp_syn(), true), 0));
+        c.set_filter(Some(crate::pfilter::Filter::parse("tls").unwrap()));
+        assert_eq!((c.shown(), c.selected, c.follow), (vec![0, 2], 2, true));
+        c.select(-1);
+        assert_eq!((c.selected, c.follow), (0, false));
+        c.select(-1);
+        assert_eq!(c.selected, 0, "stays at the first shown");
+        c.select(5);
+        assert_eq!((c.selected, c.follow), (2, true));
+        c.push(dns_packet());
+        assert_eq!(c.selected, 2, "a hidden packet does not move the selection");
+        c.push(Captured::from_event(&event(&tcp_syn(), true), 0));
+        assert_eq!(c.selected, 4, "a shown one does while following");
+        let dir = tmpdir("filtered");
+        let path = save(&c, &dir).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), 24 + 3 * (16 + 54), "only the 3 TLS packets");
+        c.set_filter(None);
+        assert_eq!(c.shown().len(), 5, "all packets stayed");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

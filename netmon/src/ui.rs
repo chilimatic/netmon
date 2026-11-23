@@ -109,10 +109,15 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     };
     let footer_text = if app.editing_host {
         format!(" block host (name or *.domain): {}█   (Enter block, Esc cancel)", app.host_input)
+    } else if app.editing_capture_filter {
+        format!(
+            " capture filter (tcp, udp, port 443, host 1.1.1.1, net 10.0.0.0/8, dns, tls, not, and, or): {}█   (Enter apply, empty clears, Esc cancel)",
+            app.capture_filter_input
+        )
     } else if app.editing_filter {
         format!(" filter: {}█   (Enter keep, Esc clear)", app.filter)
     } else if app.tab == Tab::Capture {
-        " q quit  ←→/1-9 view  ↑↓ PgUp/PgDn Home select  End/f follow  s save .pcap  c clear  x stop  g graph".to_string()
+        " q quit  ←→/1-9 view  ↑↓ PgUp/PgDn Home select  End/f follow  / filter  s save shown as .pcap  c clear  x stop  g graph".to_string()
     } else if app.tab == Tab::Hosts {
         " q quit  ←→/1-9 view  ↑↓ select  a block a host  d remove  r reload lists  s save to rules file".to_string()
     } else if app.tab == Tab::Graph {
@@ -393,6 +398,7 @@ fn draw_capture(f: &mut Frame, cap: Option<&Capture>, names: &Names, area: Rect)
     };
     let [info, list, detail] =
         Layout::vertical([Constraint::Length(1), Constraint::Percentage(55), Constraint::Min(5)]).areas(area);
+    let shown = cap.shown();
     let follow = match (cap.running, cap.follow) {
         (false, _) => "STOPPED (Enter on a row in tabs 1-3 starts a new capture)",
         (true, true) => "following",
@@ -400,11 +406,15 @@ fn draw_capture(f: &mut Frame, cap: Option<&Capture>, names: &Names, area: Rect)
     };
     f.render_widget(
         Paragraph::new(format!(
-            " {}   kept {}  received {}  ring drops {}   {follow}",
+            " {}   kept {}  received {}  ring drops {}   {follow}{}",
             cap.target.label(),
             cap.packets.len(),
             cap.received,
-            cap.dropped
+            cap.dropped,
+            match &cap.filter {
+                Some(flt) => format!("   filter [{}] shows {}", flt.text(), shown.len()),
+                None => String::new(),
+            }
         ))
         .style(Style::new().fg(Color::Yellow)),
         info,
@@ -412,9 +422,10 @@ fn draw_capture(f: &mut Frame, cap: Option<&Capture>, names: &Names, area: Rect)
 
     // Only build rows for the visible window: a capture can hold 20k packets.
     let visible = list.height.saturating_sub(2).max(1) as usize;
-    let start = cap.selected.saturating_sub(visible - 1);
+    let pos = shown.partition_point(|i| *i <= cap.selected).saturating_sub(1);
+    let start = pos.saturating_sub(visible - 1);
     let first_no = cap.received - cap.packets.len() as u64 + 1;
-    let rows = cap.packets.iter().enumerate().skip(start).take(visible).map(|(i, p)| {
+    let rows = shown.iter().skip(start).take(visible).filter_map(|&i| cap.packets.get(i).map(|p| (i, p))).map(|(i, p)| {
         let t = p.time.duration_since(cap.started).unwrap_or_default().as_secs_f64();
         let s = &p.decoded.summary;
         let dir = if p.egress {
@@ -451,10 +462,10 @@ fn draw_capture(f: &mut Frame, cap: Option<&Capture>, names: &Names, area: Rect)
     .header(header_row(&["No.", "Time", "", "Iface", "Source", "Destination", "Proto", "Len", "Info"]))
     .block(Block::new().borders(Borders::TOP))
     .row_highlight_style(Style::new().bg(Color::DarkGray));
-    let mut state = TableState::default().with_selected(Some(cap.selected - start));
+    let mut state = TableState::default().with_selected((!shown.is_empty()).then_some(pos - start));
     f.render_stateful_widget(table, list, &mut state);
 
-    let Some(p) = cap.packets.get(cap.selected) else { return };
+    let Some(p) = shown.get(pos).and_then(|i| cap.packets.get(*i)) else { return };
     let [fields, hex] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(76)]).areas(detail);
     let mut lines: Vec<Line> = vec![Line::from(format!(
         "{}  {}  {} bytes on wire, {} captured",
@@ -929,6 +940,11 @@ mod tests {
         assert!(screen.contains("[SYN] seq 1000"));
         assert!(screen.contains("TCP     40000 → 443"));
         assert!(screen.contains("0000  aa bb cc dd ee ff"));
+        // A filter that shows nothing: an empty list, no detail.
+        cap.set_filter(Some(crate::pfilter::Filter::parse("dns").unwrap()));
+        term.draw(|f| draw(f, &mut app, &c, &Names::default(), Some(&cap), &Rules::default())).unwrap();
+        let s = self::screen(&term);
+        assert!(s.contains("filter [dns] shows 0") && !s.contains("[SYN] seq 1000"), "{s}");
     }
 
     #[test]
