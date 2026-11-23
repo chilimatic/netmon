@@ -203,6 +203,37 @@ pub struct Rule {
     pub hits_base: u64,
     /// Ends when the monitor stops; never saved to the rules file.
     pub temporary: bool,
+    /// The rule ends at this time (seconds since 1970, UTC).
+    #[serde(default)]
+    pub until: Option<u64>,
+}
+
+/// Seconds since 1970, UTC.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+#[cfg(test)]
+#[test]
+fn time_left_is_short() {
+    assert_eq!(time_left(100, 100), "0s");
+    assert_eq!(time_left(3699, 100), "60m");
+    assert_eq!(time_left(3700, 100), "1h");
+    assert_eq!(time_left(3701, 100), "2h");
+    assert_eq!(time_left(86_400, 0), "24h");
+    assert_eq!(time_left(200_000, 0), "3d");
+    assert_eq!(time_left(5, 100), "0s", "past");
+}
+
+/// Time left until `until`, short: "59m", "23h", "2d".
+pub fn time_left(until: u64, now: u64) -> String {
+    let s = until.saturating_sub(now);
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s.div_ceil(60)),
+        3600..172_800 => format!("{}h", s.div_ceil(3600)),
+        _ => format!("{}d", s.div_ceil(86_400)),
+    }
 }
 
 impl fmt::Display for Rule {
@@ -329,7 +360,7 @@ impl Rules {
         }
         let id = self.next_id;
         self.next_id += 1;
-        let rule = Rule { id, action, m, comment: comment.to_string(), hits: 0, hits_base: 0, temporary: false };
+        let rule = Rule { id, action, m, comment: comment.to_string(), hits: 0, hits_base: 0, temporary: false, until: None };
         self.rules.insert(at.min(self.rules.len()), rule);
         Ok(id)
     }
@@ -349,6 +380,22 @@ impl Rules {
         if let Some(r) = self.rules.iter_mut().find(|r| r.id == id) {
             r.temporary = true;
         }
+    }
+
+    /// Sets or clears the end time of rule `id`. False: no such rule.
+    pub fn set_until(&mut self, id: u32, until: Option<u64>) -> bool {
+        match self.rules.iter_mut().find(|r| r.id == id) {
+            Some(r) => {
+                r.until = until;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Ids of the rules whose end time is `now` or earlier.
+    pub fn expired(&self, now: u64) -> Vec<u32> {
+        self.rules.iter().filter(|r| r.until.is_some_and(|u| u <= now)).map(|r| r.id).collect()
     }
 
     pub fn remove(&mut self, id: u32) -> Option<Rule> {

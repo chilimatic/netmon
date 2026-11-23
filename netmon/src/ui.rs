@@ -118,7 +118,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             if app.show_virtual { "on" } else { "off" }
         )
     } else if app.tab == Tab::Rules {
-        " q quit  ←→/1-7 view  ↑↓ select  d remove rule  s save to rules file   tmp rules end when the monitor stops".to_string()
+        " q quit  ←→/1-7 view  ↑↓ select  d remove rule  t end time 1h/1d/never  s save to rules file   tmp rules end when the monitor stops".to_string()
     } else {
         let block = match app.tab {
             Tab::Connections => "  b/B/H block ip/port/host",
@@ -268,7 +268,7 @@ fn draw_ask(f: &mut Frame, p: &Prompt, more: usize, status: &str) {
         Span::raw(format!("   {rule}")),
     ]));
     text.push(Line::from(Span::styled(
-        "a allow  A allow always  d deny  D deny always   o/x allow/deny selected once   ↑↓ select   Esc later",
+        "a allow  A allow always  h/H allow/deny 1 h  d deny  D deny always   o/x allow/deny selected once   ↑↓ select   Esc later",
         Style::new().fg(Color::Yellow),
     )));
     text.push(Line::from(format!("no answer in {left} s: deny once{more}")));
@@ -528,22 +528,36 @@ fn draw_rules(f: &mut Frame, app: &mut App, rules: &Rules, area: Rect) {
         return;
     }
     let ids: Vec<RowId> = rules.rules.iter().map(|r| RowId::Rule(r.id)).collect();
+    let now = crate::rules::unix_now();
     let table = Table::new(
         rules.rules.iter().enumerate().map(|(i, r)| {
             let color = if r.action == Action::Deny { Color::Red } else { Color::Green };
             Row::new(vec![
                 Cell::from((i + 1).to_string()),
-                Cell::from(if r.temporary { format!("{} tmp", r.action) } else { r.action.to_string() }),
+                Cell::from(action_label(r, now)),
                 Cell::from(r.m.to_string()),
                 Cell::from(r.comment.clone()),
                 Cell::from(Line::from(r.hits.to_string()).right_aligned()),
             ])
             .style(Style::new().fg(color))
         }),
-        [Constraint::Length(4), Constraint::Length(6), Constraint::Fill(2), Constraint::Fill(1), Constraint::Length(12)],
+        [Constraint::Length(4), Constraint::Length(14), Constraint::Fill(2), Constraint::Fill(1), Constraint::Length(12)],
     )
     .header(header_row(&["#", "Action", "Match", "Comment", "Hits"]));
     render_table(f, app, table, &ids, area);
+}
+
+/// The Action cell of a rule: "allow", "deny tmp", "allow 59m".
+fn action_label(r: &crate::rules::Rule, now: u64) -> String {
+    let mut s = r.action.to_string();
+    if r.temporary {
+        s.push_str(" tmp");
+    }
+    if let Some(u) = r.until {
+        s.push(' ');
+        s.push_str(&crate::rules::time_left(u, now));
+    }
+    s
 }
 
 /// The Hosts tab: blocked hostnames, the addresses learned for them and

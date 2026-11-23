@@ -275,6 +275,7 @@ impl<K: Kernel> Monitor<K> {
         match req {
             Request::ToggleBlock(target) => self.toggle_block(target),
             Request::RemoveRule(id) => self.remove_rule(id),
+            Request::SetRuleTimer { id, secs } => self.set_rule_timer(id, secs),
             Request::BlockHost { pattern, comment } => self.block_host(&pattern, &comment),
             Request::RemoveHost(id) => self.remove_host(id),
             Request::SaveRules => {
@@ -394,6 +395,9 @@ impl<K: Kernel> Monitor<K> {
             errors.push(e);
         }
         self.prof.add("hostnames", t);
+        if let Some(m) = self.expire_rules(rules::unix_now()) {
+            errors.push(m);
+        }
         self.ticks += 1;
         if let Err(e) = self.sync_process_capture() {
             errors.push(format!("capture: {e:#}"));

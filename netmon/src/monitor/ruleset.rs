@@ -106,6 +106,33 @@ impl<K: Kernel> Monitor<K> {
         self.change_rules(|r| r.block(target).map(|_| msg))
     }
 
+    /// Rule `id` ends `secs` from now, or never (None).
+    pub(crate) fn set_rule_timer(&mut self, id: u32, secs: Option<u64>) -> String {
+        let until = secs.map(|s| rules::unix_now() + s);
+        // Only the list changes, not the kernel table.
+        if !self.rules.set_until(id, until) {
+            return "no such rule".into();
+        }
+        let rule = self.rules.rules.iter().find(|r| r.id == id).map(|r| r.to_string()).unwrap_or_default();
+        match secs {
+            Some(s) => format!("{rule} ends in {}", rules::time_left(s, 0)),
+            None => format!("{rule} has no end time"),
+        }
+    }
+
+    /// Removes the rules whose end time passed. Returns a message for each
+    /// change, empty if none ended.
+    pub(crate) fn expire_rules(&mut self, now: u64) -> Option<String> {
+        let ids = self.rules.expired(now);
+        if ids.is_empty() {
+            return None;
+        }
+        Some(self.change_rules(|r| {
+            let gone: Vec<String> = ids.iter().filter_map(|id| r.remove(*id)).map(|rule| rule.to_string()).collect();
+            Ok(format!("rule ended: {}", gone.join(", ")))
+        }))
+    }
+
     pub(crate) fn remove_rule(&mut self, id: u32) -> String {
         self.change_rules(|r| r.remove(id).map(|rule| format!("removed {rule}")).ok_or_else(|| "no such rule".into()))
     }
@@ -176,7 +203,10 @@ impl<K: Kernel> Monitor<K> {
             Ok(p) => p,
             Err(e) => return fail(e),
         };
-        let n = parsed.rules.len();
+        // Rules that ended while the monitor did not run are left out.
+        let now = rules::unix_now();
+        let (rules_in, ended): (Vec<_>, Vec<_>) = parsed.rules.into_iter().partition(|r| r.until.is_none_or(|u| u > now));
+        let n = rules_in.len();
         let hosts = parsed.hosts;
         let default = parsed.default;
         let mut failed = false;
@@ -184,11 +214,12 @@ impl<K: Kernel> Monitor<K> {
             if let Some(d) = default {
                 rules.default = d;
             }
-            for r in parsed.rules {
-                rules.insert(usize::MAX, r.action, r.m, &r.comment).map_err(|e| {
+            for r in rules_in {
+                let id = rules.insert(usize::MAX, r.action, r.m, &r.comment).map_err(|e| {
                     failed = true;
                     format!("line {}: {e}", r.line)
                 })?;
+                rules.set_until(id, r.until);
             }
             let h = hosts.len();
             for x in hosts {
@@ -199,7 +230,8 @@ impl<K: Kernel> Monitor<K> {
             }
             let d = if rules.default == rules::Action::Allow { String::new() } else { format!(", default {}", rules.default) };
             let h = if h == 0 { String::new() } else { format!(", {h} blocked hosts") };
-            Ok(format!("{n} rules from {}{d}{h}", path.display()))
+            let e = if ended.is_empty() { String::new() } else { format!(", {} ended rules left out", ended.len()) };
+            Ok(format!("{n} rules from {}{d}{h}{e}", path.display()))
         });
         if failed || msg.starts_with("rule update failed") { fail(msg) } else { Ok(Some(msg)) }
     }

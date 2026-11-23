@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Version of this protocol. Client and daemon must have the same.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Where `netmond` listens.
 pub const DEFAULT_SOCKET: &str = "/run/netmon.sock";
@@ -68,6 +68,8 @@ pub enum Request {
     /// Block, or remove the block rule if it exists.
     ToggleBlock(BlockTarget),
     RemoveRule(u32),
+    /// Rule `id` ends `secs` from now; None: it never ends.
+    SetRuleTimer { id: u32, secs: Option<u64> },
     /// Block a hostname pattern (`name` or `*.domain`).
     BlockHost { pattern: String, comment: String },
     RemoveHost(u32),

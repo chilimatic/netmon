@@ -54,6 +54,9 @@ struct RawRule {
     direction: Option<RawDir>,
     #[serde(default)]
     comment: String,
+    /// End time, a TOML date and time in UTC, for example
+    /// 2026-11-24T10:00:00Z.
+    until: Option<toml::value::Datetime>,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +105,8 @@ pub struct FileRule {
     pub action: Action,
     pub m: Match,
     pub comment: String,
+    /// End time, seconds since 1970 (UTC).
+    pub until: Option<u64>,
 }
 
 /// Reads the file after checking who may write it. `Ok(None)`: the file
@@ -148,8 +153,10 @@ pub fn parse(text: &str) -> Result<RulesFile, String> {
         .into_iter()
         .map(|r| {
             let line = line_of(text, r.span().start);
-            convert(r.into_inner())
-                .map(|(action, m, comment)| FileRule { line, action, m, comment })
+            let r = r.into_inner();
+            let until = r.until.as_ref().map(unix_secs).transpose().map_err(|e| format!("line {line}: {e}"))?;
+            convert(r)
+                .map(|(action, m, comment)| FileRule { line, action, m, comment, until })
                 .map_err(|e| format!("line {line}: {e}"))
         })
         .collect::<Result<_, _>>()?;
@@ -203,6 +210,53 @@ fn convert(r: RawRule) -> Result<(Action, Match, String), String> {
     let m = Match { net, proto, ports, exe: r.process, dir };
     m.check()?;
     Ok((action, m, r.comment))
+}
+
+/// A TOML date and time with an offset as seconds since 1970 (UTC).
+fn unix_secs(d: &toml::value::Datetime) -> Result<u64, String> {
+    let bad = || format!("until {d}: use a date and time in UTC, like 2026-11-24T10:00:00Z");
+    let (Some(date), Some(time), Some(offset)) = (d.date, d.time, d.offset) else { return Err(bad()) };
+    let off_min: i64 = match offset {
+        toml::value::Offset::Z => 0,
+        toml::value::Offset::Custom { minutes } => minutes.into(),
+    };
+    let days = days_from_civil(date.year.into(), date.month.into(), date.day.into());
+    let secs = days * 86_400 + i64::from(time.hour) * 3600 + i64::from(time.minute) * 60 + i64::from(time.second.unwrap_or(0))
+        - off_min * 60;
+    u64::try_from(secs).map_err(|_| bad())
+}
+
+/// Seconds since 1970 as a TOML date and time in UTC.
+fn utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// Days since 1970-01-01 of a date (proleptic Gregorian calendar). From
+/// Howard Hinnant's `days_from_civil`.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The date of a day since 1970-01-01. Inverse of `days_from_civil`.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
 }
 
 fn port_range(s: &str) -> Result<(u16, u16), String> {
@@ -271,6 +325,9 @@ pub fn render(rules: &Rules) -> String {
         }
         if !r.comment.is_empty() {
             let _ = writeln!(out, "comment = {}", q(&r.comment));
+        }
+        if let Some(u) = r.until {
+            let _ = writeln!(out, "until = {}", utc(u));
         }
     }
     for h in &rules.hosts {
@@ -359,6 +416,28 @@ port = "8000-8100"
 action = "deny"
 remote = "2001:db8::1"
 "#;
+
+    #[test]
+    fn until_reads_and_writes_utc() {
+        let f = parse("[[rule]]\naction = \"deny\"\nport = 25\nuntil = 2026-11-24T10:00:00Z\n").unwrap();
+        assert_eq!(f.rules[0].until, Some(1_795_514_400));
+        let f = parse("[[rule]]\naction = \"deny\"\nport = 25\nuntil = 2026-11-24T12:00:00+02:00\n").unwrap();
+        assert_eq!(f.rules[0].until, Some(1_795_514_400), "offset applied");
+        assert!(err("[[rule]]\naction = \"deny\"\nuntil = 2026-11-24\n").contains("use a date and time in UTC"));
+        assert_eq!(utc(1_795_514_400), "2026-11-24T10:00:00Z");
+        assert_eq!(utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc(951_782_400), "2000-02-29T00:00:00Z", "leap day");
+        for days in [-1, 0, 59, 60, 365, 11_016, 20_416, 100_000] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
+        let mut rules = Rules::default();
+        let id = rules.insert(0, Action::Deny, Match { ports: Some((25, 25)), ..Match::default() }, "").unwrap();
+        rules.set_until(id, Some(1_795_514_400));
+        let text = render(&rules);
+        assert!(text.contains("\nuntil = 2026-11-24T10:00:00Z\n"), "{text}");
+        assert_eq!(parse(&text).unwrap().rules[0].until, Some(1_795_514_400));
+    }
 
     #[test]
     fn default_and_direction() {

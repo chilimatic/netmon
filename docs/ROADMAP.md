@@ -443,7 +443,11 @@ Small, independent features after the firewall core:
   question with `notify-send`. Buttons: Allow, Deny (temporary rule for the
   program), Allow always, Deny always (lasting rule, then the rules file is
   saved). The daemon does not change.
-- **Timed rules**: allow or deny for 1 h or 1 day, then the rule goes away.
+- **Timed rules: done (2026-11-23).** A rule can have an end time
+  (`until` in the rules file, a TOML date and time). `h`/`H` in a question
+  allow or deny for 1 hour. `t` in the Rules tab steps the selected rule
+  through 1 hour, 1 day and no end time. The monitor removes ended rules
+  each tick. Protocol version 2.
 - **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.

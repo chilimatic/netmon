@@ -141,6 +141,21 @@ impl<K: Kernel> Monitor<K> {
                 let target = d.host.unwrap_or_else(|| d.remote.to_string());
                 format!("{} {comm} to {target}:{} once", if allow { "allowed" } else { "denied" }, d.port)
             }
+            Answer::Timed { allow, secs } => {
+                let Some(m) = p.rule_match() else {
+                    return "process unknown: pick port or destination scope with ←→, or o/x for once".into();
+                };
+                let action = if allow { rules::Action::Allow } else { rules::Action::Deny };
+                let label = format!("{action} {m}");
+                let until = rules::unix_now() + secs;
+                let msg = self.change_rules(|r| {
+                    let id = r.insert(0, action, m, "asked")?;
+                    r.set_until(id, Some(until));
+                    Ok(format!("{label} (ends in {})", rules::time_left(secs, 0)))
+                });
+                self.drop_decided_asks();
+                msg
+            }
             Answer::Rule { allow, always } => {
                 let Some(m) = p.rule_match() else {
                     return "process unknown: pick port or destination scope with ←→, or o/x for once".into();

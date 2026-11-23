@@ -370,6 +370,29 @@ fn block_toggle_and_remove_from_rules_tab() {
 }
 
 #[test]
+fn timed_rules_end() {
+    let (mut m, _) = monitor();
+    let mut app = App::default();
+    let mut client = Client::new(m.snapshot(), &mut app);
+    m.request(Request::ToggleBlock(rules::BlockTarget::Port(netmon_common::IPPROTO_TCP, 25)));
+    let id = m.rules.rules[0].id;
+    // t in the Rules tab: 1 hour.
+    ui_drain(&mut m, &mut client, &mut app);
+    app.on_key(crate::app::Key::Char('5'));
+    ui_act(&mut m, &mut client, &mut app, Action::CycleRuleTimer);
+    let now = rules::unix_now();
+    let until = m.rules.rules[0].until.expect("timer set");
+    assert!(until > now + 3500 && until <= now + 3600, "{until} {now}");
+    assert!(m.expire_rules(now).is_none(), "not yet");
+    assert_eq!(m.probe.table.len(), 1);
+    // At the end time the rule goes, from the list and the kernel table.
+    let msg = m.expire_rules(until).unwrap();
+    assert!(msg.starts_with("rule ended: deny tcp port 25"), "{msg}");
+    assert!(m.rules.rules.is_empty() && m.probe.table.is_empty());
+    assert_eq!(m.request(Request::SetRuleTimer { id, secs: Some(60) }), "no such rule");
+}
+
+#[test]
 fn rules_file_owned_by_a_user_is_refused() {
     let (mut m, _) = monitor();
     let dir = std::env::temp_dir().join(format!("netmon-test-{}", std::process::id()));

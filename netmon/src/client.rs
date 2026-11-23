@@ -138,6 +138,14 @@ impl Client {
                 let ids: Vec<_> = rules.iter().map(|r| crate::app::RowId::Rule(r.id)).collect();
                 app.selected_in(&ids).map(|i| Request::RemoveRule(rules[i].id)).ok_or_else(|| "no rule selected".into())
             }
+            Action::CycleRuleTimer => {
+                let rules = &self.snap.rules.rules;
+                let ids: Vec<_> = rules.iter().map(|r| crate::app::RowId::Rule(r.id)).collect();
+                match app.selected_in(&ids).map(|i| &rules[i]) {
+                    Some(r) => Ok(Request::SetRuleTimer { id: r.id, secs: next_timer(r.until, crate::rules::unix_now()) }),
+                    None => Err("no rule selected".into()),
+                }
+            }
             Action::SaveRules => Ok(Request::SaveRules),
             Action::BlockHost(pattern) => Ok(Request::BlockHost { pattern, comment: String::new() }),
             Action::BlockHostOfRow => {
@@ -237,6 +245,26 @@ impl Client {
             Tab::Capture | Tab::Rules | Tab::Graph | Tab::Hosts => Err("select a row in another tab".into()),
         }
     }
+}
+
+/// The next end time for `t` in the Rules tab: none, then 1 hour, then 1
+/// day, then none again.
+pub(crate) fn next_timer(until: Option<u64>, now: u64) -> Option<u64> {
+    const HOUR: u64 = 3600;
+    const DAY: u64 = 86_400;
+    match until.map(|u| u.saturating_sub(now)) {
+        None => Some(HOUR),
+        Some(left) if left <= HOUR => Some(DAY),
+        Some(_) => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn timer_steps_hour_day_never() {
+    assert_eq!(next_timer(None, 1000), Some(3600));
+    assert_eq!(next_timer(Some(1000 + 3600), 1000), Some(86_400));
+    assert_eq!(next_timer(Some(1000 + 86_400), 1000), None);
 }
 
 fn dest_id(d: &crate::ask::Dest) -> DestId {

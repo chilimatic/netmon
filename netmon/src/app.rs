@@ -249,6 +249,8 @@ pub enum Action {
     ToggleBlockProcess,
     /// Remove the selected rule in the Rules tab.
     RemoveRule,
+    /// Step the end time of the selected rule: 1 hour, 1 day, never.
+    CycleRuleTimer,
     /// Block a hostname pattern typed in the Hosts tab.
     BlockHost(String),
     /// Block the hostname of the selected connection.
@@ -274,7 +276,12 @@ pub enum Answer {
     /// A rule for the chosen scope; `always` keeps it (saved with `s`),
     /// otherwise it ends when the monitor stops.
     Rule { allow: bool, always: bool },
+    /// A rule for the chosen scope that ends after `secs`.
+    Timed { allow: bool, secs: u64 },
 }
+
+/// The end time of a timed answer (`h`, `H`).
+pub const ANSWER_SECS: u64 = 3600;
 
 impl App {
     pub fn on_key(&mut self, key: Key) -> Option<Action> {
@@ -328,6 +335,8 @@ impl App {
                 Key::Char('A') => return rule(true, true),
                 Key::Char('d') => return rule(false, false),
                 Key::Char('D') => return rule(false, true),
+                Key::Char('h') => return Some(Action::Answer(Answer::Timed { allow: true, secs: ANSWER_SECS })),
+                Key::Char('H') => return Some(Action::Answer(Answer::Timed { allow: false, secs: ANSWER_SECS })),
                 Key::Char('o') => return Some(Action::Answer(Answer::Once { allow: true })),
                 Key::Char('x') => return Some(Action::Answer(Answer::Once { allow: false })),
                 Key::Up | Key::Char('k') => return Some(Action::AskSelect(-1)),
@@ -404,6 +413,7 @@ impl App {
             Key::Char('B') if self.tab == Tab::Connections => return Some(Action::ToggleBlockPort),
             Key::Char('b') if self.tab == Tab::Processes => return Some(Action::ToggleBlockProcess),
             Key::Char('d') if self.tab == Tab::Rules => return Some(Action::RemoveRule),
+            Key::Char('t') if self.tab == Tab::Rules => return Some(Action::CycleRuleTimer),
             Key::Char('s') if self.tab == Tab::Rules => return Some(Action::SaveRules),
             Key::Enter if matches!(self.tab, Tab::Connections | Tab::Processes | Tab::Interfaces) => {
                 return Some(Action::StartCapture(self.tab));
@@ -803,6 +813,7 @@ mod tests {
         assert_eq!(app.on_key(Key::Char('a')), None);
         app.tab = Tab::Rules;
         assert_eq!(app.on_key(Key::Char('d')), Some(Action::RemoveRule));
+        assert_eq!(app.on_key(Key::Char('t')), Some(Action::CycleRuleTimer));
         let p = crate::ask::Prompt {
             id: 1,
             pid: 1,
@@ -819,6 +830,7 @@ mod tests {
         assert_eq!(app.on_key(Key::Char('D')), Some(Action::Answer(Answer::Rule { allow: false, always: true })));
         assert_eq!(app.on_key(Key::Char('d')), Some(Action::Answer(Answer::Rule { allow: false, always: false })), "d answers, not remove");
         assert_eq!(app.on_key(Key::Char('o')), Some(Action::Answer(Answer::Once { allow: true })));
+        assert_eq!(app.on_key(Key::Char('H')), Some(Action::Answer(Answer::Timed { allow: false, secs: ANSWER_SECS })));
         assert_eq!(app.on_key(Key::Right), Some(Action::AskScope(1)), "arrows steer the question, not the tabs");
         assert_eq!(app.on_key(Key::Down), Some(Action::AskSelect(1)));
         assert_eq!(app.on_key(Key::Char('5')), None, "other keys still work");

@@ -289,6 +289,7 @@ that can connect, default `netmon`).
 | `H` | Connections | Block the hostname of the connection (see [Hosts tab](#hosts-tab)) |
 | `b` | Processes | Block or unblock the exe of the process |
 | `d` | Rules | Remove the selected rule |
+| `t` | Rules | Set the end time of the selected rule: 1 hour, then 1 day, then none |
 | `s` | Rules | Save all rules to the rules file |
 | `s` `c` `x` `f` `End` | Capture | Save `.pcap`, clear, stop, follow new packets |
 | `a` | Hosts | Type a hostname to block. `Enter` blocks it, `Esc` cancels. |
@@ -460,8 +461,10 @@ Limits:
 One row per rule, in match order: number, action (green allow, red deny),
 match, comment and hits. A hit is one connection or socket call that the
 rule decided. A rule from an `a` or `d` answer shows `tmp`: it ends when
-the monitor stops, and `s` does not save it. With no
-rules, the tab explains how to make one.
+the monitor stops, and `s` does not save it. A rule with an end time shows
+the time left, for example `allow 59m`. At the end time the monitor
+removes the rule, and the status line shows `rule ended`. With no rules,
+the tab explains how to make one.
 
 ### Question window
 
@@ -632,6 +635,13 @@ port = "8000-8100"         # or one number; without proto: TCP and UDP
 [[rule]]
 action = "allow"
 direction = "out"          # connections this host opens
+
+# Allow SSH until the given time, then the rule ends.
+[[rule]]
+action = "allow"
+proto = "tcp"
+port = 22
+until = 2026-12-01T18:00:00Z   # TOML date and time; Z is UTC
 ```
 
 - `action` is required. Each other field makes the match narrower. A rule
@@ -643,6 +653,9 @@ direction = "out"          # connections this host opens
   `comment`. The section [Hosts tab](#hosts-tab) explains how.
 - For inbound connections, an exe rule uses the process that bound the
   local port.
+- `until` is an optional end time with a time zone offset (`Z` or
+  `+02:00`). At start, the monitor leaves out the rules whose end time
+  passed, and the status line counts them. `s` writes the end time in UTC.
 - The file and its directory must belong to root and must not be writable
   by group or others. The monitor runs as root, so whoever can write the
   file controls the firewall.
@@ -679,6 +692,7 @@ The question lists all waiting connections of the program by destination:
 | `←` `→` | Select the scope: `program` (any destination), `port` (this protocol and port, any host) or `destination` (this address and port) |
 | `↑` `↓` | Select the destination that the `port` and `destination` scopes and `o`/`x` use |
 | `a` / `d` | Allow or deny with a temporary rule for the scope (`tmp` in the Rules tab, never saved) |
+| `h` / `H` | Allow or deny with a rule for the scope that ends after 1 hour. `s` in the Rules tab saves it with its end time. |
 | `A` / `D` | Allow or deny with a lasting rule. `s` in the Rules tab saves it. |
 | `o` / `x` | Allow or deny only the waiting connections of the selected destination, without a rule |
 | `Esc` / `?` | Put the questions aside, show them again |
@@ -808,8 +822,8 @@ The protocol is one JSON object per line (`netmon/src/proto.rs`):
    messages), then a snapshot.
 3. The daemon sends a snapshot after each tick and after each change,
    captured packets as base64 strings, and status messages.
-4. The client sends requests: block, remove rule, save rules, answer, start
-   and stop a capture. Each reply goes to the client that asked.
+4. The client sends requests: block, remove rule, set the end time of a
+   rule, save rules, answer, start and stop a capture. Each reply goes to the client that asked.
 
 A request line can be 64 KiB at most. A malformed line, a second `Hello` or
 a wrong version ends the connection. Up to 16 clients can connect. A slow
