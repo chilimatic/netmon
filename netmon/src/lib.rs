@@ -16,6 +16,7 @@ mod linkwatch;
 mod monitor;
 mod names;
 mod netns;
+mod notify;
 mod probe;
 mod profile;
 mod procmap;
@@ -29,4 +30,5 @@ mod ui;
 
 pub use daemon::run as run_daemon;
 pub use monitor::RulesFileError;
+pub use notify::run as run_notify;
 pub use tui::run;

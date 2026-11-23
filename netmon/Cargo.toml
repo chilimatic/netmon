@@ -30,3 +30,7 @@ path = "src/main.rs"
 [[bin]]
 name = "netmond"
 path = "src/bin/netmond.rs"
+
+[[bin]]
+name = "netmon-notify"
+path = "src/bin/netmon-notify.rs"

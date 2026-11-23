@@ -159,7 +159,7 @@ With this installation, the rules are in force from boot, also when nobody
 is logged in. Run the commands from the repository directory:
 
 ```sh
-sudo install -o root -g root -m 0755 target/release/netmond target/release/netmon /usr/local/bin/
+sudo install -o root -g root -m 0755 target/release/netmond target/release/netmon target/release/netmon-notify /usr/local/bin/
 sudo groupadd --system netmon
 sudo usermod -aG netmon "$USER"
 sudo install -d -o root -g root -m 0755 /etc/netmon
@@ -191,7 +191,7 @@ ExecStart=/usr/local/bin/netmond --ask
 After a rebuild, install the binaries again and restart the service:
 
 ```sh
-sudo install -o root -g root -m 0755 target/release/netmond target/release/netmon /usr/local/bin/
+sudo install -o root -g root -m 0755 target/release/netmond target/release/netmon target/release/netmon-notify /usr/local/bin/
 sudo systemctl restart netmond
 ```
 
@@ -716,6 +716,37 @@ The question lists all waiting connections of the program by destination:
   denied.
 - `--once` cannot ask. Asked connections stay dropped.
 
+### Desktop notifications
+
+`netmon-notify` shows each question as a desktop notification, also when
+no UI is open. It runs as your user, connects to `netmond` like the UI,
+and needs the group `netmon` and `notify-send` (libnotify 0.8 or later).
+The notification shows the program and up to 3 destinations. It has 4
+buttons:
+
+| Button | Answer |
+|---|---|
+| Allow / Deny | A temporary rule for the program, like `a` / `d` |
+| Allow always / Deny always | A lasting rule for the program, like `A` / `D`. The notifier also saves the rules file. |
+
+- If the program is unknown, the rule covers the selected destination
+  only.
+- The save writes all rules, also other changes that are not saved yet.
+- A short notification shows the result of each answer.
+- When the question goes away (an answer in a UI, or the 30 s timeout),
+  a short notification replaces it.
+- If the notification server shows no buttons, answer in the UI.
+- When `netmond` restarts, the notifier connects again within 5 s.
+
+Install it as a systemd user service, from the repository directory:
+
+```sh
+sudo install -o root -g root -m 0755 target/release/netmon-notify /usr/local/bin/
+install -D -m 0644 dist/netmon-notify.service ~/.config/systemd/user/netmon-notify.service
+systemctl --user daemon-reload
+systemctl --user enable --now netmon-notify
+```
+
 ## Packet capture
 
 Select a row in Connections, Processes or Interfaces and press `Enter`.
@@ -1150,7 +1181,9 @@ Limits of the `/proc` sources:
 | `netmon/src/rules.rs`, `rulefile.rs`, `ask.rs` | Rules, the rules file, questions |
 | `netmon/src/btf.rs` | Struct offsets from the kernel's BTF |
 | `netmon/src/probe.rs` | Loads and attaches the eBPF programs, reads the maps, pins the links |
+| `netmon/src/notify.rs` | `netmon-notify`: questions as desktop notifications |
 | `dist/netmond.service` | systemd unit |
+| `dist/netmon-notify.service` | systemd user unit for `netmon-notify` |
 | `docs/ROADMAP.md`, `docs/REVIEW.md`, `docs/REVIEW2.md` | Phases, reviews and decisions |
 
 ### Tests

@@ -438,6 +438,12 @@ Small, independent features after the firewall core:
   under 5 ms. The kernel walks the whole TCP hash table for each namespace;
   `sock_diag` walks the same buckets and needs `setns` (`CAP_SYS_ADMIN`).
   Kept: reads every 10 s, every 1 s for a question.
+- **Desktop notifications: done (2026-11-23).** `netmon-notify` runs as
+  the desktop user, connects to `netmond` like the UI, and shows each
+  question with `notify-send`. Buttons: Allow, Deny (temporary rule for the
+  program), Allow always, Deny always (lasting rule, then the rules file is
+  saved). The daemon does not change.
+- **Timed rules**: allow or deny for 1 h or 1 day, then the rule goes away.
 - **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.

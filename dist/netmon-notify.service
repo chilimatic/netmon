@@ -1,0 +1,16 @@
+# Desktop notifications for the questions of netmond (ask mode).
+# A user unit: install it to ~/.config/systemd/user/ and run
+#   systemctl --user enable --now netmon-notify
+# The user must be in group netmon.
+[Unit]
+Description=netmon desktop notifications for questions
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/netmon-notify
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
