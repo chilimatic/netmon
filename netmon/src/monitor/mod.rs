@@ -28,6 +28,7 @@ mod asks;
 mod capturing;
 mod containers;
 mod hosts;
+pub(crate) mod listen;
 mod ruleset;
 #[cfg(test)]
 mod tests;
@@ -155,6 +156,10 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) containers_rx: std::sync::mpsc::Receiver<ContainerResult>,
     /// Time per step, with NETMON_PROFILE set.
     pub(crate) prof: crate::profile::Profile,
+    /// Finds new listeners that other hosts can reach.
+    pub(crate) listen_watch: listen::ListenWatch,
+    /// New listeners found by the last ticks, for the clients.
+    pub(crate) new_listeners: Vec<listen::NewListener>,
     /// Unowned flows the container tables were already read for.
     pub(crate) containers_tried: HashSet<netmon_common::FlowKey>,
     /// Asked connections without a process the container tables were
@@ -255,7 +260,7 @@ impl<K: Kernel> Monitor<K> {
         let mut collector = Collector::new(args.expire_ticks());
         collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new() };
         Ok((mon, errors))
     }
 
@@ -319,9 +324,20 @@ impl<K: Kernel> Monitor<K> {
         self.probe.forget(&expired);
         self.prof.add("flow counters", t);
         let t = Instant::now();
-        let listeners = Listeners::build(
-            self.probe.listeners().into_iter().map(|(proto, a, o)| (proto, a, Owner::from_kernel(&o))),
-        );
+        let bound: Vec<_> =
+            self.probe.listeners().into_iter().map(|(proto, a, o)| (proto, a, Owner::from_kernel(&o))).collect();
+        for (proto, addr, o) in self.listen_watch.check(&bound) {
+            let exe = std::fs::read_link(format!("/proc/{}/exe", o.pid))
+                .map(|p| crate::text::sanitize(&p.to_string_lossy()))
+                .unwrap_or_default();
+            // The kernel names the thread that bound; the process name is
+            // in /proc.
+            let comm = std::fs::read_to_string(format!("/proc/{}/comm", o.pid))
+                .map(|c| crate::text::sanitize(c.trim_end()))
+                .unwrap_or(o.comm);
+            self.new_listeners.push(listen::NewListener { proto, addr, pid: o.pid, comm, exe });
+        }
+        let listeners = Listeners::build(bound);
         self.prof.add("listeners", t);
         let t = Instant::now();
         let probe = &self.probe;

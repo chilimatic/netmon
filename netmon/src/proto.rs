@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Version of this protocol. Client and daemon must have the same.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Where `netmond` listens.
 pub const DEFAULT_SOCKET: &str = "/run/netmon.sock";
@@ -49,6 +49,8 @@ pub enum ToClient {
     Reply { req: Request, msg: String },
     /// A problem while running, for every client.
     Status(String),
+    /// A program bound a port that other hosts can reach.
+    Listener(crate::monitor::listen::NewListener),
 }
 
 /// One JSON line with its newline.

@@ -251,8 +251,10 @@ fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> a
         let msgs = engine.step(Instant::now());
         let t = Instant::now();
         for m in &msgs {
-            if let ToClient::Status(s) = m {
-                eprintln!("netmond: {s}");
+            match m {
+                ToClient::Status(s) => eprintln!("netmond: {s}"),
+                ToClient::Listener(l) => eprintln!("netmond: {}", crate::monitor::listen::describe(l)),
+                _ => {}
             }
             send(&mut clients, None, m);
         }

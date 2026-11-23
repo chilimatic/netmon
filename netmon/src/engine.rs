@@ -83,6 +83,7 @@ impl<K: Kernel> Engine<K> {
                 self.next = now + self.interval;
             }
             errors.extend(self.mon.tick_at(now));
+            out.extend(self.mon.new_listeners.drain(..).map(ToClient::Listener));
             changed = true;
         }
         if !errors.is_empty() {

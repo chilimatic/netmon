@@ -202,6 +202,7 @@ fn run_tui(mut backend: Backend, snapshot: Snapshot, interval: Duration, status:
                     ToClient::Packets(p) => client.add_packets(p),
                     ToClient::Reply { req, msg } => client.replied(&mut app, &req, msg),
                     ToClient::Status(s) => app.status = s,
+                    ToClient::Listener(l) => app.status = crate::monitor::listen::describe(&l),
                     ToClient::Error(e) => bail!("netmond: {e}"),
                     ToClient::Hello { .. } => {}
                 }

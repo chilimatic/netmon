@@ -448,6 +448,10 @@ Small, independent features after the firewall core:
   allow or deny for 1 hour. `t` in the Rules tab steps the selected rule
   through 1 hour, 1 day and no end time. The monitor removes ended rules
   each tick. Protocol version 2.
+- **New-listener alerts: done (2026-11-23).** A bind to a port that other
+  hosts can reach (not loopback, not multicast, UDP not in the ephemeral
+  range) after the start goes to the journal, the UI status line and
+  `netmon-notify`. Once per program, protocol and port. Protocol version 3.
 - **GeoIP / ASN** column from an offline DB-IP or MaxMind file.
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.

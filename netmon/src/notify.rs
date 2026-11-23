@@ -6,7 +6,8 @@
 //! The notifications come from `notify-send` (libnotify 0.8 or later): one
 //! child process per question. It prints the notification id, then the name
 //! of the clicked button. When the question goes away (answered in the
-//! TUI, or timed out), a short notification replaces it.
+//! TUI, or timed out), a short notification replaces it. A program that
+//! binds a port other hosts can reach also gets a notification.
 
 use std::{
     collections::HashMap,
@@ -38,6 +39,9 @@ struct NotifyArgs {
     /// Socket of netmond.
     #[arg(long, value_name = "PATH", default_value = proto::DEFAULT_SOCKET)]
     socket: PathBuf,
+    /// No notifications about new listeners.
+    #[arg(long)]
+    no_listeners: bool,
 }
 
 /// How often the notifier reads netmond's messages.
@@ -48,6 +52,8 @@ const RECONNECT: Duration = Duration::from_secs(5);
 const SHOW_MS: u128 = crate::ask::ASK_TIMEOUT.as_millis();
 /// How long the notes about an answer stay.
 const NOTE_MS: u32 = 4000;
+/// How long a new-listener notification stays.
+const LISTENER_MS: u32 = 10_000;
 /// Destinations listed in the text of a notification.
 const LISTED_DESTS: usize = 3;
 
@@ -72,7 +78,7 @@ pub fn run() -> anyhow::Result<()> {
         match Remote::connect(&args.socket) {
             Ok((remote, welcome)) => {
                 eprintln!("netmon-notify: connected to {}", args.socket.display());
-                let e = serve(remote, welcome.snapshot.questions);
+                let e = serve(remote, welcome.snapshot.questions, !args.no_listeners);
                 eprintln!("netmon-notify: {e:#}");
             }
             // The first error is shown, later ones repeat it.
@@ -91,7 +97,7 @@ struct Shown {
 }
 
 /// Serves one connection to netmond. Returns when it ends.
-fn serve(mut remote: Remote, questions: Vec<Prompt>) -> anyhow::Error {
+fn serve(mut remote: Remote, questions: Vec<Prompt>, listeners: bool) -> anyhow::Error {
     let (tx, clicks) = mpsc::channel::<(u64, String)>();
     let mut shown: HashMap<u64, Shown> = HashMap::new();
     let mut questions = questions;
@@ -114,6 +120,14 @@ fn serve(mut remote: Remote, questions: Vec<Prompt>) -> anyhow::Error {
                 ToClient::Snapshot(s) => questions = s.questions,
                 ToClient::Reply { req: Request::Answer { .. }, msg } => note("netmon", &msg),
                 ToClient::Error(e) => note("netmon", &e),
+                ToClient::Listener(l) if listeners => {
+                    let (title, body) = listener_text(&l);
+                    let _ = Command::new("notify-send")
+                        .args(["-a", "netmon", "-u", "normal", "-t", &LISTENER_MS.to_string(), "--", &title, &body])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
                 _ => {}
             }
         }
@@ -239,6 +253,15 @@ pub(crate) fn body(q: &Prompt) -> String {
     escape(&lines.join("\n"))
 }
 
+/// Title and text of a new-listener notification. The text is escaped,
+/// the title is plain text.
+pub(crate) fn listener_text(l: &crate::monitor::listen::NewListener) -> (String, String) {
+    let comm: String = l.comm.chars().map(|c| if c.is_control() { '?' } else { c }).collect();
+    let title = format!("{comm} opened {} port {}", proto_name(l.proto), l.addr.port());
+    let exe = if l.exe.is_empty() { "program unknown".to_string() } else { l.exe.clone() };
+    (title, escape(&format!("on {}, pid {}\n{exe}", l.addr.ip(), l.pid)))
+}
+
 /// A short notification about an answer.
 fn note(title: &str, msg: &str) {
     if msg.is_empty() {
@@ -312,6 +335,18 @@ mod tests {
         );
         assert!(requests(&q, "something").is_empty());
         assert!(requests(&prompt("/usr/bin/curl", 0), "allow").is_empty());
+    }
+
+    #[test]
+    fn listener_text_names_program_and_port() {
+        let l = crate::monitor::listen::NewListener {
+            proto: netmon_common::IPPROTO_TCP,
+            addr: "0.0.0.0:8000".parse().unwrap(),
+            pid: 9,
+            comm: "py\x1b".into(),
+            exe: "/usr/bin/<x>".into(),
+        };
+        assert_eq!(listener_text(&l), ("py? opened tcp port 8000".into(), "on 0.0.0.0, pid 9\n/usr/bin/&lt;x&gt;".into()));
     }
 
     #[test]

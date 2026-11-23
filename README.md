@@ -751,6 +751,9 @@ buttons:
   a short notification replaces it.
 - If the notification server shows no buttons, answer in the UI.
 - When `netmond` restarts, the notifier connects again within 5 s.
+- A program that opens a port other hosts can reach also gets a
+  notification (see [New listeners](#new-listeners)). `--no-listeners`
+  turns these off.
 
 Install it as a systemd user service, from the repository directory:
 
@@ -760,6 +763,23 @@ install -D -m 0644 dist/netmon-notify.service ~/.config/systemd/user/netmon-noti
 systemctl --user daemon-reload
 systemctl --user enable --now netmon-notify
 ```
+
+### New listeners
+
+When a program binds a port that other hosts can reach, `netmond` writes
+`new listener: python3 (pid 7, /usr/bin/python3.14) on tcp 0.0.0.0:8000`
+to the journal. The UI shows the line in the status line, and
+`netmon-notify` shows a notification.
+
+- The kernel's bind hooks record each bound socket. The bound sockets at
+  start are the baseline: only binds after it are new.
+- Each program, protocol and port is reported once while `netmond` runs.
+- Left out: loopback and multicast addresses, and UDP ports in the
+  ephemeral range (`/proc/sys/net/ipv4/ip_local_port_range`), because
+  those are client sockets.
+- A bound TCP socket counts, also before `listen`.
+- A bind inside a container counts too, also if no port of the container
+  is published.
 
 ## Packet capture
 
