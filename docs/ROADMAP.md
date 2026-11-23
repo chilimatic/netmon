@@ -481,7 +481,9 @@ Small, independent features after the firewall core:
   (`dbip-country-lite.mmdb`, `dbip-asn-lite.mmdb` in `/var/lib/netmon`,
   crate `maxminddb`), caches per address, and shows `DE AS3320 Org` in
   the Connections tab, the detail line and the filter. netmond does not
-  read the files.
+  read the files. Optional monthly update: `dist/netmon-geoip-update` with
+  `netmon-geoip.service`/`.timer` (5th of the month, previous month as
+  fallback, MaxMind marker check, atomic replace, sandboxed unit).
 - **Alerts**: highlight a process above a rate, or contacting a new country or
   port.
 - **Capture filters**: `tcp port 443`, `dns`, `host 1.1.1.1` in the Capture

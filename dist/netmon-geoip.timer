@@ -1,0 +1,14 @@
+# Optional: updates the DB-IP Lite databases for netmon once a month.
+# DB-IP publishes the new files during the first days of a month, so the
+# timer runs on the 5th. Persistent: a run missed while the host was off
+# happens at the next boot.
+[Unit]
+Description=Monthly update of the DB-IP Lite databases for netmon
+
+[Timer]
+OnCalendar=*-*-05 04:00:00
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,51 @@
+#!/bin/sh
+# Downloads the DB-IP Lite country and ASN databases for the Geo column of
+# netmon into /var/lib/netmon (or $1). Optional: run by netmon-geoip.timer
+# once a month, or by hand.
+#
+# DB-IP publishes the files of a month during the first days of it. If the
+# current month is not there yet, the previous month is taken.
+# Data: CC BY 4.0, IP Geolocation by DB-IP (https://db-ip.com).
+set -eu
+
+dir=${1:-/var/lib/netmon}
+base=https://download.db-ip.com/free
+this=$(date -u +%Y-%m)
+# The previous month: the 1st of this month minus one day.
+prev=$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y-%m)
+
+tmp=$(mktemp -d "$dir/.geoip.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+fetch() {
+    db=$1
+    for month in "$this" "$prev"; do
+        url="$base/dbip-$db-lite-$month.mmdb.gz"
+        if curl -fsSL --max-time 300 --retry 2 -o "$tmp/$db.gz" "$url"; then
+            gunzip -c "$tmp/$db.gz" > "$tmp/$db.mmdb"
+            echo "$url"
+            return 0
+        fi
+    done
+    echo "netmon-geoip-update: no $db database for $this or $prev" >&2
+    return 1
+}
+
+# A MaxMind DB file ends with its metadata, which starts with this marker.
+valid() {
+    [ "$(stat -c %s "$1")" -gt 1000000 ] && tail -c 200000 "$1" | grep -aq 'MaxMind.com'
+}
+
+for db in country asn; do
+    url=$(fetch "$db")
+    if ! valid "$tmp/$db.mmdb"; then
+        echo "netmon-geoip-update: $url is not a MaxMind DB file" >&2
+        exit 1
+    fi
+done
+# Both files are good: replace them. rename(2) never leaves a half file.
+for db in country asn; do
+    chmod 0644 "$tmp/$db.mmdb"
+    mv -f "$tmp/$db.mmdb" "$dir/dbip-$db-lite.mmdb"
+done
+echo "netmon-geoip-update: updated $dir/dbip-country-lite.mmdb and $dir/dbip-asn-lite.mmdb; restart netmon to load them"

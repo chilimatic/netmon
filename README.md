@@ -588,6 +588,28 @@ done
 Then start `netmon` again. `--geoip DIR` reads the files from another
 directory.
 
+Optional: a systemd timer does the download on the 5th of each month.
+DB-IP publishes the files of a month during its first days. If the current
+month is not there yet, the script takes the previous one. It checks that
+both files are MaxMind DB files before it replaces the old ones. Install
+it from the repository directory:
+
+```sh
+sudo install -o root -g root -m 0755 dist/netmon-geoip-update /usr/local/bin/
+sudo install -o root -g root -m 0644 dist/netmon-geoip.service dist/netmon-geoip.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now netmon-geoip.timer
+```
+
+- `sudo systemctl start netmon-geoip.service` updates at once.
+  `journalctl -u netmon-geoip.service` shows the result. A `404` line for
+  the current month is normal early in the month.
+- A running `netmon` keeps the old data until you start it again.
+- With `default = "deny"` or `"ask"`, give the download a rule: outbound
+  TCP 443 for `/usr/bin/curl` to `download.db-ip.com`.
+- To remove the timer: `sudo systemctl disable --now netmon-geoip.timer`,
+  then delete the three files.
+
 - Private, loopback, link-local, multicast and CGNAT addresses get no
   label.
 - A missing file is no error: the column shows only what the other file
@@ -1371,6 +1393,7 @@ Limits of the `/proc` sources:
 | `netmon/src/notify.rs` | `netmon-notify`: questions as desktop notifications |
 | `dist/netmond.service` | systemd unit |
 | `dist/netmon-notify.service` | systemd user unit for `netmon-notify` |
+| `dist/netmon-geoip-update`, `dist/netmon-geoip.service`, `dist/netmon-geoip.timer` | Optional monthly download of the DB-IP Lite files |
 | `docs/ROADMAP.md`, `docs/REVIEW.md`, `docs/REVIEW2.md` | Phases, reviews and decisions |
 
 ### Tests
