@@ -93,15 +93,17 @@ impl UsageFile {
         (now, old)
     }
 
-    /// Adds the days of `other` (the file of today and the history).
+    /// Adds the days of `other` (the file of today and the history). A day
+    /// in both files is the same day written twice (a write between the two
+    /// files failed): its counts only grow, so the larger value is right.
     pub fn merge(&mut self, other: UsageFile) {
         for (map, from) in [(&mut self.days, other.days), (&mut self.dests, other.dests)] {
             for (day, keys) in from {
                 let to = map.entry(day).or_default();
                 for (k, v) in keys {
                     let t = to.entry(k).or_default();
-                    t[0] += v[0];
-                    t[1] += v[1];
+                    t[0] = t[0].max(v[0]);
+                    t[1] = t[1].max(v[1]);
                 }
             }
         }
@@ -402,6 +404,10 @@ mod tests {
         let mut back = now.clone();
         back.merge(old);
         assert_eq!(back, f);
+        // A day in both files (a failed write between them) counts once.
+        let mut twice = f.clone();
+        twice.merge(f.clone());
+        assert_eq!(twice, f);
         let rows = f.dest_rows("2026-11-23");
         assert_eq!(rows[0].program, "example.com");
         assert_eq!(rows[0].week, [11, 2]);

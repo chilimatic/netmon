@@ -106,41 +106,94 @@ pub fn follow<'a>(packets: impl IntoIterator<Item = &'a Captured>, at: &Captured
     // The client sent the SYN without ACK; without one, the first sender.
     let client = segs.iter().find(|s| s.syn && !s.ack).map(|s| s.src).unwrap_or(segs.first()?.src);
     let server = if first.src == client { first.dst } else { first.src };
-    // Next expected sequence number per direction (client, server).
-    let mut next: [Option<u32>; 2] = [None, None];
-    let mut pieces: Vec<Piece> = Vec::new();
-    let mut bytes = (0u64, 0u64);
+    let mut st = Reassembly::default();
+    // A segment that starts after a gap waits: a segment that was captured
+    // but arrived out of order can still fill the gap.
+    let mut held: [Vec<&Segment>; 2] = [Vec::new(), Vec::new()];
     for s in &segs {
         let from_client = s.src == client;
         let d = usize::from(!from_client);
-        let seq = s.seq.wrapping_add(u32::from(s.syn));
+        if st.ahead(d, s) > 0 {
+            held[d].push(s);
+            // A real gap: do not hold the rest of the stream behind it.
+            if held[d].len() > MAX_HELD {
+                let i = (0..held[d].len()).min_by_key(|&i| st.ahead(d, held[d][i])).unwrap_or(0);
+                let h = held[d].remove(i);
+                st.feed(d, from_client, h);
+            } else {
+                continue;
+            }
+        } else {
+            st.feed(d, from_client, s);
+        }
+        // Segments that now follow on (or overlap) the stream go next.
+        while let Some(i) = held[d].iter().position(|h| st.ahead(d, h) <= 0) {
+            let h = held[d].remove(i);
+            st.feed(d, from_client, h);
+        }
+    }
+    // What is still held starts after a real gap: in sequence order.
+    for (d, rest) in held.iter_mut().enumerate() {
+        while !rest.is_empty() {
+            let i = (0..rest.len()).min_by_key(|&i| st.ahead(d, rest[i])).unwrap_or(0);
+            let h = rest.remove(i);
+            st.feed(d, d == 0, h);
+        }
+    }
+    let Reassembly { pieces, bytes, .. } = st;
+    Some(Stream { client, server, pieces, bytes })
+}
+
+/// Segments held per direction while they wait for a gap to fill.
+const MAX_HELD: usize = 8;
+
+/// The state of `follow`: next expected sequence number per direction
+/// (client, server), the pieces so far and the payload bytes.
+#[derive(Default)]
+struct Reassembly {
+    next: [Option<u32>; 2],
+    pieces: Vec<Piece>,
+    bytes: (u64, u64),
+}
+
+impl Reassembly {
+    fn start(s: &Segment) -> u32 {
+        s.seq.wrapping_add(u32::from(s.syn))
+    }
+
+    /// How far the segment starts after (positive) or before the next
+    /// expected byte; wrapping keeps it right across 2^32.
+    fn ahead(&self, d: usize, s: &Segment) -> i32 {
+        let seq = Self::start(s);
+        self.next[d].map_or(0, |n| seq.wrapping_sub(n) as i32)
+    }
+
+    fn feed(&mut self, d: usize, from_client: bool, s: &Segment) {
+        let seq = Self::start(s);
         let len = s.payload.len() as u32 + s.cut;
-        let n = *next[d].get_or_insert(seq);
-        // How far this segment starts after (positive) or before the next
-        // expected byte; wrapping keeps it right across 2^32.
+        let n = *self.next[d].get_or_insert(seq);
         let ahead = seq.wrapping_sub(n) as i32;
         let (skip, gap) = if ahead >= 0 { (0u32, ahead as u32) } else { ((-ahead) as u32, 0) };
         if gap > 0 {
-            push(&mut pieces, Piece::Missing { client: from_client, bytes: gap });
+            push(&mut self.pieces, Piece::Missing { client: from_client, bytes: gap });
         }
         if skip < len {
             let new = &s.payload[(skip as usize).min(s.payload.len())..];
             if !new.is_empty() {
-                push(&mut pieces, Piece::Data { client: from_client, bytes: new.to_vec() });
-                if from_client { bytes.0 += new.len() as u64 } else { bytes.1 += new.len() as u64 }
+                push(&mut self.pieces, Piece::Data { client: from_client, bytes: new.to_vec() });
+                if from_client { self.bytes.0 += new.len() as u64 } else { self.bytes.1 += new.len() as u64 }
             }
             let cut = s.cut.min(len - skip);
             if cut > 0 {
-                push(&mut pieces, Piece::Missing { client: from_client, bytes: cut });
+                push(&mut self.pieces, Piece::Missing { client: from_client, bytes: cut });
             }
         }
         // The FIN takes one sequence number, also without payload.
         let end = seq.wrapping_add(len).wrapping_add(u32::from(s.fin));
         if end.wrapping_sub(n) as i32 > 0 {
-            next[d] = Some(end);
+            self.next[d] = Some(end);
         }
     }
-    Some(Stream { client, server, pieces, bytes })
 }
 
 /// Appends, joining with the previous piece of the same kind and side.
@@ -246,6 +299,24 @@ mod tests {
             [(true, "0123".to_string()), (true, "[6 missing]".to_string()), (true, "abcdef".to_string()), (true, "[4 missing]".to_string()), (true, "z".to_string())],
             "no SYN: the first sender counts as client"
         );
+    }
+
+    #[test]
+    fn segments_out_of_order_are_no_holes() {
+        // 0123 and abcd were captured in the wrong order; z after a real gap.
+        let p = [
+            frame(true, 1000, 0x02, b""),
+            frame(true, 1005, 0x18, b"abcd"),
+            frame(true, 1001, 0x18, b"0123"),
+            frame(false, 9, 0x18, b"ok"),
+            frame(true, 1019, 0x18, b"z"),
+        ];
+        let s = follow(p.iter(), &p[1]).unwrap();
+        assert_eq!(
+            data(&s),
+            [(true, "0123abcd".to_string()), (false, "ok".to_string()), (true, "[10 missing]".to_string()), (true, "z".to_string())]
+        );
+        assert_eq!(s.bytes, (9, 2));
     }
 
     #[test]

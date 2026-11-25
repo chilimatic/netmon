@@ -21,7 +21,7 @@ fetch() {
     db=$1
     for month in "$this" "$prev"; do
         url="$base/dbip-$db-lite-$month.mmdb.gz"
-        if curl -fsSL --max-time 300 --retry 2 -o "$tmp/$db.gz" "$url"; then
+        if curl -fsSL --proto =https --proto-redir =https --max-time 300 --retry 2 -o "$tmp/$db.gz" "$url"; then
             gunzip -c "$tmp/$db.gz" > "$tmp/$db.mmdb"
             echo "$url"
             return 0

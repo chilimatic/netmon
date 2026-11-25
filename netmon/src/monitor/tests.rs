@@ -1016,6 +1016,7 @@ fn limits_reach_the_kernel_with_exe_ids_and_go_again() {
     assert_eq!(crate::client::next_limit(None), Some(1.0));
     assert_eq!(crate::client::next_limit(Some(20.0)), None);
     assert_eq!(crate::client::next_limit(Some(3.0)), None);
+    assert_eq!(crate::client::next_limit(Some(f64::NAN)), None, "an uneven limit goes to off");
 }
 
 #[test]

@@ -19,6 +19,8 @@ const MAX_PER_TICK: usize = 5;
 const MAX_SEEN: usize = 100_000;
 /// How often the countries file is written while it changes.
 const SAVE_EVERY: Duration = Duration::from_secs(60);
+/// How often missing DB-IP files are looked for again.
+const GEO_RETRY: Duration = Duration::from_secs(600);
 pub(crate) const COUNTRIES_PATH: &str = "/var/lib/netmon/countries.json";
 
 #[derive(Default)]
@@ -39,6 +41,10 @@ pub(crate) struct Alerts {
     pub(crate) geo_dir: Option<PathBuf>,
     loaded: bool,
     dirty: bool,
+    /// When the DB-IP files were last looked for, and whether a full `seen`
+    /// was reported.
+    geo_tried: Option<Instant>,
+    full_reported: bool,
     saved: Option<Instant>,
 }
 
@@ -95,7 +101,11 @@ impl Alerts {
     }
 
     fn countries(&mut self, flows: &HashMap<netmon_common::FlowKey, crate::collector::Flow>, now: Instant, out: &mut Vec<String>) {
-        if self.geo.is_none() {
+        // Without the DB-IP files, look again every GEO_RETRY: the update
+        // timer can fetch them later.
+        let retry = matches!(self.geo, Some(None)) && self.geo_tried.is_none_or(|t| now.duration_since(t) >= GEO_RETRY);
+        if self.geo.is_none() || retry {
+            self.geo_tried = Some(now);
             let dir = self.geo_dir.clone().unwrap_or_else(|| crate::geo::DEFAULT_DIR.into());
             let g = crate::geo::Geo::open(&dir);
             self.geo = Some(g.loaded().then_some(g));
@@ -114,16 +124,25 @@ impl Alerts {
         let learning = self.learn_until.is_some_and(|t| now < t);
         let mut sent = 0;
         for (k, f) in flows {
-            if !self.checked.insert(*k) {
+            if self.checked.contains(k) {
                 continue;
             }
+            // A flow whose program is not known yet is checked again later.
             let p = program(f);
             if p == UNKNOWN {
                 continue;
             }
+            self.checked.insert(*k);
             let ip = crate::procmap::normalize(crate::collector::addr(k.family, &k.remote_addr, 0)).ip();
             let Some(c) = geo.country(ip) else { continue };
-            if self.seen.len() >= MAX_SEEN || !self.seen.insert((p.clone(), c.clone())) {
+            if self.seen.len() >= MAX_SEEN {
+                if !self.full_reported {
+                    self.full_reported = true;
+                    out.push(format!("country alerts stop: {MAX_SEEN} pairs of program and country are known"));
+                }
+                continue;
+            }
+            if !self.seen.insert((p.clone(), c.clone())) {
                 continue;
             }
             self.dirty = true;

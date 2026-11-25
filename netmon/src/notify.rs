@@ -76,7 +76,7 @@ pub fn run() -> anyhow::Result<()> {
         .stdout(Stdio::null())
         .status()
         .context("run notify-send (install libnotify)")?;
-    let mut first = true;
+    let mut last_error: Option<String> = None;
     loop {
         match Remote::connect(&args.socket) {
             Ok((remote, welcome)) => {
@@ -84,11 +84,15 @@ pub fn run() -> anyhow::Result<()> {
                 let e = serve(remote, welcome.snapshot.questions, !args.no_listeners, !args.no_alerts);
                 eprintln!("netmon-notify: {e:#}");
             }
-            // The first error is shown, later ones repeat it.
-            Err(e) if first => eprintln!("netmon-notify: {e:#}; trying again every {} s", RECONNECT.as_secs()),
-            Err(_) => {}
+            // An error is shown when it differs from the last one.
+            Err(e) => {
+                let text = format!("{e:#}");
+                if last_error.as_deref() != Some(&text) {
+                    eprintln!("netmon-notify: {text}; trying again every {} s", RECONNECT.as_secs());
+                    last_error = Some(text);
+                }
+            }
         }
-        first = false;
         std::thread::sleep(RECONNECT);
     }
 }

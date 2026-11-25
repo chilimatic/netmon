@@ -193,7 +193,10 @@ impl Client {
                 let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
                 match app.selected_in(&ids).map(|i| &rows[i]) {
                     Some(r) if !r.exe.is_empty() => {
-                        let now = self.snap.rules.limit_of(&r.exe).and_then(|l| l.down_mb.or(l.up_mb));
+                        // An uneven limit from the rules file is no step: L turns it off.
+                        let now = self.snap.rules.limit_of(&r.exe).and_then(|l| {
+                            if l.up_mb == l.down_mb { l.down_mb } else { Some(f64::NAN) }
+                        });
                         let next = next_limit(now);
                         Ok(Request::SetLimit { exe: r.exe.clone(), up_mb: next, down_mb: next })
                     }
@@ -260,7 +263,12 @@ impl Client {
                 }
             }
             Action::PickProfile => {
-                let dir = std::path::Path::new(crate::rulefile::DEFAULT_PATH).with_file_name(crate::monitor::PROFILES_DIR);
+                // The directory next to the rules file netmond started with.
+                let dir = if self.snap.rules.profiles_dir.is_empty() {
+                    std::path::Path::new(crate::rulefile::DEFAULT_PATH).with_file_name(crate::monitor::PROFILES_DIR)
+                } else {
+                    self.snap.rules.profiles_dir.clone().into()
+                };
                 app.profiles = list_profiles(&dir);
                 let active = if self.snap.rules.profile.is_empty() { "default" } else { &self.snap.rules.profile };
                 app.profile_sel = app.profiles.iter().position(|p| p == active).unwrap_or(0);
@@ -416,7 +424,8 @@ fn dest_id(d: &crate::ask::Dest) -> DestId {
 }
 
 /// The limit steps of `L` in MB/s, both directions: off, 1, 5, 20, off.
-/// A limit from the rules file that is not a step goes to off.
+/// A limit from the rules file that is not a step (also an uneven one,
+/// given as NaN) goes to off.
 pub(crate) fn next_limit(now: Option<f64>) -> Option<f64> {
     match now {
         None => Some(1.0),

@@ -116,7 +116,7 @@ fn update(path: &Path, url: &str) -> Result<usize, String> {
 
 fn download_and_check(tmp: &Path, url: &str) -> Result<usize, String> {
     let out = Command::new("curl")
-        .args(["-fsSL", "--proto", "=https,file", "--max-time", "300", "--retry", "2", "--max-filesize"])
+        .args(["-fsSL", "--proto", "=https,file", "--proto-redir", "=https", "--max-time", "300", "--retry", "2", "--max-filesize"])
         .arg(blocklist::MAX_FILE_BYTES.to_string())
         .arg("-o")
         .arg(tmp)

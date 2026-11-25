@@ -199,7 +199,12 @@ impl<K: Kernel> Monitor<K> {
     /// Reads the kernel's direction and verdict for every flow, while rules
     /// are in force.
     pub(crate) fn refresh_conns(&mut self) {
-        let active = !self.rules.rules.is_empty() || self.rules.default != rules::Action::Allow;
+        // Limits and server name blocks also turn on the kernel's
+        // connection state.
+        let active = !self.rules.rules.is_empty()
+            || self.rules.default != rules::Action::Allow
+            || !self.rules.limits.is_empty()
+            || self.rules.has_host_blocks();
         for f in self.collector.flows.values_mut() {
             f.conn = if active { self.probe.conn(&netmon_common::ConnKey::from_flow(&f.key)) } else { None };
         }
@@ -251,6 +256,7 @@ impl<K: Kernel> Monitor<K> {
     pub(crate) fn load_rules_file(&mut self, args: &Args) -> Result<Option<String>, String> {
         let base = args.rules.clone().unwrap_or_else(|| rulefile::DEFAULT_PATH.into());
         self.base_rules_path = base.clone();
+        self.rules.profiles_dir = base.with_file_name(PROFILES_DIR).to_string_lossy().into_owned();
         if args.rules.is_none()
             && let Some(name) = active_profile(&base)
         {

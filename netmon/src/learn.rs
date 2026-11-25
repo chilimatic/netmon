@@ -72,6 +72,10 @@ pub fn suggest(log: &[Entry], rules: &Rules, resolvers: &HashSet<IpAddr>) -> Vec
     let mut groups: BTreeMap<(String, Dir, u8), Dests> = BTreeMap::new();
     let mut strict = rules.clone();
     strict.default = Action::Deny;
+    // Addresses each program connected out to: an "in" line from one of
+    // them is a reply (STUN, WireGuard, a server on a high port).
+    let outbound: HashSet<(&str, IpAddr)> =
+        log.iter().filter(|e| e.event == "new" && e.dir == "out").map(|e| (e.exe.as_str(), e.remote)).collect();
     for e in log.iter().filter(|e| e.event == "new" && !e.exe.is_empty()) {
         let dir = match e.dir.as_str() {
             "out" => Dir::Out,
@@ -90,7 +94,7 @@ pub fn suggest(log: &[Entry], rules: &Rules, resolvers: &HashSet<IpAddr>) -> Vec
         // from a service port (a DNS answer, HTTPS from port 443) is the
         // reply of an outbound connection whose first packet the monitor
         // saw inbound, for example one opened before it started.
-        if dir == Dir::In && e.port < 1024 {
+        if dir == Dir::In && (e.port < 1024 || outbound.contains(&(e.exe.as_str(), e.remote))) {
             continue;
         }
         // Already allowed by a rule (not by the default): nothing to learn.
@@ -162,6 +166,9 @@ mod tests {
             e("/usr/sbin/sshd", "in", "tcp", "10.0.0.9", 51234, ""),
             e("/usr/bin/app", "in", "udp", "100.95.0.251", 53, ""),
             e("/usr/bin/app", "in", "tcp", "1.2.3.4", 443, "api.example.com"),
+            // A STUN reply: the program connected out to that address first.
+            e("/usr/bin/call", "out", "udp", "74.125.1.1", 19302, ""),
+            e("/usr/bin/call", "in", "udp", "74.125.1.1", 19302, ""),
             e("", "out", "tcp", "8.8.8.8", 443, ""),
             e("/usr/bin/ok", "out", "tcp", "8.8.8.8", 443, ""),
             Entry { event: "denied".into(), ..e("/usr/bin/x", "out", "tcp", "8.8.8.8", 443, "") },
@@ -174,6 +181,7 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                ("out exe /usr/bin/call udp port 19302".into(), "learned: 1 destination, e.g. 74.125.1.1".into()),
                 ("out exe /usr/bin/curl tcp port 80".into(), "learned: 1 destination, e.g. 1.1.1.1".into()),
                 ("out exe /usr/bin/curl tcp port 443".into(), "learned: 2 destinations, e.g. 1.1.1.1, example.com".into()),
                 ("out exe /usr/bin/torrent udp".into(), "learned: 4 destinations, e.g. 5.5.5.1, 5.5.5.2, 5.5.5.3".into()),

@@ -46,6 +46,8 @@ set -e
 if [ "$1" = configure ]; then
     systemd-sysusers netmon.conf >/dev/null 2>&1 || getent group netmon >/dev/null || addgroup --system netmon
     systemctl daemon-reload >/dev/null 2>&1 || true
+    # An upgrade: the UI must match the daemon's protocol version.
+    systemctl try-restart netmond.service >/dev/null 2>&1 || true
     echo "netmon: add your user to the group netmon, then: sudo systemctl enable --now netmond"
 fi
 EOF

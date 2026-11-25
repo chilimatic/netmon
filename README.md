@@ -343,6 +343,7 @@ and `--no-devices` (no ARP requests and no Devices tab).
 | `d` | Log | Switch between the connection log and the DNS log |
 | `b` | Log (DNS) | Block the name of the selected DNS answer |
 | `a` `A` `d` `D` `o` `x` | question window | Answer a question (see [Ask mode](#ask-mode)) |
+| `h` `H` | question window | Allow or deny for 1 hour |
 | `Esc` | question window | Put the questions aside: the tab gets its keys back |
 | `?` | everywhere | Show the questions again |
 
@@ -525,6 +526,11 @@ address that serves many names.
   one lookup per dot.
 - Block list names are blocked only by this check. Plain HTTP and QUIC to
   a listed name pass (`Q` turns QUIC off per program).
+- The check stops normal programs, not one that hides the name: a name in
+  the third segment, a first segment of a few bytes, a ClientHello split
+  into several TLS records, or Encrypted Client Hello (ECH). The hash of
+  the name is not compared with the name itself, so a list entry built to
+  have the same 64-bit hash as another name would block that name too.
 
 #### Host block lists
 
@@ -578,7 +584,8 @@ url = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
 ```
 
 `netmon-blocklist-update` downloads every list with a `url` in the rules
-file and in the profiles. It checks each download with the list parser
+file and in the profiles, over https only, also after a redirect. It runs
+as root, like the GeoIP update. It checks each download with the list parser
 and replaces the old file only if the download holds at least one name.
 A systemd timer runs it every Sunday, then runs
 `systemctl reload netmond`. Install it from the repository directory:
@@ -709,6 +716,9 @@ a bar chart shows the traffic of the selected row per day, for the last
   written once a day, so the large part is not written every minute. Both
   files belong to root and group `netmon`, mode 0640. A crash loses at
   most the last minute.
+- The destinations of 400 days are readable by every member of the group
+  `netmon`, as the connection log is. Give the group only to users who
+  may see the traffic of all users of the host.
 - With `sudo netmon --local`, no usage is counted.
 
 ### Devices tab
@@ -1043,10 +1053,14 @@ How the suggestions are made:
   nameservers in `/etc/resolv.conf` is left out, because the lockout
   guard always allows it.
 - Connections without a known exe cannot have a rule and are left out.
-- An "in" line from a port below 1024 is the reply of an outbound
-  connection (the monitor saw its first packet inbound) and is left out.
-  Make sure that the other "in" suggestions are real servers. A reply
-  from a server on a high port (for example 5228) still shows as "in".
+- An "in" line from a port below 1024, or from an address that the same
+  program connected out to, is the reply of an outbound connection (the
+  monitor saw its first packet inbound) and is left out. Make sure that
+  the other "in" suggestions are real servers: an inbound rule without a
+  port allows all inbound traffic of that protocol to the program.
+- The exe paths are compared as text. A rule that names the exe by a
+  symlink (`/usr/sbin/x` for `/usr/bin/x`) does not count, and the rule
+  is suggested again.
 - An exe whose path has a version number in it (an updater that installs
   each version in a new directory) gets a rule per version. Such a rule
   stops to match after the next update.
@@ -1072,13 +1086,19 @@ comment = "games"
   to the rate. Measured with curl: a 1 MB/s limit gave 0.95 MB/s, a 5 MB/s
   limit gave 4.5 MB/s.
 - The bucket holds a quarter second of traffic (at least 128 KiB). A
-  download therefore starts with a short burst.
+  download therefore starts with a short burst. Under 0.5 MB/s the burst
+  is longer: 0.01 MB/s lets 128 KiB pass at once (13 s of the limit).
 - Received packets cross the link before the drop. The limit protects
   other programs on the host, but the link carries the dropped packets
   once.
 - The limit counts all processes of the exe together. CPUs update the
   bucket without a lock, so the limit is approximate.
 - Forwarded traffic (containers, VMs) and loopback traffic have no limit.
+- A limit names the exe. It does not stop a user who wants to avoid it:
+  a copy of the binary under another path has no limit, and neither has
+  a socket that the program gives to another process. Received packets
+  find their process through the kernel's connection state; a connection
+  that dropped out of it (more than 65 536 connections) has no limit.
 - A limit starts with a full bucket each time it changes.
 - `s` in the Rules tab saves the limits with the rules.
 
@@ -1098,8 +1118,12 @@ format of the rules file. The name has lower-case letters, digits, `-` and
 
 2. In the Rules tab, press `P`, select the profile, and press `Enter`.
 
-- The rules, the default action, the host blocks and the lists of the
-  profile replace the current ones. Temporary rules (`tmp`) stay.
+- The rules, the default action, the host blocks, the lists, the
+  bandwidth limits and the `[alerts]` table of the profile replace the
+  current ones. A profile without `[alerts]` turns the alerts off.
+  Temporary rules (`tmp`) stay.
+- The profiles are in the directory `profiles` next to the rules file
+  that netmond started with (`--rules`), and `P` lists that directory.
 - If the profile file has an error, nothing changes, and the status line
   names the error.
 - `s` saves into the active profile. The header shows `PROFILE <name>`.
@@ -1383,9 +1407,11 @@ questions and the capture itself are shared.
   socket and all programs. No rule is in force after a clean stop.
 - `SIGHUP` does not stop `netmond`. It writes a line to the journal, and the
   rules stay.
-- `systemctl restart netmond` is a clean stop and a new start. For a short
-  time no rule is in force. Then the rules file loads. Rules that were not
-  saved are lost.
+- `systemctl restart netmond` is a clean stop and a new start. For about
+  3 seconds (loading the programs and the rules) no rule is in force,
+  also no host or server name block. Then the rules file loads. Rules that
+  were not saved are lost. A crash keeps the old rules in force instead
+  (see below).
 
 `netmond` pins its links under `/sys/fs/bpf/netmon`: the TC links per
 interface, the cgroup hooks and the tracepoints. A pinned link stays

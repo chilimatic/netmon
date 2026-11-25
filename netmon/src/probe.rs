@@ -827,19 +827,31 @@ impl Kernel for Probe {
 
     fn set_limits(&mut self, limits: &[(u32, u64, u64)]) -> anyhow::Result<()> {
         let want: BTreeMap<u32, (u64, u64)> = limits.iter().map(|&(id, up, down)| (id, (up, down))).collect();
-        // A changed limit starts with a full bucket.
+        // Removed limits first, then the new and changed ones (a changed
+        // limit starts with a full bucket). A failed insert does not stop the
+        // rest: limits_set and CFG_LIMITS always match the map.
+        let gone: Vec<u32> = self.limits_set.keys().filter(|id| !want.contains_key(id)).copied().collect();
+        for id in gone {
+            let _ = self.limits.remove(&id);
+            self.limits_set.remove(&id);
+        }
+        let mut error = None;
         for (&id, &(up, down)) in &want {
             if self.limits_set.get(&id) != Some(&(up, down)) {
                 let bucket = |rate| netmon_common::Bucket { rate, ..Default::default() };
-                self.limits.insert(id, netmon_common::Limit { up: bucket(up), down: bucket(down) }, 0)?;
+                match self.limits.insert(id, netmon_common::Limit { up: bucket(up), down: bucket(down) }, 0) {
+                    Ok(()) => {
+                        self.limits_set.insert(id, (up, down));
+                    }
+                    Err(e) => error = Some(e),
+                }
             }
         }
-        for id in self.limits_set.keys().filter(|id| !want.contains_key(id)) {
-            let _ = self.limits.remove(id);
+        self.rule_cfg.set(netmon_common::CFG_LIMITS, self.limits_set.len() as u32, 0)?;
+        match error {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
         }
-        self.rule_cfg.set(netmon_common::CFG_LIMITS, want.len() as u32, 0)?;
-        self.limits_set = want;
-        Ok(())
     }
 
     fn set_rules(&mut self, rules: &[RuleEntry], exe_ids: &BTreeMap<String, u32>, default: u8) -> anyhow::Result<()> {

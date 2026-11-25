@@ -205,7 +205,11 @@ pub fn take_tokens(b: &mut Bucket, now_ns: u64, len: u64) -> bool {
     if t > burst {
         t = burst;
     }
-    b.last_ns = now_ns;
+    // An older time stamp (from another CPU) must not move the clock back:
+    // the next packet would get that time credited again.
+    if now_ns > b.last_ns {
+        b.last_ns = now_ns;
+    }
     if t >= len {
         b.tokens = t - len;
         true
@@ -1056,10 +1060,13 @@ mod tests {
         // A small rate still passes a 64 KiB GSO packet.
         let mut small = Bucket { rate: 10_000, ..Bucket::default() };
         assert!(take_tokens(&mut small, sec, 65_536));
-        // An older timestamp from another CPU adds nothing.
+        // An older timestamp from another CPU adds nothing, and does not move
+        // the clock back: the next packet gets only the real time.
         let t = small.tokens;
         assert!(take_tokens(&mut small, sec / 2, 0));
-        assert_eq!(small.tokens, t);
+        assert_eq!((small.tokens, small.last_ns), (t, sec));
+        take_tokens(&mut small, sec + 1_000_000, 0);
+        assert_eq!(small.tokens, (t + 10).min(LIMIT_MIN_BURST), "1 ms at 10 kB/s: 10 bytes");
         // No limit; the largest rate does not overflow.
         assert!(take_tokens(&mut Bucket::default(), 0, u64::MAX));
         let mut big = Bucket { rate: MAX_LIMIT_RATE, ..Bucket::default() };

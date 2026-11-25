@@ -279,6 +279,10 @@ pub struct Rules {
     /// Bandwidth limits per exe, in the order they were added.
     #[serde(default)]
     pub limits: Vec<BandwidthLimit>,
+    /// Where the profiles are (next to the rules file netmond started
+    /// with), for the profile picker of the UI.
+    #[serde(default)]
+    pub profiles_dir: String,
 }
 
 /// A bandwidth limit for every process of one exe. The kernel drops the
