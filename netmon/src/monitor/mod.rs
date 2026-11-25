@@ -329,6 +329,15 @@ impl<K: Kernel> Monitor<K> {
                 Err(e) => format!("capture failed: {e:#}"),
             },
             Request::StopCapture => self.stop_capture(),
+            Request::AddAllowRules(list) => {
+                let n = list.len();
+                self.change_rules(|r| {
+                    for (m, comment) in list {
+                        r.insert(usize::MAX, rules::Action::Allow, m, &comment)?;
+                    }
+                    Ok(format!("{n} allow rules added at the end; s saves them"))
+                })
+            }
             Request::SetLimit { exe, up_mb, down_mb } => self.change_rules(|r| r.set_limit(&exe, up_mb, down_mb, "")),
             Request::ScanDevices => match &self.discovery {
                 Some(d) => {

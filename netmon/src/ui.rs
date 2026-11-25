@@ -148,7 +148,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             format!(" q quit  ←→/0-9 view  ↑↓ select  d DNS log  / filter [{}]   newest first, read every 2 s", app.filter)
         }
     } else if app.tab == Tab::Rules {
-        " q quit  ←→/0-9 view  ↑↓ select  d remove rule  t end time 1h/1d/never  P profile  s save to rules file   tmp rules end when the monitor stops".to_string()
+        " q quit  ←→/0-9 view  ↑↓ select  d remove rule  t end time 1h/1d/never  P profile  G learn rules  s save to rules file   tmp rules end when the monitor stops".to_string()
     } else {
         let block = match app.tab {
             Tab::Connections => "  b/B/H block ip/port/host",
@@ -164,6 +164,9 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     f.render_widget(Paragraph::new(footer_text).style(Style::new().fg(Color::DarkGray)), footer);
     if app.picking_profile {
         draw_profiles(f, app, rules);
+    }
+    if app.picking_suggestions {
+        draw_suggestions(f, app);
     }
     if let Some(v) = &app.stream {
         draw_stream(f, v);
@@ -202,6 +205,47 @@ fn draw_stream(f: &mut Frame, v: &crate::app::StreamView) {
 }
 
 /// The profile picker over the Rules tab.
+/// Learning mode: the suggested allow rules, each picked or not.
+fn draw_suggestions(f: &mut Frame, app: &App) {
+    let a = f.area();
+    let h = a.height.saturating_sub(4).max(6);
+    let w = a.width.saturating_sub(6).max(20);
+    let r = Rect { x: a.x + (a.width - w) / 2, y: a.y + (a.height - h) / 2, width: w, height: h };
+    let rows = (h as usize).saturating_sub(5);
+    let first = app.suggest_sel.saturating_sub(rows.saturating_sub(1));
+    let mut lines: Vec<Line> = app
+        .suggestions
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, s)| {
+            let mark = if s.picked { "[x]" } else { "[ ]" };
+            let style = if i == app.suggest_sel { Style::new().fg(Color::Black).bg(Color::Cyan) } else { Style::new() };
+            Line::from(vec![
+                Span::styled(format!(" {mark} allow {} ", s.m), style),
+                Span::styled(format!(" {} dest: {}", s.count, s.examples.join(", ")), Style::new().fg(Color::DarkGray)),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(""));
+    let picked = app.suggestions.iter().filter(|s| s.picked).count();
+    lines.push(Line::from(Span::styled(
+        format!("{picked} of {} picked   ↑↓ select  Space pick  a all/none  Enter add at the end  Esc cancel", app.suggestions.len()),
+        Style::new().fg(Color::Yellow),
+    )));
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title(" allow rules learned from the connection log ")
+                .border_style(Style::new().fg(Color::Cyan)),
+        ),
+        r,
+    );
+}
+
 fn draw_profiles(f: &mut Frame, app: &App, rules: &Rules) {
     let active = if rules.profile.is_empty() { "default" } else { rules.profile.as_str() };
     let a = f.area();
@@ -1218,6 +1262,41 @@ mod tests {
         assert!(ff.contains(&human(300_000_000.0)) && ff.contains(&human(1_000_000_000.0)), "{ff}");
         assert!(s.find("firefox").unwrap() < s.find("curl").unwrap(), "busiest first");
         assert!(s.contains("Today ↓ ▼"), "{s}");
+    }
+
+    #[test]
+    fn learned_rules_list_picks_and_adds() {
+        use crate::app::{Action, Key};
+        let mut app = App { tab: Tab::Rules, show_graph: false, ..App::default() };
+        let sug = |port: u16| crate::learn::Suggestion {
+            m: crate::rules::Match {
+                exe: Some("/usr/bin/curl".into()),
+                dir: Some(crate::rules::Dir::Out),
+                proto: Some(6),
+                ports: Some((port, port)),
+                ..Default::default()
+            },
+            count: 2,
+            examples: vec!["example.com".into()],
+            picked: true,
+        };
+        app.suggestions = vec![sug(80), sug(443)];
+        app.picking_suggestions = true;
+        let mut term = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        term.draw(|fr| draw(fr, &mut app, &Collector::new(1), &Names::default(), None, &Rules::default())).unwrap();
+        let s = screen(&term);
+        assert!(s.contains("[x] allow out exe /usr/bin/curl tcp port 443") && s.contains("2 of 2 picked"), "{s}");
+        assert_eq!(app.on_key(Key::Down), None);
+        assert_eq!(app.on_key(Key::Char(' ')), None);
+        assert!(app.suggestions[0].picked && !app.suggestions[1].picked);
+        app.on_key(Key::Char('a'));
+        assert!(app.suggestions.iter().all(|s| s.picked), "a: all");
+        app.on_key(Key::Char('a'));
+        assert!(app.suggestions.iter().all(|s| !s.picked), "a again: none");
+        app.on_key(Key::Char(' '));
+        assert_eq!(app.on_key(Key::Enter), Some(Action::AddSuggested));
+        assert!(!app.picking_suggestions);
+        assert_eq!(app.on_key(Key::Char('G')), Some(Action::SuggestRules));
     }
 
     #[test]

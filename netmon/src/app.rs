@@ -231,6 +231,12 @@ pub struct App {
     pub show_dns: bool,
     /// The profile picker is open (Rules tab, P): names and selection.
     pub picking_profile: bool,
+    /// Learning mode (Rules tab, G): suggested allow rules and selection.
+    pub suggestions: Vec<crate::learn::Suggestion>,
+    pub suggest_sel: usize,
+    pub picking_suggestions: bool,
+    /// The connection log, for the Log tab and the suggestions.
+    pub log_path: std::path::PathBuf,
     pub profiles: Vec<String>,
     pub profile_sel: usize,
 }
@@ -277,6 +283,10 @@ impl Default for App {
             dns: Default::default(),
             show_dns: false,
             picking_profile: false,
+            suggestions: Vec::new(),
+            suggest_sel: 0,
+            picking_suggestions: false,
+            log_path: crate::connlog::DEFAULT_PATH.into(),
             profiles: Vec::new(),
             profile_sel: 0,
         }
@@ -349,6 +359,10 @@ pub enum Action {
     BlockDnsName,
     /// Next bandwidth limit of the selected process's exe (off, 1, 5, 20 MB/s).
     CycleLimit,
+    /// Suggest allow rules from the connection log (the client opens the list).
+    SuggestRules,
+    /// Add the picked suggestions.
+    AddSuggested,
     /// Open the profile picker (the client lists the profiles).
     PickProfile,
     /// Set the display filter of the capture; empty clears it.
@@ -395,6 +409,31 @@ impl App {
                 Key::Home => v.scroll = 0,
                 Key::End => v.scroll = last,
                 Key::Esc | Key::Char('q') | Key::Char('S') => self.stream = None,
+                _ => {}
+            }
+            return None;
+        }
+        if self.picking_suggestions {
+            let n = self.suggestions.len();
+            match key {
+                Key::Up | Key::Char('k') => self.suggest_sel = self.suggest_sel.saturating_sub(1),
+                Key::Down | Key::Char('j') => self.suggest_sel = (self.suggest_sel + 1).min(n.saturating_sub(1)),
+                Key::PageUp => self.suggest_sel = self.suggest_sel.saturating_sub(20),
+                Key::PageDown => self.suggest_sel = (self.suggest_sel + 20).min(n.saturating_sub(1)),
+                Key::Char(' ') => {
+                    if let Some(s) = self.suggestions.get_mut(self.suggest_sel) {
+                        s.picked = !s.picked;
+                    }
+                }
+                Key::Char('a') => {
+                    let all = self.suggestions.iter().all(|s| s.picked);
+                    self.suggestions.iter_mut().for_each(|s| s.picked = !all);
+                }
+                Key::Enter => {
+                    self.picking_suggestions = false;
+                    return Some(Action::AddSuggested);
+                }
+                Key::Esc | Key::Char('q') => self.picking_suggestions = false,
                 _ => {}
             }
             return None;
@@ -577,6 +616,7 @@ impl App {
             Key::Char('d') if self.tab == Tab::Rules => return Some(Action::RemoveRule),
             Key::Char('t') if self.tab == Tab::Rules => return Some(Action::CycleRuleTimer),
             Key::Char('P') if self.tab == Tab::Rules => return Some(Action::PickProfile),
+            Key::Char('G') if self.tab == Tab::Rules => return Some(Action::SuggestRules),
             Key::Char('s') if self.tab == Tab::Rules => return Some(Action::SaveRules),
             Key::Char('s') if self.tab == Tab::Usage => {
                 self.usage_sort = (self.usage_sort + 1) % USAGE_COLUMNS.len();

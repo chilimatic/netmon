@@ -88,7 +88,7 @@ impl Action {
 }
 
 /// The side that opened a connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Dir {
     /// This host.
     Out,

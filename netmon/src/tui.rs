@@ -189,7 +189,7 @@ fn run_tui(
     args: &TuiArgs,
 ) -> anyhow::Result<()> {
     let (log, usage) = (args.log.as_path(), args.usage.as_path());
-    let mut app = App { interval_secs: interval.as_secs_f64(), status, ..App::default() };
+    let mut app = App { interval_secs: interval.as_secs_f64(), status, log_path: log.to_path_buf(), ..App::default() };
     app.geo = crate::geo::Geo::open(&args.geoip);
     if !app.geo.error.is_empty() {
         app.status = format!("geo databases: {}", app.geo.error);

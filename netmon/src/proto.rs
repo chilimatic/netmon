@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Version of this protocol. Client and daemon must have the same.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 
 /// Where `netmond` listens.
 pub const DEFAULT_SOCKET: &str = "/run/netmon.sock";
@@ -92,6 +92,9 @@ pub enum Request {
     StopCapture,
     /// Send ARP requests to every address of the LANs now.
     ScanDevices,
+    /// Adds allow rules at the end of the table (learning mode), with
+    /// their comments. All or none.
+    AddAllowRules(Vec<(crate::rules::Match, String)>),
     /// Sets or (both None) removes the bandwidth limit of an exe, in MB/s.
     SetLimit { exe: String, up_mb: Option<f64>, down_mb: Option<f64> },
 }

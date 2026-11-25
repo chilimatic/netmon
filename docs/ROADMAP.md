@@ -525,6 +525,13 @@ Small, independent features after the firewall core:
   share exe ids with rules. `[[limit]]` in the rules file, `L` in the
   Processes tab (1, 5, 20 MB/s, off), Limit column. Protocol 10. Tested:
   1 MB/s gave 0.95 MB/s, 5 MB/s gave 4.46 MB/s, removal 20.6 MB/s.
+- **Learning mode: done (2026-11-25).** `G` in the Rules tab reads the
+  connection log (and `.1`), groups `new` lines per exe, direction and
+  protocol (a port per rule up to 3 ports), leaves out what rules already
+  allow, DNS to the resolvers and "in" lines from ports below 1024
+  (replies). A picker adds the picked rules at the end
+  (`Request::AddAllowRules`, all or none). Protocol 11. Tested on the
+  real log: 36 305 lines gave 65 suggestions.
 - **History**: per-process daily totals in SQLite.
 
 ## Phase 9 – Connection graph

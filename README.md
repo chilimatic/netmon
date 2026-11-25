@@ -295,6 +295,7 @@ and `--no-devices` (no ARP requests and no Devices tab).
 | `H` | Connections | Block the hostname of the connection (see [Hosts tab](#hosts-tab)) |
 | `b` | Processes | Block or unblock the exe of the process |
 | `Q` | Processes | Turn QUIC (HTTP/3) off or on for the exe: a rule denies its outbound UDP port 443. Browsers then use TCP, where netmon sees the TLS server name. |
+| `G` | Rules | Suggest allow rules from the connection log (see [Learning mode](#learning-mode)) |
 | `L` | Processes | Bandwidth limit of the exe, both directions: off, 1, 5, 20 MB/s, off (see [Bandwidth limits](#bandwidth-limits)) |
 | `d` | Rules | Remove the selected rule |
 | `t` | Rules | Set the end time of the selected rule: 1 hour, then 1 day, then none |
@@ -915,6 +916,42 @@ until = 2026-12-01T18:00:00Z   # TOML date and time; Z is UTC
   in match order. It writes a temporary file (mode 0644) and renames it
   over the old one. Only the `comment` fields stay. Other `#` comments of a
   hand-written file are lost.
+
+### Learning mode
+
+Learning mode helps to change the default action from `allow` to `deny` or
+`ask` without breaking programs. It suggests allow rules for the
+connections that the programs made.
+
+1. Run `netmond` with the default `allow` and the connection log on for
+   some days.
+2. Press `G` in the Rules tab. The TUI reads the connection log
+   (`connections.log` and `connections.log.1`) and lists the suggestions,
+   all picked.
+3. Remove the pick from suggestions you do not want: `Space` picks one,
+   `a` picks all or none.
+4. Press `Enter`. The picked rules go to the end of the rule table, after
+   the blocks.
+5. Press `s` to save the rules. Then set `default = "deny"` (or `"ask"`)
+   in the rules file and restart `netmond`.
+
+How the suggestions are made:
+
+- One rule per program, direction and protocol. An outbound rule names
+  the remote port. With more than 3 ports, the rule has no port.
+- An inbound rule has no port, because a rule can only name the remote
+  port.
+- Connections that a rule already allows are left out. DNS to the
+  nameservers in `/etc/resolv.conf` is left out, because the lockout
+  guard always allows it.
+- Connections without a known exe cannot have a rule and are left out.
+- An "in" line from a port below 1024 is the reply of an outbound
+  connection (the monitor saw its first packet inbound) and is left out.
+  Make sure that the other "in" suggestions are real servers. A reply
+  from a server on a high port (for example 5228) still shows as "in".
+- An exe whose path has a version number in it (an updater that installs
+  each version in a new directory) gets a rule per version. Such a rule
+  stops to match after the next update.
 
 ### Bandwidth limits
 

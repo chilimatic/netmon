@@ -1006,3 +1006,22 @@ fn limits_reach_the_kernel_with_exe_ids_and_go_again() {
     assert_eq!(crate::client::next_limit(Some(20.0)), None);
     assert_eq!(crate::client::next_limit(Some(3.0)), None);
 }
+
+#[test]
+fn learned_allow_rules_go_to_the_end() {
+    let (mut m, _) = monitor();
+    m.request(Request::ToggleBlock(BlockTarget::Exe("/usr/bin/nc".into())));
+    let rule = |port: u16| {
+        (crate::rules::Match { exe: Some("/usr/bin/curl".into()), ports: Some((port, port)), ..Default::default() }, format!("learned {port}"))
+    };
+    let msg = m.request(Request::AddAllowRules(vec![rule(80), rule(443)]));
+    assert_eq!(msg, "2 allow rules added at the end; s saves them");
+    let r = &m.rules.rules;
+    assert_eq!(r.len(), 3);
+    assert_eq!((r[0].action, r[2].action, r[2].comment.as_str()), (rules::Action::Deny, rules::Action::Allow, "learned 443"));
+    assert_eq!(m.probe.table.len(), 3);
+    // All or none: a bad rule adds nothing.
+    let bad = (crate::rules::Match { exe: Some("rel".into()), ..Default::default() }, String::new());
+    assert!(m.request(Request::AddAllowRules(vec![rule(8080), bad])).contains("absolute path"));
+    assert_eq!(m.rules.rules.len(), 3);
+}

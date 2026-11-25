@@ -17,6 +17,7 @@ mod engine;
 mod geo;
 mod graph;
 mod ifaces;
+mod learn;
 mod linkwatch;
 mod listupdate;
 mod monitor;

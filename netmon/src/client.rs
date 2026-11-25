@@ -170,6 +170,24 @@ impl Client {
                     None => Err("no process selected".into()),
                 }
             }
+            Action::SuggestRules => match crate::learn::read_log(&app.log_path) {
+                Err(e) => Err(format!("connection log: {e}")),
+                Ok(log) => {
+                    let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+                    app.suggestions = crate::learn::suggest(&log, &self.snap.rules, &crate::learn::resolvers(&resolv));
+                    if app.suggestions.is_empty() {
+                        Err(format!("no suggestions: rules allow all {} logged connections", log.len()))
+                    } else {
+                        app.suggest_sel = 0;
+                        app.picking_suggestions = true;
+                        return None;
+                    }
+                }
+            },
+            Action::AddSuggested => {
+                let list: Vec<_> = app.suggestions.iter().filter(|s| s.picked).map(|s| (s.m.clone(), s.comment())).collect();
+                if list.is_empty() { Err("no suggestion picked".into()) } else { Ok(Request::AddAllowRules(list)) }
+            }
             Action::CycleLimit => {
                 let rows = app.proc_rows(&self.snap.collector, &self.snap.names);
                 let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
