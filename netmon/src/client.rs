@@ -170,6 +170,19 @@ impl Client {
                     None => Err("no process selected".into()),
                 }
             }
+            Action::CycleLimit => {
+                let rows = app.proc_rows(&self.snap.collector, &self.snap.names);
+                let ids: Vec<_> = rows.iter().map(|r| r.id()).collect();
+                match app.selected_in(&ids).map(|i| &rows[i]) {
+                    Some(r) if !r.exe.is_empty() => {
+                        let now = self.snap.rules.limit_of(&r.exe).and_then(|l| l.down_mb.or(l.up_mb));
+                        let next = next_limit(now);
+                        Ok(Request::SetLimit { exe: r.exe.clone(), up_mb: next, down_mb: next })
+                    }
+                    Some(_) => Err("exe unknown for this process: no limit possible".into()),
+                    None => Err("no process selected".into()),
+                }
+            }
             Action::RemoveRule => {
                 let rules = &self.snap.rules.rules;
                 let ids: Vec<_> = rules.iter().map(|r| crate::app::RowId::Rule(r.id)).collect();
@@ -373,4 +386,15 @@ fn timer_steps_hour_day_never() {
 
 fn dest_id(d: &crate::ask::Dest) -> DestId {
     DestId::from(d)
+}
+
+/// The limit steps of `L` in MB/s, both directions: off, 1, 5, 20, off.
+/// A limit from the rules file that is not a step goes to off.
+pub(crate) fn next_limit(now: Option<f64>) -> Option<f64> {
+    match now {
+        None => Some(1.0),
+        Some(1.0) => Some(5.0),
+        Some(5.0) => Some(20.0),
+        Some(_) => None,
+    }
 }

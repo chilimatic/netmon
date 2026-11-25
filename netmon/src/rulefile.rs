@@ -34,6 +34,19 @@ struct RawFile {
     blocklist: Vec<toml::Spanned<RawBlocklist>>,
     /// When netmond sends alerts.
     alerts: Option<toml::Spanned<RawAlerts>>,
+    /// Bandwidth limits per exe.
+    #[serde(default)]
+    limit: Vec<toml::Spanned<RawLimit>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLimit {
+    exe: String,
+    up_mb: Option<f64>,
+    down_mb: Option<f64>,
+    #[serde(default)]
+    comment: String,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +131,17 @@ pub struct RulesFile {
     pub blocklists: Vec<FileBlocklist>,
     /// None: the file has no `[alerts]` table.
     pub alerts: Option<crate::rules::AlertConfig>,
+    pub limits: Vec<FileLimit>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct FileLimit {
+    /// 1-based line of the `[[limit]]` header.
+    pub line: usize,
+    pub exe: String,
+    pub up_mb: Option<f64>,
+    pub down_mb: Option<f64>,
+    pub comment: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -265,7 +289,23 @@ pub fn parse(text: &str) -> Result<RulesFile, String> {
             })
         })
         .transpose()?;
-    Ok(RulesFile { default: raw.default.map(action), rules, hosts, blocklists, alerts })
+    let limits = raw
+        .limit
+        .into_iter()
+        .map(|l| {
+            let line = line_of(text, l.span().start);
+            let l = l.into_inner();
+            if l.up_mb.is_none() && l.down_mb.is_none() {
+                return Err(format!("line {line}: limit: give up_mb, down_mb or both"));
+            }
+            crate::rules::Match { exe: Some(l.exe.clone()), ..Default::default() }.check().map_err(|e| format!("line {line}: limit {e}"))?;
+            for v in [l.up_mb, l.down_mb].into_iter().flatten() {
+                crate::rules::limit_rate(v).map_err(|e| format!("line {line}: {e}"))?;
+            }
+            Ok(FileLimit { line, exe: l.exe, up_mb: l.up_mb, down_mb: l.down_mb, comment: l.comment })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(RulesFile { default: raw.default.map(action), rules, hosts, blocklists, alerts, limits })
 }
 
 fn action(a: RawAction) -> Action {
@@ -446,6 +486,18 @@ pub fn render(rules: &Rules) -> String {
             let _ = writeln!(out, "comment = {}", q(&h.comment));
         }
     }
+    for l in &rules.limits {
+        let _ = write!(out, "\n[[limit]]\nexe = {}\n", q(&l.exe));
+        if let Some(v) = l.up_mb {
+            let _ = writeln!(out, "up_mb = {v:?}");
+        }
+        if let Some(v) = l.down_mb {
+            let _ = writeln!(out, "down_mb = {v:?}");
+        }
+        if !l.comment.is_empty() {
+            let _ = writeln!(out, "comment = {}", q(&l.comment));
+        }
+    }
     for l in &rules.blocklists {
         let _ = write!(out, "\n[[blocklist]]\npath = {}\n", q(&l.path));
         if !l.url.is_empty() {
@@ -535,6 +587,23 @@ port = "8000-8100"
 action = "deny"
 remote = "2001:db8::1"
 "#;
+
+    #[test]
+    fn limits_parse_check_and_round_trip() {
+        let f = parse("[[limit]]\nexe = \"/usr/bin/steam\"\ndown_mb = 5\nup_mb = 0.5\ncomment = \"games\"\n").unwrap();
+        assert_eq!(
+            f.limits,
+            vec![FileLimit { line: 1, exe: "/usr/bin/steam".into(), up_mb: Some(0.5), down_mb: Some(5.0), comment: "games".into() }]
+        );
+        assert!(err("[[limit]]\nexe = \"/usr/bin/x\"\n").contains("give up_mb"));
+        assert!(err("[[limit]]\nexe = \"x\"\ndown_mb = 1\n").contains("absolute path"));
+        assert!(err("[[limit]]\nexe = \"/x\"\ndown_mb = 0\n").contains("0.01 to"));
+        assert!(err("[[limit]]\nexe = \"/x\"\nrate = 1\n").starts_with("line"), "unknown field");
+        let mut rules = Rules::default();
+        rules.set_limit("/usr/bin/steam", Some(0.5), Some(5.0), "games").unwrap();
+        let back = parse(&render(&rules)).unwrap();
+        assert_eq!((back.limits[0].up_mb, back.limits[0].down_mb, back.limits[0].comment.as_str()), (Some(0.5), Some(5.0), "games"));
+    }
 
     #[test]
     fn alerts_table_parses_checks_and_round_trips() {

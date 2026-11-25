@@ -15,7 +15,7 @@ use aya_ebpf::{
     programs::{SockAddrContext, SockContext, TcContext, TracePointContext},
 };
 use netmon_common::{
-    ACTION_ALLOW, ACTION_ASK, ACTION_DENY, ASK_RING_BYTES, AskEvent, DENY_RING_BYTES, DenyEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
+    ACTION_ALLOW, ACTION_ASK, ACTION_DENY, CFG_LIMITS, Limit, take_tokens, ASK_RING_BYTES, AskEvent, DENY_RING_BYTES, DenyEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
@@ -123,6 +123,10 @@ static TGID_EXE: HashMap<u32, u32> = HashMap::with_max_entries(MAX_MARKED_TGIDS,
 #[map]
 static TRACE_CFG: Array<TraceCfg> = Array::with_max_entries(1, 0);
 
+/// Bandwidth limits by exe id. Never LRU, like the verdict maps.
+#[map]
+static LIMITS: HashMap<u32, Limit> = HashMap::with_max_entries(MAX_RULES, 0);
+
 /// Packets and socket calls matched, per table slot (both halves).
 #[map]
 static RULE_HITS: PerCpuArray<u64> = PerCpuArray::with_max_entries(2 * MAX_RULES, 0);
@@ -145,7 +149,32 @@ fn live_rules() -> (u32, u32) {
 fn rules_active() -> bool {
     let (count, half) = live_rules();
     let d = cfg(CFG_DEFAULT + half);
-    count != 0 || d == ACTION_DENY as u32 || d == ACTION_ASK as u32
+    count != 0 || d == ACTION_DENY as u32 || d == ACTION_ASK as u32 || cfg(CFG_LIMITS) != 0
+}
+
+/// Is this packet over the bandwidth limit of its process's exe? Egress
+/// packets name their process by the socket (`tgid`), ingress packets by
+/// the connection state. Takes the packet's bytes from the bucket.
+#[inline(never)]
+fn over_limit(key: &FlowKey, egress: bool, tgid: u32, len: u64) -> bool {
+    if cfg(CFG_LIMITS) == 0 {
+        return false;
+    }
+    let mut tgid = tgid;
+    if tgid == 0 {
+        let mut c = ConnKey::default();
+        conn_key(key, &mut c);
+        tgid = unsafe { CONNS.get(&c) }.map_or(0, |s| s.tgid);
+    }
+    if tgid == 0 {
+        return false;
+    }
+    let Some(exe) = (unsafe { TGID_EXE.get(&tgid) }).copied() else { return false };
+    let Some(l) = LIMITS.get_ptr_mut(&exe) else { return false };
+    let now = unsafe { bpf_ktime_get_ns() };
+    let l = unsafe { &mut *l };
+    let b = if egress { &mut l.up } else { &mut l.down };
+    !take_tokens(b, now, len)
 }
 
 /// Outbound connections waiting for the user's answer (ask mode).
@@ -610,9 +639,10 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
             tls_names(ctx, key, payload as u32);
         }
         // Unparsed packets have no key and pass (fail-open).
-        let denied =
-            ifindex != LOOPBACK_IFINDEX && !forwarded(ctx, key, egress) && packet_denied(key, egress, packet_tgid(ctx, egress));
-        if denied {
+        let local = ifindex != LOOPBACK_IFINDEX && !forwarded(ctx, key, egress);
+        let tgid = if local { packet_tgid(ctx, egress) } else { 0 };
+        let denied = local && packet_denied(key, egress, tgid);
+        if denied || (local && over_limit(key, egress, tgid, ctx.len() as u64)) {
             action = TC_ACT_SHOT;
         }
         // DNS answers: from port 53, on every interface (lo carries the

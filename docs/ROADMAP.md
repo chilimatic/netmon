@@ -518,6 +518,13 @@ Small, independent features after the firewall core:
   result, server and a blocked mark. netmond keeps 5000 in memory and
   sends new ones as `ToClient::Dns` (backlog at connect). `b` blocks the
   name. Protocol 9. Tested: getent, NXDOMAIN, a blocked ad domain.
+- **Bandwidth limits: done (2026-11-25).** Token bucket per exe id and
+  direction in the LIMITS map (policing, TC_ACT_SHOT above the rate,
+  approximate without a lock). Egress finds the process by the socket,
+  ingress by CONNS. CFG_LIMITS turns the connection state on. Limits
+  share exe ids with rules. `[[limit]]` in the rules file, `L` in the
+  Processes tab (1, 5, 20 MB/s, off), Limit column. Protocol 10. Tested:
+  1 MB/s gave 0.95 MB/s, 5 MB/s gave 4.46 MB/s, removal 20.6 MB/s.
 - **History**: per-process daily totals in SQLite.
 
 ## Phase 9 – Connection graph

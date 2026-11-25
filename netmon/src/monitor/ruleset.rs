@@ -203,7 +203,10 @@ impl<K: Kernel> Monitor<K> {
         };
         match self.probe.set_rules(&self.rules.entries(), self.rules.exe_ids(), self.rules.default.kernel()) {
             Ok(()) => {
-                let host_error = self.sync_host_blocks(Instant::now());
+                let mut host_error = self.sync_host_blocks(Instant::now());
+                if let Err(e) = self.probe.set_limits(&self.rules.kernel_limits()) {
+                    host_error = Some(format!("bandwidth limits not set: {e:#}"));
+                }
                 if let Some(e) = self.sync_exe_blocks().or(host_error) {
                     return format!("{msg}; {e}");
                 }
@@ -288,6 +291,7 @@ impl<K: Kernel> Monitor<K> {
         let hosts = parsed.hosts;
         let default = parsed.default;
         let alerts = parsed.alerts;
+        let limits = parsed.limits;
         // A list that cannot be read is no error of the rules file: it
         // stays in the Hosts tab with its error, and a reload tries again.
         let mut left = crate::blocklist::MAX_NAMES;
@@ -311,6 +315,10 @@ impl<K: Kernel> Monitor<K> {
                 rules.blocklists.clear();
                 rules.default = rules::Action::Allow;
                 rules.alerts = rules::AlertConfig::default();
+                let exes: Vec<String> = rules.limits.iter().map(|l| l.exe.clone()).collect();
+                for e in exes {
+                    let _ = rules.set_limit(&e, None, None, "");
+                }
             }
             if let Some(d) = default {
                 rules.default = d;
@@ -330,6 +338,12 @@ impl<K: Kernel> Monitor<K> {
                 rules.add_host(&x.pattern, &x.comment).map_err(|e| {
                     failed = true;
                     format!("line {}: {e}", x.line)
+                })?;
+            }
+            for l in limits {
+                rules.set_limit(&l.exe, l.up_mb, l.down_mb, &l.comment).map_err(|e| {
+                    failed = true;
+                    format!("line {}: {e}", l.line)
                 })?;
             }
             for (l, names) in lists {

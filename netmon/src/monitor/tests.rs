@@ -70,9 +70,14 @@ struct Fake {
     fail_capture: bool,
     marked: Vec<(u32, u32)>,
     blocked: HashSet<std::net::IpAddr>,
+    limits: Vec<(u32, u64, u64)>,
 }
 
 impl Kernel for Fake {
+    fn set_limits(&mut self, limits: &[(u32, u64, u64)]) -> anyhow::Result<()> {
+        self.limits = limits.to_vec();
+        Ok(())
+    }
     fn set_blocked_addrs(&mut self, add: &[std::net::IpAddr], remove: &[std::net::IpAddr]) -> Vec<std::net::IpAddr> {
         for ip in remove {
             self.blocked.remove(ip);
@@ -208,6 +213,7 @@ fn monitor() -> (Monitor<Fake>, Instant) {
         drops: 0,
         table: Vec::new(),
         exe_ids: Default::default(),
+        limits: Vec::new(),
         default: 0,
         conns: HashMap::new(),
         names: VecDeque::new(),
@@ -983,4 +989,20 @@ fn dns_log_names_the_asking_program_and_marks_blocked_names() {
     assert!(e.blocked);
     assert_eq!(e.result(), "203.0.113.5");
     assert_eq!(m.new_dns.len(), 1);
+}
+
+#[test]
+fn limits_reach_the_kernel_with_exe_ids_and_go_again() {
+    let (mut m, _) = monitor();
+    let msg = m.request(Request::SetLimit { exe: "/usr/bin/curl".into(), up_mb: Some(1.0), down_mb: Some(5.0) });
+    assert_eq!(msg, "limit ↓5 ↑1 MB/s for /usr/bin/curl");
+    assert_eq!(m.probe.limits, vec![(1, 1_000_000, 5_000_000)]);
+    assert_eq!(m.probe.exe_ids.get("/usr/bin/curl"), Some(&1), "the exe id is in the kernel first");
+    assert!(m.request(Request::SetLimit { exe: "rel".into(), up_mb: Some(1.0), down_mb: None }).contains("absolute path"));
+    assert_eq!(m.probe.limits.len(), 1, "a refused limit changes nothing");
+    m.request(Request::SetLimit { exe: "/usr/bin/curl".into(), up_mb: None, down_mb: None });
+    assert!(m.probe.limits.is_empty() && m.probe.exe_ids.is_empty());
+    assert_eq!(crate::client::next_limit(None), Some(1.0));
+    assert_eq!(crate::client::next_limit(Some(20.0)), None);
+    assert_eq!(crate::client::next_limit(Some(3.0)), None);
 }

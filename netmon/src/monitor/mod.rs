@@ -329,6 +329,7 @@ impl<K: Kernel> Monitor<K> {
                 Err(e) => format!("capture failed: {e:#}"),
             },
             Request::StopCapture => self.stop_capture(),
+            Request::SetLimit { exe, up_mb, down_mb } => self.change_rules(|r| r.set_limit(&exe, up_mb, down_mb, "")),
             Request::ScanDevices => match &self.discovery {
                 Some(d) => {
                     d.scan();

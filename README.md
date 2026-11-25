@@ -295,6 +295,7 @@ and `--no-devices` (no ARP requests and no Devices tab).
 | `H` | Connections | Block the hostname of the connection (see [Hosts tab](#hosts-tab)) |
 | `b` | Processes | Block or unblock the exe of the process |
 | `Q` | Processes | Turn QUIC (HTTP/3) off or on for the exe: a rule denies its outbound UDP port 443. Browsers then use TCP, where netmon sees the TLS server name. |
+| `L` | Processes | Bandwidth limit of the exe, both directions: off, 1, 5, 20 MB/s, off (see [Bandwidth limits](#bandwidth-limits)) |
 | `d` | Rules | Remove the selected rule |
 | `t` | Rules | Set the end time of the selected rule: 1 hour, then 1 day, then none |
 | `P` | Rules | Pick a rule profile (`↑↓`, `Enter` loads, `Esc` cancels) |
@@ -914,6 +915,37 @@ until = 2026-12-01T18:00:00Z   # TOML date and time; Z is UTC
   in match order. It writes a temporary file (mode 0644) and renames it
   over the old one. Only the `comment` fields stay. Other `#` comments of a
   hand-written file are lost.
+
+### Bandwidth limits
+
+A bandwidth limit caps the traffic of every process of one exe. `L` in
+the Processes tab steps the limit of the selected exe through 1, 5 and 20
+MB/s (both directions) and off. The Limit column shows it, and limited
+rows are yellow. For other values, use a `[[limit]]` section in the
+rules file:
+
+```toml
+[[limit]]
+exe = "/usr/bin/steam"
+down_mb = 5        # MB/s received (10^6 bytes)
+up_mb = 0.5        # MB/s sent; leave out for no limit in that direction
+comment = "games"
+```
+
+- The kernel keeps a token bucket per exe and direction. A packet above
+  the rate is dropped (policing). TCP and QUIC see the loss and slow down
+  to the rate. Measured with curl: a 1 MB/s limit gave 0.95 MB/s, a 5 MB/s
+  limit gave 4.5 MB/s.
+- The bucket holds a quarter second of traffic (at least 128 KiB). A
+  download therefore starts with a short burst.
+- Received packets cross the link before the drop. The limit protects
+  other programs on the host, but the link carries the dropped packets
+  once.
+- The limit counts all processes of the exe together. CPUs update the
+  bucket without a lock, so the limit is approximate.
+- Forwarded traffic (containers, VMs) and loopback traffic have no limit.
+- A limit starts with a full bucket each time it changes.
+- `s` in the Rules tab saves the limits with the rules.
 
 ### Rule profiles
 

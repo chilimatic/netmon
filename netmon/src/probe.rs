@@ -89,6 +89,9 @@ pub struct Probe {
     /// File of each exe as last written to EXE_INODES.
     inode_of: BTreeMap<String, ExeInode>,
     tgid_exe: HashMap<MapData, u32, u32>,
+    limits: HashMap<MapData, u32, netmon_common::Limit>,
+    /// Limits as last written to LIMITS: exe id -> (up, down) bytes/s.
+    limits_set: BTreeMap<u32, (u64, u64)>,
     /// Exe ids as last written to EXE_IDS.
     exe_ids: BTreeMap<String, u32>,
     cpus: usize,
@@ -217,6 +220,7 @@ impl Probe {
         let exe_id_map = HashMap::try_from(take("EXE_IDS")?)?;
         let exe_inodes = HashMap::try_from(take("EXE_INODES")?)?;
         let tgid_exe = HashMap::try_from(take("TGID_EXE")?)?;
+        let limits = HashMap::try_from(take("LIMITS")?)?;
         let trace_cfg = Array::try_from(take("TRACE_CFG")?)?;
         let mut hook_errors = Vec::new();
         let pins = match pin_dir.map(prepare_pins) {
@@ -263,6 +267,8 @@ impl Probe {
             exe_inodes,
             inode_of: BTreeMap::new(),
             tgid_exe,
+            limits,
+            limits_set: BTreeMap::new(),
             exe_ids: BTreeMap::new(),
             cpus,
             attached: HashSet::new(),
@@ -589,6 +595,11 @@ pub trait Kernel {
     /// decided again. On error the old table stays live.
     fn set_rules(&mut self, rules: &[RuleEntry], exe_ids: &BTreeMap<String, u32>, default: u8)
     -> anyhow::Result<()>;
+    /// Replaces the bandwidth limits: exe id, bytes/s up, bytes/s down.
+    /// Call after `set_rules`, which writes the exe ids.
+    fn set_limits(&mut self, _limits: &[(u32, u64, u64)]) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Direction and verdict the kernel holds for a connection.
     fn conn(&self, key: &ConnKey) -> Option<ConnState>;
     /// Packets and socket calls matched by the rule in `slot` of the live
@@ -779,6 +790,23 @@ impl Kernel for Probe {
 
     fn sock_owner(&self, cookie: u64) -> Option<SockOwner> {
         self.sock_owner.get(&cookie, 0).ok()
+    }
+
+    fn set_limits(&mut self, limits: &[(u32, u64, u64)]) -> anyhow::Result<()> {
+        let want: BTreeMap<u32, (u64, u64)> = limits.iter().map(|&(id, up, down)| (id, (up, down))).collect();
+        // A changed limit starts with a full bucket.
+        for (&id, &(up, down)) in &want {
+            if self.limits_set.get(&id) != Some(&(up, down)) {
+                let bucket = |rate| netmon_common::Bucket { rate, ..Default::default() };
+                self.limits.insert(id, netmon_common::Limit { up: bucket(up), down: bucket(down) }, 0)?;
+            }
+        }
+        for id in self.limits_set.keys().filter(|id| !want.contains_key(id)) {
+            let _ = self.limits.remove(id);
+        }
+        self.rule_cfg.set(netmon_common::CFG_LIMITS, want.len() as u32, 0)?;
+        self.limits_set = want;
+        Ok(())
     }
 
     fn set_rules(&mut self, rules: &[RuleEntry], exe_ids: &BTreeMap<String, u32>, default: u8) -> anyhow::Result<()> {

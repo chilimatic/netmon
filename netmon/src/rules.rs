@@ -276,6 +276,45 @@ pub struct Rules {
     /// When netmond sends alerts (`[alerts]` in the rules file).
     #[serde(default)]
     pub alerts: AlertConfig,
+    /// Bandwidth limits per exe, in the order they were added.
+    #[serde(default)]
+    pub limits: Vec<BandwidthLimit>,
+}
+
+/// A bandwidth limit for every process of one exe. The kernel drops the
+/// packets above the rate (policing); TCP and QUIC then slow down.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BandwidthLimit {
+    pub id: u32,
+    pub exe: String,
+    /// MB/s (10^6 bytes) sent, and received. None: no limit that way.
+    pub up_mb: Option<f64>,
+    pub down_mb: Option<f64>,
+    pub comment: String,
+}
+
+impl BandwidthLimit {
+    /// "↓5 ↑1 MB/s", "↓5 MB/s".
+    pub fn label(&self) -> String {
+        let n = |v: f64| format!("{v}");
+        let mut parts = Vec::new();
+        if let Some(d) = self.down_mb {
+            parts.push(format!("↓{}", n(d)));
+        }
+        if let Some(u) = self.up_mb {
+            parts.push(format!("↑{}", n(u)));
+        }
+        format!("{} MB/s", parts.join(" "))
+    }
+}
+
+/// Bytes per second from MB/s, or why the value is no limit.
+pub fn limit_rate(mb: f64) -> Result<u64, String> {
+    let max = netmon_common::MAX_LIMIT_RATE as f64 / 1e6;
+    if !(mb.is_finite() && mb >= 0.01 && mb <= max) {
+        return Err(format!("limit {mb} MB/s: use 0.01 to {max}"));
+    }
+    Ok((mb * 1e6) as u64)
 }
 
 /// `[alerts]` in the rules file. All off by default.
@@ -494,11 +533,8 @@ impl Rules {
         if self.rules.len() >= MAX_RULES as usize {
             return Err(format!("rule limit {MAX_RULES} reached"));
         }
-        if let Some(p) = &m.exe
-            && !self.exe_ids.contains_key(p)
-        {
-            self.next_exe_id += 1;
-            self.exe_ids.insert(p.clone(), self.next_exe_id);
+        if let Some(p) = &m.exe {
+            self.name_exe(p)?;
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -543,15 +579,82 @@ impl Rules {
     pub fn remove(&mut self, id: u32) -> Option<Rule> {
         let i = self.rules.iter().position(|r| r.id == id)?;
         let rule = self.rules.remove(i);
-        if let Some(p) = &rule.m.exe
-            && !self.rules.iter().any(|r| r.m.exe.as_ref() == Some(p))
-        {
-            self.exe_ids.remove(p);
+        if let Some(p) = &rule.m.exe {
+            self.release_exe(p);
         }
         Some(rule)
     }
 
-    /// Exe path -> exe id of every exe named by a rule.
+    /// Registers an exe id for `p` if it has none.
+    fn name_exe(&mut self, p: &str) -> Result<(), String> {
+        if !self.exe_ids.contains_key(p) {
+            if self.exe_ids.len() >= MAX_RULES as usize {
+                return Err(format!("{MAX_RULES} exes named by rules and limits: no more"));
+            }
+            self.next_exe_id += 1;
+            self.exe_ids.insert(p.to_string(), self.next_exe_id);
+        }
+        Ok(())
+    }
+
+    /// Drops the exe id of `p` once no rule and no limit names it.
+    fn release_exe(&mut self, p: &str) {
+        if !self.rules.iter().any(|r| r.m.exe.as_deref() == Some(p)) && !self.limits.iter().any(|l| l.exe == p) {
+            self.exe_ids.remove(p);
+        }
+    }
+
+    /// Sets, changes or (both None) removes the bandwidth limit of `exe`.
+    pub fn set_limit(&mut self, exe: &str, up_mb: Option<f64>, down_mb: Option<f64>, comment: &str) -> Result<String, String> {
+        if up_mb.is_none() && down_mb.is_none() {
+            let Some(i) = self.limits.iter().position(|l| l.exe == exe) else {
+                return Err(format!("no limit for {exe}"));
+            };
+            self.limits.remove(i);
+            self.release_exe(exe);
+            return Ok(format!("limit removed for {exe}"));
+        }
+        Match { exe: Some(exe.to_string()), ..Match::default() }.check()?;
+        for v in [up_mb, down_mb].into_iter().flatten() {
+            limit_rate(v)?;
+        }
+        if comment.chars().any(char::is_control) {
+            return Err("comment: control characters".into());
+        }
+        let l = match self.limits.iter().position(|l| l.exe == exe) {
+            Some(i) => &mut self.limits[i],
+            None => {
+                if self.limits.len() >= MAX_RULES as usize {
+                    return Err(format!("limit count {MAX_RULES} reached"));
+                }
+                self.name_exe(exe)?;
+                let id = self.next_id;
+                self.next_id += 1;
+                self.limits.push(BandwidthLimit { id, exe: exe.to_string(), comment: comment.to_string(), ..Default::default() });
+                self.limits.last_mut().unwrap()
+            }
+        };
+        (l.up_mb, l.down_mb) = (up_mb, down_mb);
+        if !comment.is_empty() {
+            l.comment = comment.to_string();
+        }
+        Ok(format!("limit {} for {exe}", l.label()))
+    }
+
+    pub fn limit_of(&self, exe: &str) -> Option<&BandwidthLimit> {
+        self.limits.iter().find(|l| l.exe == exe)
+    }
+
+    /// The LIMITS table: exe id, bytes/s up, bytes/s down (0: no limit).
+    pub fn kernel_limits(&self) -> Vec<(u32, u64, u64)> {
+        let rate = |v: Option<f64>| v.and_then(|v| limit_rate(v).ok()).unwrap_or(0);
+        self.limits
+            .iter()
+            .filter_map(|l| Some((*self.exe_ids.get(&l.exe)?, rate(l.up_mb), rate(l.down_mb))))
+            .collect()
+    }
+
+    /// Exe path -> exe id of every exe named by a rule or a limit.
     pub fn exe_ids(&self) -> &BTreeMap<String, u32> {
         &self.exe_ids
     }
@@ -802,6 +905,28 @@ mod tests {
             full.block(BlockTarget::Port(IPPROTO_UDP, p as u16)).unwrap();
         }
         assert!(full.block(BlockTarget::Port(IPPROTO_TCP, 1)).unwrap_err().contains("limit"));
+    }
+
+    #[test]
+    fn limits_share_exe_ids_with_rules() {
+        let mut r = Rules::default();
+        let a = r.block(BlockTarget::Exe("/usr/bin/curl".into())).unwrap();
+        assert_eq!(r.set_limit("/usr/bin/curl", None, Some(5.0), "").unwrap(), "limit ↓5 MB/s for /usr/bin/curl");
+        r.set_limit("/usr/bin/steam", Some(0.5), Some(20.0), "games").unwrap();
+        assert_eq!(r.kernel_limits(), vec![(1, 0, 5_000_000), (2, 500_000, 20_000_000)]);
+        r.remove(a).unwrap();
+        assert_eq!(r.exe_ids().get("/usr/bin/curl"), Some(&1), "the limit still names curl");
+        r.set_limit("/usr/bin/curl", Some(1.0), Some(1.0), "").unwrap();
+        assert_eq!(r.limits.len(), 2, "changed, not added");
+        assert_eq!(r.limit_of("/usr/bin/curl").unwrap().label(), "↓1 ↑1 MB/s");
+        assert_eq!(r.set_limit("/usr/bin/curl", None, None, "").unwrap(), "limit removed for /usr/bin/curl");
+        assert!(!r.exe_ids().contains_key("/usr/bin/curl"));
+        assert!(r.set_limit("/usr/bin/curl", None, None, "").is_err());
+        assert!(r.set_limit("curl", Some(1.0), None, "").is_err(), "relative path");
+        assert!(r.set_limit("/usr/bin/x", Some(0.0), None, "").is_err());
+        assert!(r.set_limit("/usr/bin/x", Some(f64::NAN), None, "").is_err());
+        assert!(r.set_limit("/usr/bin/x", None, Some(20_000.0), "").is_err());
+        assert_eq!(r.limit_of("/usr/bin/steam").unwrap().comment, "games");
     }
 
     #[test]

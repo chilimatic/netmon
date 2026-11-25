@@ -120,7 +120,69 @@ pub const CFG_DEFAULT: u32 = 3;
 /// Bumped on every table rewrite: cached connection verdicts of an older
 /// generation are decided again.
 pub const CFG_GEN: u32 = 5;
-pub const CFG_LEN: u32 = 6;
+/// Number of bandwidth limits in LIMITS. Limits also turn on the
+/// connection state, so ingress packets find their process.
+pub const CFG_LIMITS: u32 = 6;
+pub const CFG_LEN: u32 = 7;
+
+/// Highest limit rate in bytes per second: keeps the token math in u64.
+pub const MAX_LIMIT_RATE: u64 = 10_000_000_000;
+/// Smallest bucket. GSO and GRO packets reach 64 KiB; a smaller bucket
+/// would never pass them.
+pub const LIMIT_MIN_BURST: u64 = 128 * 1024;
+
+/// Token bucket of a bandwidth limit for one direction. Rate 0: no limit.
+/// The kernel updates it without a lock: two CPUs can lose an update, so
+/// the limit is approximate.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bucket {
+    /// Bytes per second.
+    pub rate: u64,
+    pub tokens: u64,
+    pub last_ns: u64,
+}
+
+/// Bandwidth limit of one exe (LIMITS map, by exe id).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Limit {
+    pub up: Bucket,
+    pub down: Bucket,
+}
+
+/// Takes `len` bytes from the bucket at time `now_ns`. False: the packet
+/// is over the limit and the caller drops it. The bucket holds a quarter
+/// second of traffic, at least LIMIT_MIN_BURST. A full second of refill
+/// at most, so a long pause gives no larger burst and the math stays in
+/// u64 (rate <= MAX_LIMIT_RATE).
+#[inline(always)]
+pub fn take_tokens(b: &mut Bucket, now_ns: u64, len: u64) -> bool {
+    if b.rate == 0 {
+        return true;
+    }
+    let mut burst = b.rate / 4;
+    if burst < LIMIT_MIN_BURST {
+        burst = LIMIT_MIN_BURST;
+    }
+    let mut elapsed = now_ns.saturating_sub(b.last_ns);
+    if elapsed > 1_000_000_000 {
+        elapsed = 1_000_000_000;
+    }
+    // A new bucket (last_ns 0) starts full.
+    let mut t = if b.last_ns == 0 { burst } else { b.tokens + elapsed * b.rate / 1_000_000_000 };
+    if t > burst {
+        t = burst;
+    }
+    b.last_ns = now_ns;
+    if t >= len {
+        b.tokens = t - len;
+        true
+    } else {
+        b.tokens = t;
+        false
+    }
+}
 
 /// Connections whose direction and verdict the kernel remembers.
 pub const MAX_CONNS: u32 = 65_536;
@@ -551,6 +613,8 @@ pub struct PacketEvent {
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for CaptureConfig {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for Limit {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for FlowKey {}
@@ -778,6 +842,40 @@ impl FlowKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_bucket_passes_the_rate_and_drops_the_rest() {
+        let sec = 1_000_000_000u64;
+        let mut b = Bucket { rate: 1_000_000, ..Bucket::default() };
+        // First packet: a full bucket (a quarter second, at least the minimum).
+        assert!(take_tokens(&mut b, 5 * sec, 60_000));
+        assert_eq!(b.tokens, 250_000 - 60_000);
+        assert!(take_tokens(&mut b, 5 * sec, 190_000));
+        assert!(!take_tokens(&mut b, 5 * sec, 1), "empty");
+        // 10 ms later: 10 000 bytes.
+        assert!(take_tokens(&mut b, 5 * sec + 10_000_000, 10_000));
+        assert!(!take_tokens(&mut b, 5 * sec + 10_000_000, 1500));
+        // Over 10 s at 1 MB/s with 1500-byte packets every 0.5 ms (3 MB/s
+        // offered), about 10 MB pass.
+        let mut passed = 0u64;
+        for i in 0..20_000u64 {
+            if take_tokens(&mut b, 6 * sec + i * 500_000, 1500) {
+                passed += 1500;
+            }
+        }
+        assert!((9_900_000..=10_300_000).contains(&passed), "{passed}");
+        // A small rate still passes a 64 KiB GSO packet.
+        let mut small = Bucket { rate: 10_000, ..Bucket::default() };
+        assert!(take_tokens(&mut small, sec, 65_536));
+        // An older timestamp from another CPU adds nothing.
+        let t = small.tokens;
+        assert!(take_tokens(&mut small, sec / 2, 0));
+        assert_eq!(small.tokens, t);
+        // No limit; the largest rate does not overflow.
+        assert!(take_tokens(&mut Bucket::default(), 0, u64::MAX));
+        let mut big = Bucket { rate: MAX_LIMIT_RATE, ..Bucket::default() };
+        assert!(take_tokens(&mut big, u64::MAX, 1));
+    }
 
     #[test]
     fn only_routed_packets_count_as_forwarded() {

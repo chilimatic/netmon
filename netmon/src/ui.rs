@@ -152,7 +152,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     } else {
         let block = match app.tab {
             Tab::Connections => "  b/B/H block ip/port/host",
-            Tab::Processes => "  b block exe  Q QUIC off",
+            Tab::Processes => "  b block exe  Q QUIC off  L limit",
             _ => "",
         };
         format!(
@@ -984,12 +984,20 @@ fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, rules:
     let table = Table::new(
         rows.into_iter().map(|r| {
             let blocked = rules.denies_exe(&r.exe);
-            let style = if blocked { Style::new().fg(Color::Red) } else { Style::new() };
+            let limit = rules.limit_of(&r.exe).map(|l| l.label()).unwrap_or_default();
+            let style = if blocked {
+                Style::new().fg(Color::Red)
+            } else if !limit.is_empty() {
+                Style::new().fg(Color::Yellow)
+            } else {
+                Style::new()
+            };
             Row::new(vec![
                 Cell::from(r.process),
                 Cell::from(r.pid),
                 Cell::from(r.user),
                 Cell::from(r.exe),
+                Cell::from(limit),
                 Cell::from(Line::from(r.conns.to_string()).right_aligned()),
                 Cell::from(Line::from(rate(r.tx_rate)).right_aligned()),
                 Cell::from(Line::from(rate(r.rx_rate)).right_aligned()),
@@ -1002,13 +1010,14 @@ fn draw_procs(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, rules:
             Constraint::Length(8),
             Constraint::Length(10),
             Constraint::Fill(1),
+            Constraint::Length(14),
             Constraint::Length(6),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(10),
         ],
     )
-    .header(header_row(&["Process", "PID", "User", "Exe", "Flows", "↑", "↓", "Total"]));
+    .header(header_row(&["Process", "PID", "User", "Exe", "Limit", "Flows", "↑", "↓", "Total"]));
     render_table(f, app, table, &ids, area);
 }
 

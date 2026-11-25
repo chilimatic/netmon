@@ -347,6 +347,8 @@ pub enum Action {
     ScanDevices,
     /// Block the name of the selected DNS log entry.
     BlockDnsName,
+    /// Next bandwidth limit of the selected process's exe (off, 1, 5, 20 MB/s).
+    CycleLimit,
     /// Open the profile picker (the client lists the profiles).
     PickProfile,
     /// Set the display filter of the capture; empty clears it.
@@ -571,6 +573,7 @@ impl App {
             Key::Char('B') if self.tab == Tab::Connections => return Some(Action::ToggleBlockPort),
             Key::Char('b') if self.tab == Tab::Processes => return Some(Action::ToggleBlockProcess),
             Key::Char('Q') if self.tab == Tab::Processes => return Some(Action::ToggleQuicProcess),
+            Key::Char('L') if self.tab == Tab::Processes => return Some(Action::CycleLimit),
             Key::Char('d') if self.tab == Tab::Rules => return Some(Action::RemoveRule),
             Key::Char('t') if self.tab == Tab::Rules => return Some(Action::CycleRuleTimer),
             Key::Char('P') if self.tab == Tab::Rules => return Some(Action::PickProfile),
