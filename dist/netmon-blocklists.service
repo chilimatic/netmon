@@ -11,13 +11,14 @@ Type=oneshot
 ExecStart=/usr/local/bin/netmon-blocklist-update
 # "+": outside the sandbox below; "-": netmond may not run.
 ExecStartPost=-+/usr/bin/systemctl reload netmond
-# It only downloads and replaces list files. The lists must be under
-# /etc/netmon (for example /etc/netmon/lists); other places need a
-# drop-in with ReadWritePaths.
+# It only downloads and replaces list files in /etc/netmon/lists; it cannot
+# write the rules file. Lists in other places need a drop-in with
+# ReadWritePaths. Without capabilities, root can write only files and
+# directories that belong to root.
 CapabilityBoundingSet=
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/etc/netmon
+ReadWritePaths=-/etc/netmon/lists
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

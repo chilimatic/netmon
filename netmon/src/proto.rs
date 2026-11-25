@@ -26,7 +26,14 @@ pub const MAX_REQUEST_LINE: u64 = 64 * 1024;
 /// One line from a UI to the daemon. The first must be `Hello`.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ToDaemon {
-    Hello { version: u32 },
+    /// `light`: the client reads only questions and messages (the
+    /// notifier): its snapshots have no flows, and it gets no packets and
+    /// no DNS log.
+    Hello {
+        version: u32,
+        #[serde(default)]
+        light: bool,
+    },
     Request(Request),
 }
 
@@ -56,6 +63,20 @@ pub enum ToClient {
     /// New DNS log entries, oldest first. A new client first gets the
     /// entries the monitor keeps.
     Dns(Vec<crate::dnslog::DnsEntry>),
+}
+
+impl Snapshot {
+    /// The part a light client reads: the questions.
+    pub fn light(&self) -> Snapshot {
+        Snapshot {
+            collector: Collector::new(1),
+            names: Names::default(),
+            rules: Rules::default(),
+            questions: self.questions.clone(),
+            capture: None,
+            devices: Vec::new(),
+        }
+    }
 }
 
 /// One JSON line with its newline.

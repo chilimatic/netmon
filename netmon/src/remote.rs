@@ -29,6 +29,11 @@ pub(crate) struct Welcome {
 
 impl Remote {
     pub(crate) fn connect(path: &Path) -> anyhow::Result<(Self, Welcome)> {
+        Self::connect_as(path, false)
+    }
+
+    /// `light`: see ToDaemon::Hello (the notifier).
+    pub(crate) fn connect_as(path: &Path, light: bool) -> anyhow::Result<(Self, Welcome)> {
         let stream = UnixStream::connect(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(
                 "connect {}: permission denied; add your user to group netmon (then log in again), \
@@ -43,7 +48,7 @@ impl Remote {
             _ => anyhow::Error::new(e).context(format!("connect {}", path.display())),
         })?;
         let mut remote = Remote { rx: reader(stream.try_clone()?), stream };
-        remote.send_line(&ToDaemon::Hello { version: proto::VERSION })?;
+        remote.send_line(&ToDaemon::Hello { version: proto::VERSION, light })?;
         let (interval, warnings) = match remote.recv(HANDSHAKE)? {
             ToClient::Hello { version, interval_ms, warnings } if version == proto::VERSION => {
                 (Duration::from_millis(interval_ms), warnings)

@@ -585,7 +585,8 @@ url = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
 
 `netmon-blocklist-update` downloads every list with a `url` in the rules
 file and in the profiles, over https only, also after a redirect. It runs
-as root, like the GeoIP update. It checks each download with the list parser
+as root, like the GeoIP update, but without capabilities, and it can
+write only `/etc/netmon/lists`. It checks each download with the list parser
 and replaces the old file only if the download holds at least one name.
 A systemd timer runs it every Sunday, then runs
 `systemctl reload netmond`. Install it from the repository directory:

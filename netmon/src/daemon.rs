@@ -167,7 +167,7 @@ impl Outbox {
 }
 
 enum Incoming {
-    Joined { id: u64, out: Arc<Outbox> },
+    Joined { id: u64, out: Arc<Outbox>, light: bool },
     Request { id: u64, req: Request },
     Left(u64),
 }
@@ -292,7 +292,7 @@ fn restart_job(list: &str, unit: &str) -> bool {
 }
 
 fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> anyhow::Result<()> {
-    let mut clients: HashMap<u64, Arc<Outbox>> = HashMap::new();
+    let mut clients: HashMap<u64, Client> = HashMap::new();
     while !STOP.load(Ordering::Relaxed) {
         if HUP.swap(false, Ordering::Relaxed) {
             let msg = engine.mon.reload_blocklists();
@@ -305,19 +305,21 @@ fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> a
         let mut changed = false;
         for _ in 0..REQUEST_BATCH {
             match next {
-                Ok(Incoming::Joined { id, out }) => {
+                Ok(Incoming::Joined { id, out, light }) => {
                     let hello = ToClient::Hello {
                         version: proto::VERSION,
                         interval_ms: engine.interval().as_millis() as u64,
                         warnings: warnings.to_vec(),
                     };
                     out.push(proto::line(&hello).into(), false);
-                    out.push(proto::line(&engine.snapshot()).into(), true);
-                    if !engine.mon.dns_log.is_empty() {
+                    let snap = engine.mon.snapshot();
+                    let snap = if light { snap.light() } else { snap };
+                    out.push(proto::line(&ToClient::Snapshot(Box::new(snap))).into(), true);
+                    if !light && !engine.mon.dns_log.is_empty() {
                         let backlog = ToClient::Dns(engine.mon.dns_log.iter().cloned().collect());
                         out.push(proto::line(&backlog).into(), false);
                     }
-                    clients.insert(id, out);
+                    clients.insert(id, Client { out, light });
                 }
                 Ok(Incoming::Request { id, req }) => {
                     changed = true;
@@ -327,8 +329,8 @@ fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> a
                     }
                 }
                 Ok(Incoming::Left(id)) => {
-                    if let Some(out) = clients.remove(&id) {
-                        out.close();
+                    if let Some(c) = clients.remove(&id) {
+                        c.out.close();
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => break,
@@ -358,29 +360,46 @@ fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> a
             engine.mon.prof.add("send to clients (JSON)", t);
         }
     }
-    for out in clients.values() {
-        out.close();
+    for c in clients.values() {
+        c.out.close();
     }
     Ok(())
 }
 
+/// A connected UI.
+struct Client {
+    out: Arc<Outbox>,
+    /// The notifier: questions and messages only.
+    light: bool,
+}
+
 /// Sends to one client or all. Drops clients that are gone or too far
 /// behind.
-fn send(clients: &mut HashMap<u64, Arc<Outbox>>, to: Option<u64>, msg: &ToClient) {
+fn send(clients: &mut HashMap<u64, Client>, to: Option<u64>, msg: &ToClient) {
     if clients.is_empty() {
         return;
     }
-    let line: Arc<str> = proto::line(msg).into();
     let snapshot = matches!(msg, ToClient::Snapshot(_));
-    clients.retain(|id, out| {
+    // A light client gets no packets and no DNS log, and a snapshot with
+    // only the questions. Each line is made once, and only if needed.
+    let mut full: Option<Arc<str>> = None;
+    let mut light: Option<Arc<str>> = None;
+    clients.retain(|id, c| {
         if to.is_some_and(|t| t != *id) {
             return true;
         }
-        if out.push(line.clone(), snapshot) {
+        let line = match (c.light, msg) {
+            (true, ToClient::Packets(_) | ToClient::Dns(_)) => return true,
+            (true, ToClient::Snapshot(s)) => {
+                light.get_or_insert_with(|| proto::line(&ToClient::Snapshot(Box::new(s.light()))).into()).clone()
+            }
+            _ => full.get_or_insert_with(|| proto::line(msg).into()).clone(),
+        };
+        if c.out.push(line, snapshot) {
             return true;
         }
         eprintln!("netmond: client {id} gone or too slow, dropped");
-        out.close();
+        c.out.close();
         false
     });
 }
@@ -493,22 +512,22 @@ fn client(stream: UnixStream, id: u64, gid: Option<u32>, tx: &SyncSender<Incomin
 fn session(stream: UnixStream, id: u64, tx: &SyncSender<Incoming>) -> anyhow::Result<()> {
     let mut lines = BufReader::new(stream.try_clone()?);
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
-    match read_request(&mut lines)? {
-        Some(ToDaemon::Hello { version }) if version == proto::VERSION => {}
-        Some(ToDaemon::Hello { version }) => {
+    let light = match read_request(&mut lines)? {
+        Some(ToDaemon::Hello { version, light }) if version == proto::VERSION => light,
+        Some(ToDaemon::Hello { version, .. }) => {
             let why = format!("protocol {version} not supported, netmond speaks {}", proto::VERSION);
             let _ = (&stream).write_all(proto::line(&ToClient::Error(why.clone())).as_bytes());
             bail!(why);
         }
         _ => bail!("no hello"),
-    }
+    };
     stream.set_read_timeout(None)?;
     let out = Arc::new(Outbox::default());
     let writer = stream.try_clone()?;
     writer.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let queue = out.clone();
     std::thread::spawn(move || write_lines(writer, &queue));
-    tx.send(Incoming::Joined { id, out })?;
+    tx.send(Incoming::Joined { id, out, light })?;
     while let Some(msg) = read_request(&mut lines)? {
         match msg {
             ToDaemon::Request(req) => tx.send(Incoming::Request { id, req })?,
@@ -626,6 +645,41 @@ mod tests {
     }
 
     #[test]
+    fn a_light_client_gets_questions_only() {
+        let mut clients = HashMap::new();
+        clients.insert(1, Client { out: Arc::new(Outbox::default()), light: false });
+        clients.insert(2, Client { out: Arc::new(Outbox::default()), light: true });
+        let mut snap = crate::proto::Snapshot {
+            collector: crate::collector::Collector::new(1),
+            names: Default::default(),
+            rules: Default::default(),
+            questions: Vec::new(),
+            capture: None,
+            devices: Vec::new(),
+        };
+        snap.rules.default = crate::rules::Action::Deny;
+        send(&mut clients, None, &ToClient::Snapshot(Box::new(snap)));
+        send(&mut clients, None, &ToClient::Packets(Vec::new()));
+        send(&mut clients, None, &ToClient::Status("s".into()));
+        let lines = |id| {
+            let c: &Client = &clients[&id];
+            std::iter::from_fn(|| {
+                let st = c.out.state.lock().unwrap();
+                let empty = st.lines.is_empty();
+                drop(st);
+                if empty { None } else { c.out.pop() }
+            })
+            .collect::<Vec<_>>()
+        };
+        let full = lines(1);
+        assert_eq!(full.len(), 3);
+        assert!(full[0].contains("\"default\":\"Deny\""), "{}", full[0]);
+        let light = lines(2);
+        assert_eq!(light.len(), 2, "no packets: {light:?}");
+        assert!(light[0].contains("\"default\":\"Allow\"") && light[1].contains("Status"), "{light:?}");
+    }
+
+    #[test]
     fn outbox_keeps_one_snapshot_and_limits_the_rest() {
         let out = Outbox::default();
         assert!(out.push("s1".into(), true));
@@ -648,10 +702,10 @@ mod tests {
         let (a, b) = UnixStream::pair().unwrap();
         let mut r = BufReader::new(b);
         let mut w = &a;
-        w.write_all(proto::line(&ToDaemon::Hello { version: 1 }).as_bytes()).unwrap();
+        w.write_all(b"{\"Hello\":{\"version\":1}}\n").unwrap();
         w.write_all(b"{\"Request\":\"SaveRules\"}\n").unwrap();
         w.write_all(b"not json\n").unwrap();
-        assert_eq!(read_request(&mut r).unwrap(), Some(ToDaemon::Hello { version: 1 }));
+        assert_eq!(read_request(&mut r).unwrap(), Some(ToDaemon::Hello { version: 1, light: false }), "light is optional");
         assert_eq!(read_request(&mut r).unwrap(), Some(ToDaemon::Request(Request::SaveRules)));
         assert!(read_request(&mut r).is_err(), "malformed");
         let long = vec![b'x'; proto::MAX_REQUEST_LINE as usize + 10];

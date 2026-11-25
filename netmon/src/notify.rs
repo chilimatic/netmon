@@ -78,7 +78,7 @@ pub fn run() -> anyhow::Result<()> {
         .context("run notify-send (install libnotify)")?;
     let mut last_error: Option<String> = None;
     loop {
-        match Remote::connect(&args.socket) {
+        match Remote::connect_as(&args.socket, true) {
             Ok((remote, welcome)) => {
                 eprintln!("netmon-notify: connected to {}", args.socket.display());
                 let e = serve(remote, welcome.snapshot.questions, !args.no_listeners, !args.no_alerts);
