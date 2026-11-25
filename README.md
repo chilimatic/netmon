@@ -83,23 +83,77 @@ example "block this address".
 Screenshots of a real host. Addresses, MAC addresses, domain names,
 container names and the host name are replaced with made-up values.
 
-![Connections tab](docs/screenshots/01-connections.png)
+### Connections
 
-![DNS log in the Log tab](docs/screenshots/08-dns-log.png)
+Every connection with its process, addresses, hostname, country and network owner, interface, state and rate.
 
-![Devices tab](docs/screenshots/10-devices.png)
+![Connections](docs/screenshots/01-connections.png)
 
-The other tabs:
+### Processes
 
-- [Processes](docs/screenshots/02-processes.png)
-- [Interfaces](docs/screenshots/03-interfaces.png)
-- [Capture](docs/screenshots/04-capture.png)
-- [Rules](docs/screenshots/05-rules.png)
-- [Graph](docs/screenshots/06-graph.png)
-- [Hosts](docs/screenshots/07-hosts.png)
-- [Connection log](docs/screenshots/08-log.png)
-- [Usage per program](docs/screenshots/09-usage.png) and
-  [per destination](docs/screenshots/09-usage-destinations.png)
+Traffic per process, with the exe, the user and the bandwidth limit.
+
+![Processes](docs/screenshots/02-processes.png)
+
+### Interfaces
+
+Traffic per interface, with a graph of the selected one.
+
+![Interfaces](docs/screenshots/03-interfaces.png)
+
+### Capture
+
+Packets of a process, a connection or an interface, with a display filter.
+
+![Capture](docs/screenshots/04-capture.png)
+
+### Rules
+
+The rule table in match order, with hits and end times.
+
+![Rules](docs/screenshots/05-rules.png)
+
+### Graph
+
+Processes and the hosts they talk to, with the traffic between them.
+
+![Graph](docs/screenshots/06-graph.png)
+
+### Hosts
+
+Blocked hostnames and block lists.
+
+![Hosts](docs/screenshots/07-hosts.png)
+
+### Connection log
+
+New connections and denied ones from the connection log.
+
+![Connection log](docs/screenshots/08-log.png)
+
+### DNS log
+
+Every DNS answer with the program that asked (`d` in the Log tab).
+
+![DNS log](docs/screenshots/08-dns-log.png)
+
+### Usage per program
+
+Traffic per program for today, yesterday, 7 and 30 days, with a chart per day.
+
+![Usage per program](docs/screenshots/09-usage.png)
+
+### Usage per destination
+
+The same per destination (`d` in the Usage tab).
+
+![Usage per destination](docs/screenshots/09-usage-destinations.png)
+
+### Devices
+
+Devices on the local network, with maker, name and open ports.
+
+![Devices](docs/screenshots/10-devices.png)
 
 ## Network diagram
 
