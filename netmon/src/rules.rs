@@ -541,6 +541,20 @@ impl Rules {
         out
     }
 
+    /// Changes when `sni_entries` would change: the host patterns, and each
+    /// list's id and name set (a reload makes a new set).
+    pub fn sni_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for x in &self.hosts {
+            x.pattern.hash(&mut h);
+        }
+        for l in &self.blocklists {
+            (l.id, std::sync::Arc::as_ptr(&l.names) as usize, l.names.len()).hash(&mut h);
+        }
+        h.finish()
+    }
+
     pub fn blocklist_names(&self) -> usize {
         self.blocklists.iter().map(|l| l.count).sum()
     }

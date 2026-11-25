@@ -69,10 +69,18 @@ impl<K: Kernel> Monitor<K> {
 
     /// Writes the blocked server names to the kernel, which drops a TLS
     /// ClientHello that names one. Returns an error message.
+    /// Builds the table only when host patterns or lists changed: up to
+    /// two million names take time on the main loop.
     pub(crate) fn sync_sni(&mut self) -> Option<String> {
+        let sig = self.rules.sni_signature();
+        if self.sni_sig == Some(sig) {
+            return None;
+        }
         match self.probe.set_sni_blocks(&self.rules.sni_entries()) {
-            Ok(0) => None,
-            Ok(n) => Some(format!("{n} blocked server names not in the kernel: map full")),
+            Ok(n) => {
+                self.sni_sig = Some(sig);
+                (n > 0).then(|| format!("{n} blocked server names not in the kernel: map full"))
+            }
             Err(e) => Some(format!("server name blocks not set: {e:#}")),
         }
     }

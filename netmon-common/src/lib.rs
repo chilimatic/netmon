@@ -131,8 +131,10 @@ pub const CFG_LEN: u32 = 8;
 /// SNI_BLOCKS flags: the name itself is blocked, and the names below it.
 pub const SNI_SELF: u8 = 1;
 pub const SNI_BELOW: u8 = 2;
-/// Names SNI_BLOCKS holds at most (host blocks and block lists).
-pub const MAX_SNI_NAMES: u32 = 2_100_000;
+/// Names SNI_BLOCKS holds at most (host blocks and block lists). A power of
+/// two: the kernel rounds the bucket count up to one, and 2^21 + 1 would
+/// double the memory of the table.
+pub const MAX_SNI_NAMES: u32 = 1 << 21;
 /// Longest server name the kernel reads.
 pub const MAX_SNI_LEN: usize = 255;
 
@@ -298,7 +300,89 @@ pub fn fib_forwarded(ret: i64) -> bool {
 /// (`decided` is ask): a new rule or block always wins over "once".
 #[inline(always)]
 pub fn keep_answer(decided: u8, prev_action: u8, prev_answered: u8) -> (u8, u8) {
-    if prev_answered != 0 && decided == ACTION_ASK { (prev_action, 1) } else { (decided, 0) }
+    if prev_answered == ANSWER_STICKY {
+        (prev_action, ANSWER_STICKY)
+    } else if prev_answered != 0 && decided == ACTION_ASK {
+        (prev_action, 1)
+    } else {
+        (decided, 0)
+    }
+}
+
+/// ConnState::answered of a connection denied for its TLS server name: the
+/// deny stays for the life of the connection, also after rule changes.
+pub const ANSWER_STICKY: u8 = 2;
+
+/// Where the server name of a TLS ClientHello is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SniWalk {
+    /// No ClientHello, no server name, or the name is cut by the segment.
+    None,
+    /// The name bytes: offset in the packet and length.
+    Name { off: u32, len: u32 },
+    /// The extensions go on in the next segment: offset of the next
+    /// extension header there, and the extension bytes left.
+    Pending { skip: u32, left: u32 },
+}
+
+/// TLS extensions looked at for the server name at most. Browsers send
+/// about 20, GREASE included.
+pub const MAX_EXTENSIONS: u32 = 32;
+
+/// Finds the server name in a TLS ClientHello whose payload starts at
+/// `off` in a packet of `len` bytes. `pending` is where an earlier segment
+/// of the connection left the walk; a ClientHello start ignores it.
+#[inline(always)]
+pub fn sni_walk<P: PacketSource>(pkt: &P, off: u32, len: u32, pending: Option<(u32, u32)>) -> SniWalk {
+    let Some(b) = pkt.read::<6>(off as usize) else { return SniWalk::None };
+    let first = b[0] == 0x16 && b[1] == 0x03 && b[5] == 0x01;
+    let (mut p, all_end) = if first {
+        // Record header (5), handshake header (4), version (2), random (32).
+        let mut p = off + 43;
+        let Some([sid]) = pkt.read::<1>(p as usize) else { return SniWalk::None };
+        p += 1 + sid as u32;
+        let Some(cs) = pkt.read::<2>(p as usize) else { return SniWalk::None };
+        p += 2 + u16::from_be_bytes(cs) as u32;
+        let Some([cm]) = pkt.read::<1>(p as usize) else { return SniWalk::None };
+        p += 1 + cm as u32;
+        let Some(el) = pkt.read::<2>(p as usize) else { return SniWalk::None };
+        p += 2;
+        (p, p + u16::from_be_bytes(el) as u32)
+    } else if let Some((skip, left)) = pending {
+        let p = off + skip;
+        (p, p + left)
+    } else {
+        return SniWalk::None;
+    };
+    let mut end = all_end;
+    if end > len {
+        end = len;
+    }
+    let mut name = 0u32;
+    for _ in 0..MAX_EXTENSIONS {
+        if p + 4 > end {
+            break;
+        }
+        let Some(e) = pkt.read::<4>(p as usize) else { break };
+        if e[0] == 0 && e[1] == 0 {
+            name = p + 4;
+            break;
+        }
+        p += 4 + u16::from_be_bytes([e[2], e[3]]) as u32;
+    }
+    if name == 0 {
+        // The next extension header starts in the next segment.
+        if first && all_end > len && p >= len && p < all_end {
+            return SniWalk::Pending { skip: p - len, left: all_end - p };
+        }
+        return SniWalk::None;
+    }
+    // server_name_list: list length (2), name type (1, 0 = host), length (2).
+    let Some(h) = pkt.read::<5>(name as usize) else { return SniWalk::None };
+    if h[2] != 0 {
+        return SniWalk::None;
+    }
+    SniWalk::Name { off: name + 5, len: u16::from_be_bytes([h[3], h[4]]) as u32 }
 }
 
 /// DHCP and DHCPv6 (client and server ports). Never blocked, so a host
@@ -873,7 +957,80 @@ impl FlowKey {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+    use std::{vec, vec::Vec};
     use super::*;
+
+    /// A TLS ClientHello: padding extension of `pad` bytes, then the server
+    /// name `name`, then one more extension. Returns the bytes and the
+    /// offset of the name.
+    fn client_hello(pad: usize, name: &[u8]) -> (Vec<u8>, usize) {
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&[0x0a, 0x0a, 0, 0]); // GREASE, empty
+        exts.extend_from_slice(&[0, 0x15]);
+        exts.extend_from_slice(&(pad as u16).to_be_bytes());
+        exts.extend(std::iter::repeat_n(0u8, pad));
+        exts.extend_from_slice(&[0, 0]);
+        exts.extend_from_slice(&((name.len() + 5) as u16).to_be_bytes());
+        exts.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+        exts.push(0);
+        exts.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        let name_in_exts = exts.len();
+        exts.extend_from_slice(name);
+        exts.extend_from_slice(&[0, 0x2b, 0, 3, 2, 3, 4]);
+        let mut body = vec![3, 3];
+        body.extend_from_slice(&[7; 32]);
+        body.push(32);
+        body.extend_from_slice(&[9; 32]);
+        body.extend_from_slice(&[0, 4, 0x13, 1, 0x13, 2, 1, 0]);
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        let name_in_body = body.len() + name_in_exts;
+        body.extend_from_slice(&exts);
+        let mut rec = vec![0x16, 3, 1];
+        rec.extend_from_slice(&((body.len() + 4) as u16).to_be_bytes());
+        rec.push(1);
+        rec.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        rec.extend_from_slice(&body);
+        (rec, 9 + name_in_body)
+    }
+
+    #[test]
+    fn sni_walk_finds_the_name_also_in_the_next_segment() {
+        let name = b"ads.example.com";
+        let (hello, at) = client_hello(100, name);
+        // A 20-byte header in front of the payload, as in a packet.
+        let mut pkt = vec![0u8; 20];
+        pkt.extend_from_slice(&hello);
+        let got = sni_walk(&pkt.as_slice(), 20, pkt.len() as u32, None);
+        assert_eq!(got, SniWalk::Name { off: (20 + at) as u32, len: name.len() as u32 });
+        assert_eq!(&pkt[20 + at..20 + at + name.len()], name);
+        // Split right after the padding: the first segment says where the
+        // walk goes on, the second finds the name.
+        let cut = at - 9;
+        let first = &pkt[..20 + cut];
+        let SniWalk::Pending { skip, left } = sni_walk(&first, 20, first.len() as u32, None) else { panic!("pending") };
+        assert_eq!(skip, 0);
+        let mut second = vec![0u8; 20];
+        second.extend_from_slice(&hello[cut..]);
+        assert_eq!(
+            sni_walk(&second.as_slice(), 20, second.len() as u32, Some((skip, left))),
+            SniWalk::Name { off: 20 + 9, len: name.len() as u32 }
+        );
+        // A border inside an extension header: no pending, the name passes.
+        let first = &pkt[..20 + cut + 2];
+        assert_eq!(sni_walk(&first, 20, first.len() as u32, None), SniWalk::None);
+        // No ClientHello and nothing pending; every cut of the packet is safe.
+        assert_eq!(sni_walk(&second.as_slice(), 20, second.len() as u32, None), SniWalk::None);
+        for n in 0..pkt.len() {
+            let _ = sni_walk(&&pkt[..n], 20, n as u32, None);
+        }
+    }
+
+    #[test]
+    fn a_server_name_deny_survives_rule_changes() {
+        assert_eq!(keep_answer(ACTION_ALLOW, ACTION_DENY, ANSWER_STICKY), (ACTION_DENY, ANSWER_STICKY));
+        assert_eq!(keep_answer(ACTION_ALLOW, ACTION_DENY, 1), (ACTION_ALLOW, 0), "a normal answer still ends");
+    }
 
     #[test]
     fn token_bucket_passes_the_rate_and_drops_the_rest() {
@@ -1222,4 +1379,5 @@ mod tests {
         assert!(!is_loopback(6, &fe80));
     }
 }
+
 

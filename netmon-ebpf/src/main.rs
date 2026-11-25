@@ -16,7 +16,7 @@ use aya_ebpf::{
 };
 use netmon_common::{
     ACTION_ALLOW, ACTION_ASK, ACTION_DENY, CFG_LIMITS, Limit, take_tokens, CFG_SNI, FNV_OFFSET, MAX_SNI_LEN,
-    MAX_SNI_NAMES, SNI_BELOW, SNI_SELF, sni_step, NAME_DNS_TCP, ASK_RING_BYTES, AskEvent, DENY_RING_BYTES, DenyEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
+    MAX_SNI_NAMES, SNI_BELOW, SNI_SELF, sni_step, NAME_DNS_TCP, ANSWER_STICKY, SniWalk, sni_walk, ASK_RING_BYTES, AskEvent, DENY_RING_BYTES, DenyEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
@@ -177,10 +177,6 @@ fn rules_active() -> bool {
     count != 0 || d == ACTION_DENY as u32 || d == ACTION_ASK as u32 || cfg(CFG_LIMITS) != 0 || cfg(CFG_SNI) != 0
 }
 
-/// TLS extensions looked at for the server name at most. Browsers send
-/// about 20, GREASE included.
-const MAX_EXTENSIONS: u32 = 32;
-
 /// State of the walk over the server name, from its last byte to the first.
 #[repr(C)]
 struct SniScan {
@@ -214,63 +210,24 @@ extern "C" fn sni_byte(i: u64, ctx: *mut c_void) -> i64 {
 }
 
 /// Does the TLS ClientHello at `off` name a blocked server? The walk over
-/// the extensions goes on in the next segment if the first one ends
-/// between two extensions before the name. A name that the segment
-/// border cuts passes, and userspace blocks the addresses of that name.
+/// the extensions (`sni_walk`) goes on in the next segment if the first
+/// one ends between two extensions before the name. A name that the
+/// segment border cuts passes.
 #[inline(never)]
 fn sni_blocked(ctx: &TcContext, key: &FlowKey, off: u32) -> bool {
-    let len = ctx.len();
-    let Ok(b) = ctx.load::<[u8; 6]>(off as usize) else { return false };
-    let first = b[0] == 0x16 && b[1] == 0x03 && b[5] == 0x01;
-    let (mut p, all_end) = if first {
-        // Record header (5), handshake header (4), version (2), random (32).
-        let mut p = off + 43;
-        let Ok(sid) = ctx.load::<u8>(p as usize) else { return false };
-        p += 1 + sid as u32;
-        let Ok(cs) = ctx.load::<[u8; 2]>(p as usize) else { return false };
-        p += 2 + u16::from_be_bytes(cs) as u32;
-        let Ok(cm) = ctx.load::<u8>(p as usize) else { return false };
-        p += 1 + cm as u32;
-        let Ok(el) = ctx.load::<[u8; 2]>(p as usize) else { return false };
-        p += 2;
-        (p, p + u16::from_be_bytes(el) as u32)
-    } else {
-        let Some(pend) = (unsafe { SNI_PENDING.get(key) }).copied() else { return false };
+    let pending = unsafe { SNI_PENDING.get(key) }.map(|p| (p.skip, p.left));
+    if pending.is_some() {
         let _ = SNI_PENDING.remove(key);
-        let p = off + pend.skip;
-        (p, p + pend.left)
+    }
+    let (name, n) = match sni_walk(&Skb(ctx), off, ctx.len(), pending) {
+        SniWalk::Name { off, len } => (off, len),
+        SniWalk::Pending { skip, left } => {
+            let _ = SNI_PENDING.insert(key, &SniPending { skip, left }, 0);
+            return false;
+        }
+        SniWalk::None => return false,
     };
-    let mut end = all_end;
-    if end > len {
-        end = len;
-    }
-    let mut name = 0u32;
-    for _ in 0..MAX_EXTENSIONS {
-        if p + 4 > end {
-            break;
-        }
-        let Ok(e) = ctx.load::<[u8; 4]>(p as usize) else { break };
-        if e[0] == 0 && e[1] == 0 {
-            name = p + 4;
-            break;
-        }
-        p += 4 + u16::from_be_bytes([e[2], e[3]]) as u32;
-    }
-    if name == 0 {
-        // The extensions go on in the next segment, and the next header
-        // starts there: remember where.
-        if first && all_end > len && p >= len && p < all_end {
-            let pend = SniPending { skip: p - len, left: all_end - p };
-            let _ = SNI_PENDING.insert(key, &pend, 0);
-        }
-        return false;
-    }
-    // server_name_list: list length (2), name type (1, 0 = host), length (2).
-    let Ok(h) = ctx.load::<[u8; 5]>(name as usize) else { return false };
-    if h[2] != 0 {
-        return false;
-    }
-    let mut n = u16::from_be_bytes([h[3], h[4]]) as u32;
+    let mut n = n;
     if n > MAX_SNI_LEN as u32 {
         n = MAX_SNI_LEN as u32;
     }
@@ -280,8 +237,16 @@ fn sni_blocked(ctx: &TcContext, key: &FlowKey, off: u32) -> bool {
         return false;
     }
     let Some(buf) = SNI_BUF.get_ptr_mut(0) else { return false };
-    let ret = unsafe { bpf_skb_load_bytes(ctx.as_ptr() as *const c_void, name + 5, buf as *mut c_void, n) };
+    let ret = unsafe { bpf_skb_load_bytes(ctx.as_ptr() as *const c_void, name, buf as *mut c_void, n) };
     if ret != 0 {
+        return false;
+    }
+    // A final dot (`name.`) is the same name.
+    let mut n = n;
+    if unsafe { (*buf)[((n - 1) & 0xff) as usize] } == b'.' {
+        n -= 1;
+    }
+    if n == 0 {
         return false;
     }
     let mut scan = SniScan { len: n, hit: 0, h: FNV_OFFSET };
@@ -301,7 +266,8 @@ fn sni_deny(key: &FlowKey, tgid: u32) {
     let mut c = ConnKey::default();
     conn_key(key, &mut c);
     let prev = unsafe { CONNS.get(&c) }.map_or(0, |s| s.action);
-    let st = ConnState { generation: cfg(CFG_GEN), dir: DIR_OUT, action: ACTION_DENY, exe_known: 1, answered: 0, tgid };
+    // Sticky: a rule change later must not allow the rest of it.
+    let st = ConnState { generation: cfg(CFG_GEN), dir: DIR_OUT, action: ACTION_DENY, exe_known: 1, answered: ANSWER_STICKY, tgid };
     let _ = CONNS.insert(&c, &st, 0);
     if prev != ACTION_DENY {
         deny_event(&c, tgid);
