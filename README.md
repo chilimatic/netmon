@@ -470,9 +470,19 @@ when data changes.
 
 ### Hosts tab
 
-Blocked hostnames. The kernel sees only addresses, so netmon learns the
-addresses of each name from the DNS answers and the TLS server names that
-it reads, and blocks those addresses in the kernel (`HOST_BLOCKS`).
+Blocked hostnames. netmon blocks them in two ways:
+
+1. The kernel checks the server name in each TLS ClientHello (see below).
+   This applies to host patterns and to block lists.
+2. For host patterns only, netmon also blocks the addresses of the name
+   (`HOST_BLOCKS`). It learns them only from the answers of a trusted
+   resolver: a nameserver of `/etc/resolv.conf`, or a local resolver on
+   loopback. This also blocks plain HTTP and QUIC to those addresses.
+
+Answers of other DNS servers and server names from a ClientHello never
+block an address. Any local program can ask its own DNS server or send a
+ClientHello with any name, and it could then block any address for all
+users.
 
 - `ads.example.com` blocks that name only. `*.example.com` blocks
   `example.com` and every name below it.
@@ -489,6 +499,11 @@ it reads, and blocks those addresses in the kernel (`HOST_BLOCKS`).
   connection that starts right after the DNS answer can pass in that time.
 - An address leaves the block 1 hour after the last answer for the name,
   like the names in the UI.
+- An address block also stops other sites on the same address (a shared
+  CDN or front-end address). Use host patterns for names that have their
+  own addresses, and block lists for the rest.
+- netmond keeps at most 64 addresses per name and 8192 in total. When the
+  total is reached, the oldest address leaves the block.
 
 The kernel also checks the server name (SNI) in each outbound TLS
 ClientHello against the host blocks and block lists (`SNI_BLOCKS`). A
@@ -508,9 +523,8 @@ address that serves many names.
 - The kernel stores a 64-bit hash of each name (FNV-1a over the name from
   its end), not the name. It checks the name and each parent domain with
   one lookup per dot.
-- The userspace still learns the address of the blocked name from the
-  ClientHello. That address is then blocked for 1 hour, also for other
-  names on it.
+- Block list names are blocked only by this check. Plain HTTP and QUIC to
+  a listed name pass (`Q` turns QUIC off per program).
 
 #### Host block lists
 
@@ -542,9 +556,12 @@ Download them yourself, for example with a systemd timer, then run
 - Formats, one entry per line: hosts file (`0.0.0.0 ads.example.com`),
   adblock (`||ads.example.com^`), or one name per line. `#` starts a
   comment. Lines that start with `!` or `[` are skipped.
-- The Hosts tab shows one row per list: the number of names, the
-  addresses learned for them and the hits. A list that cannot be read
-  shows its error in yellow. The other rules still load.
+- A list blocks server names in TLS ClientHellos (see above), not
+  addresses: one listed ad name on a shared address must not stop the
+  other sites there. Plain HTTP and QUIC to a listed name pass.
+- The Hosts tab shows one row per list with the number of names. A list
+  that cannot be read shows its error in yellow. The other rules still
+  load.
 - `r` in the Hosts tab and `systemctl reload netmond` (SIGHUP) read every
   list again. The rules stay.
 - `d` removes the selected list from the running rules. `s` saves the

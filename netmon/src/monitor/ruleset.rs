@@ -99,19 +99,21 @@ impl<K: Kernel> Monitor<K> {
         if !self.rules.has_host_blocks() && self.blocked.is_empty() && self.kernel_blocked.is_empty() {
             return None;
         }
+        // Names from trusted answers that a host pattern blocks (also names
+        // learned before the pattern was added).
+        let found: Vec<(std::net::IpAddr, String, Instant)> = self
+            .trusted_hosts
+            .iter(now)
+            .filter(|(_, name, _)| self.rules.host_pattern_blocked(name))
+            .map(|(ip, name, seen)| (ip, name.to_string(), seen))
+            .collect();
+        for (ip, name, seen) in found {
+            if !self.blocked.contains_key(&ip) {
+                self.block_address(ip, name, seen);
+            }
+        }
         let rules = &self.rules;
-        for (ip, name, seen) in self.hosts.iter(now) {
-            if rules.host_blocked(name) {
-                self.blocked.entry(ip).or_insert_with(|| (name.to_string(), seen));
-            }
-        }
-        for (k, name) in &self.sni {
-            if rules.host_blocked(name) {
-                let ip = procmap::normalize(collector::addr(k.family, &k.remote_addr, 0)).ip();
-                self.blocked.insert(ip, (name.clone(), now));
-            }
-        }
-        self.blocked.retain(|_, (name, seen)| rules.host_blocked(name) && now.duration_since(*seen) < names::KEEP);
+        self.blocked.retain(|_, (name, seen)| rules.host_pattern_blocked(name) && now.duration_since(*seen) < names::KEEP);
         let want: HashSet<std::net::IpAddr> = self.blocked.keys().copied().collect();
         let add: Vec<_> = want.difference(&self.kernel_blocked).copied().collect();
         let remove: Vec<_> = self.kernel_blocked.difference(&want).copied().collect();

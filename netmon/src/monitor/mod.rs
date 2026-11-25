@@ -204,6 +204,12 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) blocked: HashMap<std::net::IpAddr, (String, Instant)>,
     /// Addresses as last written to HOST_BLOCKS.
     pub(crate) kernel_blocked: HashSet<std::net::IpAddr>,
+    /// Names from answers of a trusted resolver (resolv.conf or a local
+    /// stub): the only source of address blocks.
+    pub(crate) trusted_hosts: names::HostNames,
+    /// TCP DNS connections whose first segment was read: later segments
+    /// are not the start of a message.
+    pub(crate) tcp_dns_seen: HashSet<netmon_common::FlowKey>,
 }
 
 impl Monitor {
@@ -285,7 +291,7 @@ impl<K: Kernel> Monitor<K> {
         let mut collector = Collector::new(args.expire_ticks());
         collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), base_rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new(), conn_log: None, usage: None, discovery: None, devices: Vec::new(), dns_log: Default::default(), new_dns: Vec::new(), dns_pending: Vec::new(), alerts: Default::default(), new_alerts: Vec::new(), log_done: HashSet::new(), log_pending: HashSet::new() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), base_rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), trusted_hosts: Default::default(), tcp_dns_seen: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new(), conn_log: None, usage: None, discovery: None, devices: Vec::new(), dns_log: Default::default(), new_dns: Vec::new(), dns_pending: Vec::new(), alerts: Default::default(), new_alerts: Vec::new(), log_done: HashSet::new(), log_pending: HashSet::new() };
         Ok((mon, errors))
     }
 

@@ -478,6 +478,12 @@ impl Rules {
         self.hosts.iter().any(|h| h.matches(name)) || self.blocklists.iter().any(|l| l.matches(name))
     }
 
+    /// Does a host pattern (not a block list) block the name? Only these
+    /// block addresses; block lists block server names in the kernel.
+    pub fn host_pattern_blocked(&self, name: &str) -> bool {
+        self.hosts.iter().any(|h| h.matches(name))
+    }
+
     /// Are there host blocks of any kind?
     pub fn has_host_blocks(&self) -> bool {
         !self.hosts.is_empty() || self.blocklists.iter().any(|l| l.count > 0)

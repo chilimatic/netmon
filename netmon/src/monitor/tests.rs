@@ -520,6 +520,9 @@ fn blocked_hostnames_reach_the_kernel_and_leave_it() {
     let (mut m, t0) = monitor();
     m.probe.flows = vec![(key(50001), tx(10))];
     m.tick_at(secs(t0, 1));
+    // The test answers come from 198.51.100.9 (key's remote end). Set after
+    // the first tick, which reads the real resolv.conf.
+    m.guard.resolv = "nameserver 198.51.100.9\n".into();
     // An answer for example.com before the block: the block finds it.
     let mut dns = vec![0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
     dns.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
@@ -565,7 +568,9 @@ fn blocklists_block_names_below_their_entries() {
     m.rules.add_blocklist("/etc/netmon/lists/test.txt", "test", Ok((names, 2))).unwrap();
     m.rules.add_blocklist("/etc/netmon/lists/gone.txt", "", Err("No such file or directory".into())).unwrap();
     assert!(m.rules.has_host_blocks());
-    // An answer for cdn.example.com: below a listed name, so blocked at once.
+    m.guard.resolv = "nameserver 198.51.100.9\n".into();
+    // An answer for cdn.example.com, below a listed name: a list blocks
+    // server names in the kernel, not addresses.
     let mut dns = vec![0, 2, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
     dns.extend_from_slice(b"\x03cdn\x07example\x03com\x00\x00\x01\x00\x01");
     dns.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 5]);
@@ -578,10 +583,10 @@ fn blocklists_block_names_below_their_entries() {
     };
     ev.data[..dns.len()].copy_from_slice(&dns);
     m.probe.names.push_back(ev);
-    assert!(m.poll_names(secs(t0, 1)));
-    let ip: std::net::IpAddr = "203.0.113.5".parse().unwrap();
-    assert_eq!(m.probe.blocked, HashSet::from([ip]));
-    assert_eq!((m.rules.blocklists[0].addrs, m.rules.blocklists[1].addrs), (1, 0));
+    assert!(!m.poll_names(secs(t0, 1)));
+    assert!(m.probe.blocked.is_empty());
+    assert_eq!((m.rules.blocklists[0].addrs, m.rules.blocklists[1].addrs), (0, 0));
+    assert!(m.rules.sni_entries().contains_key(&netmon_common::sni_hash("example.com")), "the kernel gets the name");
     // The names never go to the UI; the counts do.
     let snap = serde_json::to_string(&m.snapshot()).unwrap();
     assert!(!snap.contains("\"example.com\"") && snap.contains("\"count\":1"), "{snap}");
@@ -986,7 +991,7 @@ fn dns_log_names_the_asking_program_and_marks_blocked_names() {
     ev.data[..dns.len()].copy_from_slice(&dns);
     m.probe.names.push_back(ev);
     // Read between ticks (host blocks exist), logged at the next tick.
-    assert!(m.poll_names(secs(t0, 1)));
+    m.poll_names(secs(t0, 1));
     assert!(m.dns_log.is_empty());
     m.tick_at(secs(t0, 2));
     let e = m.dns_log.back().unwrap();
@@ -1046,6 +1051,8 @@ fn host_blocks_reach_the_kernel_server_name_check() {
 #[test]
 fn dns_answers_over_tcp_are_logged() {
     let (mut m, t0) = monitor();
+    // The TCP connection to the server is a flow, as in real traffic.
+    m.probe.flows = vec![(key(53), tx(10))];
     let mut dns = vec![0, 2, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
     dns.extend_from_slice(b"\x03cdn\x07example\x03com\x00\x00\x01\x00\x01");
     dns.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 5]);
@@ -1064,4 +1071,45 @@ fn dns_answers_over_tcp_are_logged() {
     let e = m.dns_log.back().expect("logged");
     assert_eq!((e.name.as_str(), e.answers.clone()), ("cdn.example.com", vec!["203.0.113.5".to_string()]));
     assert_eq!(m.hosts.get("203.0.113.5".parse().unwrap(), secs(t0, 1)), Some("cdn.example.com"), "names flows too");
+    // A later segment of the same connection is not the start of a message.
+    let n = m.dns_log.len();
+    m.probe.names.push_back(ev);
+    m.tick_at(secs(t0, 2));
+    assert_eq!(m.dns_log.len(), n, "only the first segment is parsed");
+}
+
+#[test]
+fn only_trusted_answers_and_host_patterns_block_addresses() {
+    let (mut m, t0) = monitor();
+    m.request(Request::BlockHost { pattern: "*.example.com".into(), comment: String::new() });
+    let answer = |id: u8, last: u8| {
+        let mut dns = vec![0, id, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        dns.extend_from_slice(b"\x03cdn\x07example\x03com\x00\x00\x01\x00\x01");
+        dns.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, last]);
+        let mut ev = netmon_common::NameEvent {
+            key: key(53),
+            len: dns.len() as u16,
+            kind: netmon_common::NAME_DNS,
+            _pad: 0,
+            data: [0; netmon_common::NAME_DATA],
+        };
+        ev.data[..dns.len()].copy_from_slice(&dns);
+        ev
+    };
+    // From a server that is not in resolv.conf: names the flow, blocks nothing.
+    m.guard.resolv = "nameserver 100.95.0.251\n".into();
+    m.probe.names.push_back(answer(1, 5));
+    assert!(!m.poll_names(secs(t0, 1)));
+    assert!(m.probe.blocked.is_empty());
+    assert_eq!(m.hosts.get("203.0.113.5".parse().unwrap(), secs(t0, 1)), Some("cdn.example.com"));
+    // From the resolver: blocked.
+    m.guard.resolv = "nameserver 198.51.100.9\n".into();
+    m.probe.names.push_back(answer(2, 6));
+    assert!(m.poll_names(secs(t0, 2)));
+    assert_eq!(m.probe.blocked, HashSet::from(["203.0.113.6".parse().unwrap()]));
+    // At most MAX_ADDRS_PER_NAME addresses per name.
+    for i in 0..100u8 {
+        m.block_address(std::net::IpAddr::from([10, 0, 0, i]), "cdn.example.com".into(), secs(t0, 3));
+    }
+    assert_eq!(m.blocked.values().filter(|(n, _)| n == "cdn.example.com").count(), 64);
 }

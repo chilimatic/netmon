@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// TCP DNS connections remembered as read at most.
+const MAX_TCP_DNS: usize = 4096;
+/// Blocked addresses at most (HOST_BLOCKS holds 16 384), and per name.
+pub(crate) const MAX_BLOCKED: usize = 8192;
+const MAX_ADDRS_PER_NAME: usize = 64;
+
 impl<K: Kernel> Monitor<K> {
     /// Reads new DNS answers and ClientHellos and names every flow's
     /// remote end. The TLS server name wins: it is what the client asked
@@ -12,6 +18,7 @@ impl<K: Kernel> Monitor<K> {
         // Names of connections that are gone.
         let flows = &self.collector.flows;
         self.sni.retain(|k, _| flows.contains_key(k));
+        self.tcp_dns_seen.retain(|k| flows.contains_key(k));
         self.hello_parts.retain(|k, _| flows.contains_key(k));
         for (k, f) in self.collector.flows.iter_mut() {
             // Dual-stack sockets show IPv4 peers as ::ffff:a.b.c.d.
@@ -26,18 +33,36 @@ impl<K: Kernel> Monitor<K> {
 
     /// Reads new DNS answers and ClientHellos. An address of a blocked
     /// hostname goes to the kernel at once. Returns whether it found one.
+    ///
+    /// Only answers of a trusted resolver (a nameserver of resolv.conf, or
+    /// a local stub on loopback) can block addresses: any local program
+    /// can ask its own DNS server or send a ClientHello with any name.
     pub(crate) fn poll_names(&mut self, now: Instant) -> bool {
         let mut learned: Vec<(std::net::IpAddr, String)> = Vec::new();
-        let (hosts, sni, parts, dns) = (&mut self.hosts, &mut self.sni, &mut self.hello_parts, &mut self.dns_pending);
+        let resolvers = crate::learn::resolvers(&self.guard.resolv);
+        let (hosts, trusted, sni, parts, dns, tcp_seen) = (
+            &mut self.hosts,
+            &mut self.trusted_hosts,
+            &mut self.sni,
+            &mut self.hello_parts,
+            &mut self.dns_pending,
+            &mut self.tcp_dns_seen,
+        );
         let unix = rules::unix_now();
         self.probe.drain_names(NAME_BATCH, |ev| {
             let data = &ev.data[..(ev.len as usize).min(ev.data.len())];
-            // DNS over TCP: the message follows a 2-byte length.
+            // DNS over TCP: the message follows a 2-byte length, in the
+            // first segment of the connection only. A later segment can be
+            // the middle of a long answer.
             let (kind, data) = match ev.kind {
-                netmon_common::NAME_DNS_TCP if data.len() > 2 => (netmon_common::NAME_DNS, &data[2..]),
+                netmon_common::NAME_DNS_TCP if data.len() >= 14 && tcp_seen.len() < MAX_TCP_DNS && tcp_seen.insert(ev.key) => {
+                    (netmon_common::NAME_DNS, &data[2..])
+                }
                 netmon_common::NAME_DNS_TCP => (0, data),
                 k => (k, data),
             };
+            let server = procmap::normalize(collector::addr(ev.key.family, &ev.key.remote_addr, 0)).ip();
+            let from_resolver = server.is_loopback() || resolvers.contains(&server);
             match kind {
                 netmon_common::NAME_DNS => {
                     if let Some(a) = names::dns_answer(data)
@@ -49,7 +74,7 @@ impl<K: Kernel> Monitor<K> {
                                 time: unix,
                                 program: String::new(),
                                 pid: None,
-                                server: procmap::normalize(collector::addr(ev.key.family, &ev.key.remote_addr, 0)).ip(),
+                                server,
                                 name: a.name,
                                 qtype: names::qtype_text(a.qtype),
                                 rcode: names::rcode_text(a.rcode),
@@ -59,13 +84,17 @@ impl<K: Kernel> Monitor<K> {
                         ));
                     }
                     for (ip, name, _ttl) in names::dns_answers(data) {
-                        learned.push((ip, name.clone()));
+                        if from_resolver {
+                            learned.push((ip, name.clone()));
+                            trusted.insert(ip, name.clone(), now);
+                        }
                         hosts.insert(ip, name, now);
                     }
                 }
                 netmon_common::NAME_TLS => match names::client_hello_sni(data) {
+                    // A server name names the flow only: the kernel drops a
+                    // ClientHello with a blocked name itself.
                     Some(name) => {
-                        learned.push((collector::addr(ev.key.family, &ev.key.remote_addr, 0).ip(), name.clone()));
                         sni.insert(ev.key, name);
                     }
                     None if names::record_continues(data) => {
@@ -80,7 +109,6 @@ impl<K: Kernel> Monitor<K> {
                     if let Some(mut hello) = parts.remove(&ev.key) {
                         hello.extend_from_slice(data);
                         if let Some(name) = names::client_hello_sni(&hello) {
-                            learned.push((collector::addr(ev.key.family, &ev.key.remote_addr, 0).ip(), name.clone()));
                             sni.insert(ev.key, name);
                         }
                     }
@@ -90,9 +118,9 @@ impl<K: Kernel> Monitor<K> {
         });
         let mut found = false;
         for (ip, name) in learned {
-            if self.rules.host_blocked(&name) {
+            if self.rules.host_pattern_blocked(&name) {
                 let ip = procmap::normalize(std::net::SocketAddr::new(ip, 0)).ip();
-                found |= self.blocked.insert(ip, (name, now)).is_none();
+                found |= self.block_address(ip, name, now);
             }
         }
         if found {
@@ -121,5 +149,25 @@ impl<K: Kernel> Monitor<K> {
                 self.new_dns.push(e);
             }
         }
+    }
+
+    /// Adds an address of a blocked name. At most MAX_ADDRS_PER_NAME per
+    /// name; when MAX_BLOCKED is reached, the oldest address goes.
+    /// Returns whether the address is new.
+    pub(crate) fn block_address(&mut self, ip: std::net::IpAddr, name: String, now: Instant) -> bool {
+        if let Some(e) = self.blocked.get_mut(&ip) {
+            *e = (name, now);
+            return false;
+        }
+        if self.blocked.values().filter(|(n, _)| *n == name).count() >= MAX_ADDRS_PER_NAME {
+            return false;
+        }
+        if self.blocked.len() >= MAX_BLOCKED
+            && let Some(old) = self.blocked.iter().min_by_key(|(_, (_, seen))| *seen).map(|(ip, _)| *ip)
+        {
+            self.blocked.remove(&old);
+        }
+        self.blocked.insert(ip, (name, now));
+        true
     }
 }
