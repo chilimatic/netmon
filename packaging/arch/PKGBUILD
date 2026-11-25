@@ -42,7 +42,10 @@ prepare() {
 build() {
     cd netmon
     # makepkg exports RUSTFLAGS for the host; the bpf target must not get
-    # them. Only the build path is remapped, so no binary names $srcdir.
+    # them. Only the build path is remapped. makepkg still warns about
+    # $srcdir: the eBPF object in netmond and netmon keeps its source file
+    # paths in its BTF debug info (aya-build builds it without RUSTFLAGS).
+    # They are names only.
     export RUSTFLAGS="--remap-path-prefix=$srcdir=/usr/src/netmon"
     cargo build --release --locked --frozen
 }
