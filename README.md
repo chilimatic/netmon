@@ -494,11 +494,12 @@ connection is marked as denied. This also blocks a program that connects
 to an address without DNS (a hard-coded address, DNS over HTTPS) or to an
 address that serves many names.
 
-- The kernel reads only the first TCP segment of the ClientHello. Chrome
-  and Firefox send large ClientHellos (post-quantum key shares) and
-  shuffle the extensions, so the server name can be in the second
-  segment. Then the connection passes, and the address block above takes
-  over.
+- Chrome and Firefox send large ClientHellos (post-quantum key shares)
+  and shuffle the extensions, so the server name can be in the second TCP
+  segment. If the first segment ends between two extensions, the kernel
+  goes on with the walk in the next segment of the connection. If the
+  border cuts an extension header or the name itself, the connection
+  passes, and the address block above takes over.
 - QUIC (HTTP/3) encrypts the ClientHello. `Q` in the Processes tab turns
   QUIC off for a program, so it uses TCP.
 - The kernel stores a 64-bit hash of each name (FNV-1a over the name from

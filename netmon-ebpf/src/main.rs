@@ -129,6 +129,21 @@ static TRACE_CFG: Array<TraceCfg> = Array::with_max_entries(1, 0);
 #[map]
 static SNI_BLOCKS: HashMap<u64, u8> = HashMap::with_max_entries(MAX_SNI_NAMES, BPF_F_NO_PREALLOC);
 
+/// Where the extension walk of a ClientHello goes on in the connection's
+/// next segment: the first segment ended between two extensions before
+/// the server name.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SniPending {
+    /// Offset of the next extension header in the next segment's payload.
+    skip: u32,
+    /// Extension bytes left from there.
+    left: u32,
+}
+
+#[map]
+static SNI_PENDING: LruHashMap<FlowKey, SniPending> = LruHashMap::with_max_entries(MAX_HELLO_PENDING, 0);
+
 /// The server name of the ClientHello being checked. Index 0 only.
 #[map]
 static SNI_BUF: PerCpuArray<[u8; 256]> = PerCpuArray::with_max_entries(1, 0);
@@ -198,28 +213,36 @@ extern "C" fn sni_byte(i: u64, ctx: *mut c_void) -> i64 {
     0
 }
 
-/// Does the TLS ClientHello at `off` name a blocked server? Only the
-/// first segment is read: a name in a later segment passes, and userspace
-/// blocks the addresses of that name instead.
+/// Does the TLS ClientHello at `off` name a blocked server? The walk over
+/// the extensions goes on in the next segment if the first one ends
+/// between two extensions before the name. A name that the segment
+/// border cuts passes, and userspace blocks the addresses of that name.
 #[inline(never)]
-fn sni_blocked(ctx: &TcContext, off: u32) -> bool {
+fn sni_blocked(ctx: &TcContext, key: &FlowKey, off: u32) -> bool {
+    let len = ctx.len();
     let Ok(b) = ctx.load::<[u8; 6]>(off as usize) else { return false };
-    if b[0] != 0x16 || b[1] != 0x03 || b[5] != 0x01 {
-        return false;
-    }
-    // Record header (5), handshake header (4), version (2), random (32).
-    let mut p = off + 43;
-    let Ok(sid) = ctx.load::<u8>(p as usize) else { return false };
-    p += 1 + sid as u32;
-    let Ok(cs) = ctx.load::<[u8; 2]>(p as usize) else { return false };
-    p += 2 + u16::from_be_bytes(cs) as u32;
-    let Ok(cm) = ctx.load::<u8>(p as usize) else { return false };
-    p += 1 + cm as u32;
-    let Ok(el) = ctx.load::<[u8; 2]>(p as usize) else { return false };
-    p += 2;
-    let mut end = p + u16::from_be_bytes(el) as u32;
-    if end > ctx.len() {
-        end = ctx.len();
+    let first = b[0] == 0x16 && b[1] == 0x03 && b[5] == 0x01;
+    let (mut p, all_end) = if first {
+        // Record header (5), handshake header (4), version (2), random (32).
+        let mut p = off + 43;
+        let Ok(sid) = ctx.load::<u8>(p as usize) else { return false };
+        p += 1 + sid as u32;
+        let Ok(cs) = ctx.load::<[u8; 2]>(p as usize) else { return false };
+        p += 2 + u16::from_be_bytes(cs) as u32;
+        let Ok(cm) = ctx.load::<u8>(p as usize) else { return false };
+        p += 1 + cm as u32;
+        let Ok(el) = ctx.load::<[u8; 2]>(p as usize) else { return false };
+        p += 2;
+        (p, p + u16::from_be_bytes(el) as u32)
+    } else {
+        let Some(pend) = (unsafe { SNI_PENDING.get(key) }).copied() else { return false };
+        let _ = SNI_PENDING.remove(key);
+        let p = off + pend.skip;
+        (p, p + pend.left)
+    };
+    let mut end = all_end;
+    if end > len {
+        end = len;
     }
     let mut name = 0u32;
     for _ in 0..MAX_EXTENSIONS {
@@ -234,6 +257,12 @@ fn sni_blocked(ctx: &TcContext, off: u32) -> bool {
         p += 4 + u16::from_be_bytes([e[2], e[3]]) as u32;
     }
     if name == 0 {
+        // The extensions go on in the next segment, and the next header
+        // starts there: remember where.
+        if first && all_end > len && p >= len && p < all_end {
+            let pend = SniPending { skip: p - len, left: all_end - p };
+            let _ = SNI_PENDING.insert(key, &pend, 0);
+        }
         return false;
     }
     // server_name_list: list length (2), name type (1, 0 = host), length (2).
@@ -776,7 +805,7 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
             && key.proto == IPPROTO_TCP
             && payload > 0
             && cfg(CFG_SNI) != 0
-            && sni_blocked(ctx, payload as u32)
+            && sni_blocked(ctx, key, payload as u32)
         {
             sni_deny(key, tgid);
             action = TC_ACT_SHOT;

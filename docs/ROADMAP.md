@@ -547,6 +547,10 @@ Small, independent features after the firewall core:
   bpf_loop, one lookup per dot. A hit drops the packet, writes a deny
   verdict to CONNS and sends a deny event. CFG_SNI turns it on. Tested:
   same address, example.org passes, ad.doubleclick.net times out.
+  Second segment (2026-11-25): SNI_PENDING (LRU, per flow) keeps where the
+  extension walk goes on when the first segment ends between two
+  extensions. Tested with a ClientHello split after a 1000-byte padding
+  extension: example.org answered, ad.doubleclick.net dropped.
 - **Packaging: done (2026-11-25).** `packaging/install-tree.sh` (shared
   layout), `packaging/arch/PKGBUILD` (`netmon-git`, nightly via rustup in
   prepare), `packaging/deb/build.sh` (dpkg-deb). Not published: the AUR
