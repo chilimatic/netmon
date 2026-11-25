@@ -547,7 +547,12 @@ Small, independent features after the firewall core:
   bpf_loop, one lookup per dot. A hit drops the packet, writes a deny
   verdict to CONNS and sends a deny event. CFG_SNI turns it on. Tested:
   same address, example.org passes, ad.doubleclick.net times out.
-- **History**: per-process daily totals in SQLite.
+- **History: done (2026-11-25).** No SQLite: the usage file keeps 400
+  days per program and per destination (registrable domain, else
+  address; 1000 per day). Today is in `usage.json` (every 60 s), older
+  days in `usage-history.json` (once a day). `d` in the Usage tab switches
+  to destinations; a bar chart shows the selected row per day. Tested: the
+  old single file split into today and history at the first save.
 
 ## Phase 9 – Connection graph
 

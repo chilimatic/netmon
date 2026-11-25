@@ -204,8 +204,14 @@ fn run_tui(
             if app.tab == Tab::Usage && usage_read.is_none_or(|t| t.elapsed() >= USAGE_READ) {
                 usage_read = Some(Instant::now());
                 match crate::usage::load(usage) {
-                    Ok(f) => (app.usage, app.usage_error) = (f.rows(&crate::usage::today()), String::new()),
-                    Err(e) => (app.usage, app.usage_error) = (Vec::new(), e),
+                    Ok(f) => {
+                        app.set_usage(f);
+                        app.usage_error = String::new();
+                    }
+                    Err(e) => {
+                        app.set_usage(Default::default());
+                        app.usage_error = e;
+                    }
                 }
             }
             if app.tab == Tab::Log && log_read.is_none_or(|t| t.elapsed() >= LOG_READ) {

@@ -224,6 +224,10 @@ pub struct App {
     /// Traffic per program (Usage tab), and why the file could not be read.
     pub usage: Vec<crate::usage::UsageRow>,
     pub usage_error: String,
+    /// The whole usage file, for the chart, and whether the tab shows
+    /// destinations instead of programs.
+    pub usage_file: crate::usage::UsageFile,
+    pub usage_dests: bool,
     /// Devices on the LANs (Devices tab), from the monitor.
     pub devices: Vec<crate::devices::Device>,
     /// The DNS log, oldest first, and whether the Log tab shows it.
@@ -279,6 +283,8 @@ impl Default for App {
             geo: crate::geo::Geo::default(),
             usage: Vec::new(),
             usage_error: String::new(),
+            usage_file: Default::default(),
+            usage_dests: false,
             devices: Vec::new(),
             dns: Default::default(),
             show_dns: false,
@@ -628,6 +634,11 @@ impl App {
                 self.usage_reverse = false;
             }
             Key::Char('S') if self.tab == Tab::Usage => self.usage_reverse = !self.usage_reverse,
+            Key::Char('d') if self.tab == Tab::Usage => {
+                self.usage_dests = !self.usage_dests;
+                self.refresh_usage();
+                self.reset_selection();
+            }
             Key::Enter if matches!(self.tab, Tab::Connections | Tab::Processes | Tab::Interfaces) => {
                 return Some(Action::StartCapture(self.tab));
             }
@@ -752,6 +763,18 @@ impl App {
                 self.matches(&[&d.ip.to_string(), &crate::devices::mac_text(&d.mac), &d.vendor, &d.name, &d.iface, &v6.join(" "), &ports.join(" ")])
             })
             .collect()
+    }
+
+    /// Takes a newly read usage file.
+    pub fn set_usage(&mut self, f: crate::usage::UsageFile) {
+        self.usage_file = f;
+        self.refresh_usage();
+    }
+
+    /// The rows of the shown kind (programs or destinations).
+    pub fn refresh_usage(&mut self) {
+        let today = crate::usage::today();
+        self.usage = if self.usage_dests { self.usage_file.dest_rows(&today) } else { self.usage_file.rows(&today) };
     }
 
     /// The Usage rows that match the filter, sorted by the chosen column.

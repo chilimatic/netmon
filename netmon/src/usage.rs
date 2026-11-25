@@ -1,7 +1,9 @@
-//! Traffic per program and day. `netmond` adds the bytes of each flow to
-//! its program (exe path, else process name) for the local date, and keeps
-//! 90 days in `/var/lib/netmon/usage.json` (root, group `netmon`, 0640).
-//! The UI reads the file (Usage tab).
+//! Traffic per program and per destination and day. `netmond` adds the
+//! bytes of each flow to its program (exe path, else process name) and its
+//! destination (registrable domain, else address) for the local date, and
+//! keeps 400 days. Today is in `/var/lib/netmon/usage.json`, written every
+//! minute; the older days are in `usage-history.json` next to it, written
+//! once a day (root, group `netmon`, 0640). The UI reads both (Usage tab).
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -16,20 +18,28 @@ use netmon_common::FlowKey;
 use crate::collector::Flow;
 
 pub const DEFAULT_PATH: &str = "/var/lib/netmon/usage.json";
-/// Days kept in the file.
-const KEEP_DAYS: usize = 90;
-/// Programs per day at most; the rest add up in OTHER.
+/// Days kept.
+const KEEP_DAYS: usize = 400;
+/// Programs and destinations per day at most; the rest add up in OTHER and
+/// OTHER_DESTS.
 const MAX_PROGRAMS: usize = 2000;
 const OTHER: &str = "(other programs)";
+const MAX_DESTS: usize = 1000;
+const OTHER_DESTS: &str = "(other destinations)";
+/// The older days, next to the file of today.
+pub const HISTORY_FILE: &str = "usage-history.json";
 pub(crate) const UNKNOWN: &str = "(unknown)";
 /// How often `netmond` writes the file.
 pub const SAVE_EVERY: Duration = Duration::from_secs(60);
 const LOOPBACK_IFINDEX: u32 = 1;
 
-/// Date (YYYY-MM-DD) -> program -> [bytes up, bytes down].
+/// Date (YYYY-MM-DD) -> program -> [bytes up, bytes down], and the same
+/// per destination.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageFile {
     pub days: BTreeMap<String, BTreeMap<String, [u64; 2]>>,
+    #[serde(default)]
+    pub dests: BTreeMap<String, BTreeMap<String, [u64; 2]>>,
 }
 
 /// One program in the Usage tab: [up, down] per time window.
@@ -44,13 +54,21 @@ pub struct UsageRow {
     pub month: [u64; 2],
 }
 
+fn add_to(map: &mut BTreeMap<String, BTreeMap<String, [u64; 2]>>, day: &str, key: &str, max: usize, other: &str, up: u64, down: u64) {
+    let keys = map.entry(day.to_string()).or_default();
+    let key = if keys.contains_key(key) || keys.len() < max { key } else { other };
+    let v = keys.entry(key.to_string()).or_default();
+    v[0] += up;
+    v[1] += down;
+}
+
 impl UsageFile {
     pub fn add(&mut self, day: &str, program: &str, up: u64, down: u64) {
-        let progs = self.days.entry(day.to_string()).or_default();
-        let key = if progs.contains_key(program) || progs.len() < MAX_PROGRAMS { program } else { OTHER };
-        let v = progs.entry(key.to_string()).or_default();
-        v[0] += up;
-        v[1] += down;
+        add_to(&mut self.days, day, program, MAX_PROGRAMS, OTHER, up, down);
+    }
+
+    pub fn add_dest(&mut self, day: &str, dest: &str, up: u64, down: u64) {
+        add_to(&mut self.dests, day, dest, MAX_DESTS, OTHER_DESTS, up, down);
     }
 
     /// Drops all but the newest KEEP_DAYS days.
@@ -58,44 +76,98 @@ impl UsageFile {
         while self.days.len() > KEEP_DAYS {
             self.days.pop_first();
         }
+        while self.dests.len() > KEEP_DAYS {
+            self.dests.pop_first();
+        }
+    }
+
+    /// Today, and all other days.
+    pub fn split(&self, today: &str) -> (UsageFile, UsageFile) {
+        let (mut now, mut old) = (UsageFile::default(), self.clone());
+        if let Some(d) = old.days.remove(today) {
+            now.days.insert(today.to_string(), d);
+        }
+        if let Some(d) = old.dests.remove(today) {
+            now.dests.insert(today.to_string(), d);
+        }
+        (now, old)
+    }
+
+    /// Adds the days of `other` (the file of today and the history).
+    pub fn merge(&mut self, other: UsageFile) {
+        for (map, from) in [(&mut self.days, other.days), (&mut self.dests, other.dests)] {
+            for (day, keys) in from {
+                let to = map.entry(day).or_default();
+                for (k, v) in keys {
+                    let t = to.entry(k).or_default();
+                    t[0] += v[0];
+                    t[1] += v[1];
+                }
+            }
+        }
+    }
+
+    /// Bytes (up and down) of one program or destination for each of the
+    /// `n` days up to `today`, oldest first, with the day of the month.
+    pub fn series(&self, dests: bool, key: &str, today: &str, n: i64) -> Vec<(String, u64)> {
+        let Some(t) = day_number(today) else { return Vec::new() };
+        let map = if dests { &self.dests } else { &self.days };
+        (0..n)
+            .rev()
+            .map(|age| {
+                let (y, m, d) = crate::rulefile::civil_from_days(t - age);
+                let day = format!("{y:04}-{m:02}-{d:02}");
+                let v = map.get(&day).and_then(|k| k.get(key)).map_or(0, |v| v[0] + v[1]);
+                (format!("{d}"), v)
+            })
+            .collect()
     }
 
     /// The programs with their windows up to `today`, the busiest today
     /// first, then by the last 7 days.
     pub fn rows(&self, today: &str) -> Vec<UsageRow> {
-        let Some(t) = day_number(today) else { return Vec::new() };
-        let mut rows: HashMap<&str, UsageRow> = HashMap::new();
-        for (day, progs) in &self.days {
-            let Some(d) = day_number(day) else { continue };
-            let age = t - d;
-            if !(0..30).contains(&age) {
-                continue;
+        rows_of(&self.days, today)
+    }
+
+    /// The same for the destinations.
+    pub fn dest_rows(&self, today: &str) -> Vec<UsageRow> {
+        rows_of(&self.dests, today)
+    }
+}
+
+fn rows_of(map: &BTreeMap<String, BTreeMap<String, [u64; 2]>>, today: &str) -> Vec<UsageRow> {
+    let Some(t) = day_number(today) else { return Vec::new() };
+    let mut rows: HashMap<&str, UsageRow> = HashMap::new();
+    for (day, progs) in map {
+        let Some(d) = day_number(day) else { continue };
+        let age = t - d;
+        if !(0..30).contains(&age) {
+            continue;
+        }
+        for (p, v) in progs {
+            let r = rows.entry(p).or_insert_with(|| UsageRow { program: p.clone(), ..UsageRow::default() });
+            let add = |w: &mut [u64; 2]| {
+                w[0] += v[0];
+                w[1] += v[1];
+            };
+            add(&mut r.month);
+            if age < 7 {
+                add(&mut r.week);
             }
-            for (p, v) in progs {
-                let r = rows.entry(p).or_insert_with(|| UsageRow { program: p.clone(), ..UsageRow::default() });
-                let add = |w: &mut [u64; 2]| {
-                    w[0] += v[0];
-                    w[1] += v[1];
-                };
-                add(&mut r.month);
-                if age < 7 {
-                    add(&mut r.week);
-                }
-                if age == 1 {
-                    add(&mut r.yesterday);
-                }
-                if age == 0 {
-                    add(&mut r.today);
-                }
+            if age == 1 {
+                add(&mut r.yesterday);
+            }
+            if age == 0 {
+                add(&mut r.today);
             }
         }
-        let mut out: Vec<UsageRow> = rows.into_values().collect();
-        out.sort_by(|a, b| {
-            let sum = |w: [u64; 2]| w[0] + w[1];
-            sum(b.today).cmp(&sum(a.today)).then(sum(b.week).cmp(&sum(a.week))).then(a.program.cmp(&b.program))
-        });
-        out
     }
+    let mut out: Vec<UsageRow> = rows.into_values().collect();
+    out.sort_by(|a, b| {
+        let sum = |w: [u64; 2]| w[0] + w[1];
+        sum(b.today).cmp(&sum(a.today)).then(sum(b.week).cmp(&sum(a.week))).then(a.program.cmp(&b.program))
+    });
+    out
 }
 
 /// Days since 1970 of "YYYY-MM-DD".
@@ -116,13 +188,24 @@ pub fn today() -> String {
     format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)
 }
 
-/// Reads the file. A missing file is an empty one.
-pub fn load(path: &Path) -> Result<UsageFile, String> {
+fn load_one(path: &Path) -> Result<UsageFile, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UsageFile::default()),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
+}
+
+/// The history file next to the file of today.
+pub fn history_path(path: &Path) -> PathBuf {
+    path.with_file_name(HISTORY_FILE)
+}
+
+/// Reads the file of today and the history. A missing file is an empty one.
+pub fn load(path: &Path) -> Result<UsageFile, String> {
+    let mut f = load_one(path)?;
+    f.merge(load_one(&history_path(path))?);
+    Ok(f)
 }
 
 /// The counter in `netmond`.
@@ -136,6 +219,9 @@ pub struct Usage {
     dirty: bool,
     /// The last save failed: the next error is not reported again.
     failing: bool,
+    /// The day the history file was last written for; it is written again
+    /// when the day changes.
+    history_day: String,
 }
 
 impl Usage {
@@ -146,7 +232,16 @@ impl Usage {
             Ok(f) => (f, None),
             Err(e) => (UsageFile::default(), Some(format!("usage file: {e}; starting empty"))),
         };
-        let u = Usage { file, path: path.to_path_buf(), gid, last: HashMap::new(), saved: Instant::now(), dirty: false, failing: false };
+        let u = Usage {
+            file,
+            path: path.to_path_buf(),
+            gid,
+            last: HashMap::new(),
+            saved: Instant::now(),
+            dirty: false,
+            failing: false,
+            history_day: String::new(),
+        };
         (u, err)
     }
 
@@ -167,6 +262,7 @@ impl Usage {
             seen.insert(*k, now);
             if up + down > 0 {
                 self.file.add(day, &program(f), up, down);
+                self.file.add_dest(day, &destination(f), up, down);
                 self.dirty = true;
             }
         }
@@ -181,7 +277,7 @@ impl Usage {
         }
         self.saved = now;
         self.file.prune();
-        match self.write() {
+        match self.write(&today()) {
             Ok(()) => {
                 self.dirty = false;
                 self.failing = false;
@@ -195,8 +291,16 @@ impl Usage {
         }
     }
 
-    fn write(&self) -> std::io::Result<()> {
-        write_private(&self.path, serde_json::to_string(&self.file).unwrap_or_default().as_bytes(), self.gid)
+    /// Writes today's file, and the history when the day changed since
+    /// its last write (also the first time, which moves the days of an
+    /// older single file into it).
+    fn write(&mut self, today: &str) -> std::io::Result<()> {
+        let (now, old) = self.file.split(today);
+        if self.history_day != today {
+            write_private(&history_path(&self.path), serde_json::to_string(&old).unwrap_or_default().as_bytes(), self.gid)?;
+            self.history_day = today.to_string();
+        }
+        write_private(&self.path, serde_json::to_string(&now).unwrap_or_default().as_bytes(), self.gid)
     }
 }
 
@@ -217,6 +321,15 @@ pub(crate) fn write_private(path: &Path, data: &[u8], gid: Option<u32>) -> std::
     f.write_all(data)?;
     f.sync_all()?;
     std::fs::rename(&tmp, path)
+}
+
+/// The destination a flow counts for: the registrable domain of its
+/// hostname, else the remote address.
+pub(crate) fn destination(f: &Flow) -> String {
+    match &f.host {
+        Some(h) if !h.is_empty() => crate::graph::domain(h),
+        _ => crate::procmap::normalize(f.remote).ip().to_string(),
+    }
 }
 
 /// The program a flow counts for.
@@ -265,14 +378,36 @@ mod tests {
         let day = &f.days["2026-11-23"];
         assert_eq!(day.len(), MAX_PROGRAMS + 1);
         assert_eq!((day["/p0"], day[OTHER]), ([2, 0], [5, 0]));
-        for d in 1..=28 {
-            for m in 1..=4 {
-                f.add(&format!("2026-{m:02}-{d:02}"), "/x", 1, 1);
-            }
+        let last = day_number("2026-11-22").unwrap();
+        for age in 0..KEEP_DAYS as i64 + 50 {
+            let (y, m, d) = crate::rulefile::civil_from_days(last - age);
+            f.add(&format!("{y:04}-{m:02}-{d:02}"), "/x", 1, 1);
+            f.add_dest(&format!("{y:04}-{m:02}-{d:02}"), "example.com", 1, 1);
         }
         f.prune();
+        assert_eq!(f.dests.len(), KEEP_DAYS);
         assert_eq!(f.days.len(), KEEP_DAYS);
         assert!(f.days.contains_key("2026-11-23"), "the newest stay");
+    }
+
+    #[test]
+    fn destinations_split_merge_and_series() {
+        let mut f = UsageFile::default();
+        f.add("2026-11-23", "/a", 1, 2);
+        f.add_dest("2026-11-23", "example.com", 1, 2);
+        f.add_dest("2026-11-21", "example.com", 10, 0);
+        f.add_dest("2026-11-21", "1.1.1.1", 4, 4);
+        let (now, old) = f.split("2026-11-23");
+        assert_eq!((now.days.len(), now.dests.len(), old.days.len(), old.dests.len()), (1, 1, 0, 1));
+        let mut back = now.clone();
+        back.merge(old);
+        assert_eq!(back, f);
+        let rows = f.dest_rows("2026-11-23");
+        assert_eq!(rows[0].program, "example.com");
+        assert_eq!(rows[0].week, [11, 2]);
+        let s = f.series(true, "example.com", "2026-11-23", 4);
+        assert_eq!(s, vec![("20".into(), 0), ("21".into(), 10), ("22".into(), 0), ("23".into(), 3)]);
+        assert_eq!(f.series(false, "/a", "2026-11-23", 1), vec![("23".into(), 3)]);
     }
 
     #[test]
@@ -296,9 +431,16 @@ mod tests {
         c.ingest([(k(2), FlowStats { tx_bytes: 150, rx_bytes: 3000, ..Default::default() })], 1.0);
         u.count(&c.flows, &counted, "2026-11-23");
         assert_eq!(u.file.days["2026-11-23"][UNKNOWN], [150, 3000], "deltas, only interface 2");
+        assert_eq!(u.file.dests["2026-11-23"]["0.0.0.0"], [150, 3000], "no hostname: the address");
+        // An older day: it goes to the history file, today stays in the file of today.
+        u.file.add("2020-01-01", "/old", 5, 5);
         assert!(u.save(Instant::now(), false).is_none() && !path.exists(), "not due yet");
         assert!(u.save(Instant::now(), true).is_none());
         assert_eq!(load(&path).unwrap(), u.file);
+        let today_only: UsageFile = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(today_only.days.keys().all(|d| *d == today()), "{:?}", today_only.days.keys());
+        let history: UsageFile = serde_json::from_str(&std::fs::read_to_string(history_path(&path)).unwrap()).unwrap();
+        assert!(history.days.contains_key("2020-01-01") && history.days.contains_key("2026-11-23"));
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
         let (again, _) = Usage::new(&path, None);
         assert_eq!(again.file, u.file, "a restart goes on from the file");

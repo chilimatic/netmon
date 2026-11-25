@@ -313,6 +313,7 @@ and `--no-devices` (no ARP requests and no Devices tab).
 | `b` | Graph | Block the selected node: its exe, hostname or address |
 | `z` | Graph | Switch the level: process, container, domain |
 | `s` `S` | Usage | Sort by the next column, reverse the order |
+| `d` | Usage | Switch between programs and destinations |
 | `r` | Devices | Send ARP requests to the LANs now |
 | `o` | Devices | Check 26 common TCP ports of the selected device |
 | `w` | Devices | Send a Wake-on-LAN packet to the selected device |
@@ -647,16 +648,25 @@ next column, and `S` reverses the order. An arrow in the header marks the
 sort column. Programs sort from A to Z, byte counts from the largest.
 `/` filters by program. The tab reads the file every 10 s while it is open.
 
+`d` switches between programs and destinations. A destination is the
+registrable domain of the connection's hostname (`whatsapp.net` for
+`media-vie1-1.cdn.whatsapp.net`), else the remote address. Under the table,
+a bar chart shows the traffic of the selected row per day, for the last
+30 days (or as many as fit).
+
 - `netmond` adds the bytes of each connection to its program: the exe
   path, else the process name, `container:<name>/<process>` for a
   container, or `(unknown)`.
 - It counts the interfaces that the header counts (the physical ones), so
   traffic that passes a bridge, a veth and the uplink counts once.
-- Days are local dates. The file keeps 90 days and at most 2000 programs
-  per day. More programs add up in `(other programs)`.
-- `netmond` writes `/var/lib/netmon/usage.json` every 60 s and when it
-  stops. The file belongs to root and group `netmon`, mode 0640. A crash
-  loses at most the last minute.
+- Days are local dates. `netmond` keeps 400 days, at most 2000 programs
+  and 1000 destinations per day. More add up in `(other programs)` and
+  `(other destinations)`.
+- `netmond` writes today to `/var/lib/netmon/usage.json` every 60 s and
+  when it stops. The older days are in `usage-history.json` next to it,
+  written once a day, so the large part is not written every minute. Both
+  files belong to root and group `netmon`, mode 0640. A crash loses at
+  most the last minute.
 - With `sudo netmon --local`, no usage is counted.
 
 ### Devices tab

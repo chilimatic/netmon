@@ -7,7 +7,8 @@ use ratatui::{
     symbols::Marker,
     text::{Line, Span},
     widgets::{
-        Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Sparkline, Table, TableState, Tabs,
+        Axis, Bar, BarChart, BarGroup, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Sparkline,
+        Table, TableState, Tabs,
         canvas::{Canvas, Line as CanvasLine, Points},
     },
 };
@@ -129,8 +130,9 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         )
     } else if app.tab == Tab::Usage {
         format!(
-            " q quit  ←→/0-9 view  ↑↓ select  s sort column [{}]  S reverse  / filter [{}]   local days; netmond writes every 60 s",
+            " q quit  ←→/0-9 view  ↑↓ select  s sort column [{}]  S reverse  d {}  / filter [{}]   local days, 400 kept",
             crate::app::USAGE_COLUMNS[app.usage_sort],
+            if app.usage_dests { "programs" } else { "destinations" },
             app.filter
         )
     } else if app.tab == Tab::Devices {
@@ -576,8 +578,9 @@ fn draw_capture(f: &mut Frame, cap: Option<&Capture>, names: &Names, area: Rect)
 }
 
 /// The Usage header. An arrow marks the sort column: ▼ for the normal order, ▲ when reversed.
-fn usage_header(sort: usize, reverse: bool) -> Row<'static> {
+fn usage_header(sort: usize, reverse: bool, dests: bool) -> Row<'static> {
     let cells = crate::app::USAGE_COLUMNS.iter().enumerate().map(|(i, c)| {
+        let c = if i == 0 && dests { "Destination" } else { c };
         if i == sort { format!("{c} {}", if reverse { "▲" } else { "▼" }) } else { c.to_string() }
     });
     Row::new(cells).style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
@@ -717,8 +720,12 @@ fn draw_usage(f: &mut Frame, app: &mut App, area: Rect) {
         );
         return;
     }
+    let [area, chart] = Layout::vertical([Constraint::Min(4), Constraint::Length(8)]).areas(area);
     let rows = app.usage_rows();
     let ids: Vec<RowId> = rows.iter().map(|r| RowId::Usage(r.program.clone())).collect();
+    if let Some(r) = app.selected_in(&ids).map(|i| rows[i]) {
+        draw_usage_days(f, app, &r.program, chart);
+    }
     let bytes = |n: u64| Cell::from(Line::from(human(n as f64)).right_aligned());
     let sum = |w: [u64; 2]| w[0] + w[1];
     let lines: Vec<Row> = rows
@@ -745,7 +752,7 @@ fn draw_usage(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(11),
         ],
     )
-    .header(usage_header(app.usage_sort, app.usage_reverse));
+    .header(usage_header(app.usage_sort, app.usage_reverse, app.usage_dests));
     render_table(f, app, table, &ids, area);
 }
 
@@ -887,6 +894,28 @@ fn draw_dns(f: &mut Frame, app: &mut App, area: Rect) {
     )
     .header(header_row(&["Time (UTC)", "Program", "Name", "Type", "Result", "Server"]));
     render_table(f, app, table, &ids, area);
+}
+
+/// Traffic per day of one program or destination: the last 30 days, or as
+/// many as fit.
+fn draw_usage_days(f: &mut Frame, app: &App, key: &str, area: Rect) {
+    let n = (area.width.saturating_sub(2) / 3).clamp(1, 30) as i64;
+    let days = app.usage_file.series(app.usage_dests, key, &crate::usage::today(), n);
+    let peak = days.iter().map(|d| d.1).max().unwrap_or(0);
+    let bars: Vec<Bar> = days
+        .iter()
+        .map(|(d, v)| Bar::default().value(*v).text_value(String::new()).label(Line::from(d.clone())))
+        .collect();
+    let title = format!(" {key}: traffic per day, last {n} days, peak {} ", human(peak as f64));
+    f.render_widget(
+        BarChart::default()
+            .block(Block::new().borders(Borders::TOP).title(title))
+            .data(BarGroup::default().bars(&bars))
+            .bar_width(2)
+            .bar_gap(1)
+            .bar_style(Style::new().fg(Color::Green)),
+        area,
+    );
 }
 
 /// The Log tab: the newest lines of the connection log.
@@ -1390,6 +1419,25 @@ mod tests {
         assert_eq!(term.backend().buffer()[(x, y)].fg, Color::DarkGray, "not seen for 2 h: gray");
         app.filter = "router".into();
         assert_eq!(app.device_rows().len(), 1);
+    }
+
+    #[test]
+    fn usage_shows_destinations_and_a_chart_per_day() {
+        let mut app = App { tab: Tab::Usage, show_graph: false, ..App::default() };
+        let today = crate::usage::today();
+        let mut f = crate::usage::UsageFile::default();
+        f.add(&today, "/usr/bin/curl", 1000, 5_000_000);
+        f.add_dest(&today, "example.com", 1000, 5_000_000);
+        app.set_usage(f);
+        let mut term = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        term.draw(|fr| draw(fr, &mut app, &Collector::new(1), &Names::default(), None, &Rules::default())).unwrap();
+        let s = screen(&term);
+        assert!(s.contains(&format!("/usr/bin/curl: traffic per day, last 30 days, peak {}", human(5_001_000.0))), "{s}");
+        assert!(s.contains("d destinations"), "{s}");
+        app.on_key(crate::app::Key::Char('d'));
+        term.draw(|fr| draw(fr, &mut app, &Collector::new(1), &Names::default(), None, &Rules::default())).unwrap();
+        let s = screen(&term);
+        assert!(s.contains("Destination") && s.contains("example.com: traffic per day"), "{s}");
     }
 
     #[test]
