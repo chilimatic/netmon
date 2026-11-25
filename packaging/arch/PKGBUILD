@@ -3,7 +3,7 @@
 # The eBPF part needs a nightly Rust toolchain and bpf-linker. prepare()
 # installs the nightly toolchain with rustup if it is missing.
 pkgname=netmon-git
-pkgver=0.1.0.r75.g88ee8dc
+pkgver=0.1.0.r80.g8832cae
 pkgrel=1
 pkgdesc="eBPF network monitor and per-program firewall with a terminal UI"
 arch=('x86_64' 'aarch64')

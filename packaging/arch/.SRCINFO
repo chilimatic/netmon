@@ -1,0 +1,26 @@
+pkgbase = netmon-git
+	pkgdesc = eBPF network monitor and per-program firewall with a terminal UI
+	pkgver = 0.1.0.r80.g8832cae
+	pkgrel = 1
+	url = https://github.com/chilimatic/netmon
+	install = netmon.install
+	arch = x86_64
+	arch = aarch64
+	license = MIT OR Apache-2.0
+	makedepends = git
+	makedepends = rustup
+	makedepends = bpf-linker
+	depends = glibc
+	depends = gcc-libs
+	depends = systemd
+	optdepends = libnotify: desktop notifications (netmon-notify)
+	optdepends = curl: GeoIP and block list updates
+	optdepends = gzip: GeoIP updates
+	provides = netmon
+	conflicts = netmon
+	options = !lto
+	options = !debug
+	source = netmon::git+https://github.com/chilimatic/netmon.git
+	sha256sums = SKIP
+
+pkgname = netmon-git

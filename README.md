@@ -166,6 +166,9 @@ need the toolchain above.
   `target/debian/netmon_VERSION_ARCH.deb` with `dpkg-deb`. Install it with
   `sudo apt install ./target/debian/netmon_*.deb`.
 
+`packaging/arch/.SRCINFO` is the metadata that the AUR needs. Make it new
+with `makepkg --printsrcinfo > .SRCINFO` after a change of the PKGBUILD.
+
 After the install, add your user to the group `netmon`, log out and in
 again, copy `/usr/share/doc/netmon/rules.example.toml` to
 `/etc/netmon/rules.toml` if you want rules, and run
