@@ -90,6 +90,9 @@ pub struct Probe {
     inode_of: BTreeMap<String, ExeInode>,
     tgid_exe: HashMap<MapData, u32, u32>,
     limits: HashMap<MapData, u32, netmon_common::Limit>,
+    sni_blocks: HashMap<MapData, u64, u8>,
+    /// Names as last written to SNI_BLOCKS.
+    sni_set: std::collections::HashMap<u64, u8>,
     /// Limits as last written to LIMITS: exe id -> (up, down) bytes/s.
     limits_set: BTreeMap<u32, (u64, u64)>,
     /// Exe ids as last written to EXE_IDS.
@@ -221,6 +224,7 @@ impl Probe {
         let exe_inodes = HashMap::try_from(take("EXE_INODES")?)?;
         let tgid_exe = HashMap::try_from(take("TGID_EXE")?)?;
         let limits = HashMap::try_from(take("LIMITS")?)?;
+        let sni_blocks = HashMap::try_from(take("SNI_BLOCKS")?)?;
         let trace_cfg = Array::try_from(take("TRACE_CFG")?)?;
         let mut hook_errors = Vec::new();
         let pins = match pin_dir.map(prepare_pins) {
@@ -269,6 +273,8 @@ impl Probe {
             tgid_exe,
             limits,
             limits_set: BTreeMap::new(),
+            sni_blocks,
+            sni_set: std::collections::HashMap::new(),
             exe_ids: BTreeMap::new(),
             cpus,
             attached: HashSet::new(),
@@ -595,6 +601,11 @@ pub trait Kernel {
     /// decided again. On error the old table stays live.
     fn set_rules(&mut self, rules: &[RuleEntry], exe_ids: &BTreeMap<String, u32>, default: u8)
     -> anyhow::Result<()>;
+    /// Replaces the blocked server names (hash -> SNI_* flags). Returns how
+    /// many did not fit into the map.
+    fn set_sni_blocks(&mut self, _names: &std::collections::HashMap<u64, u8>) -> anyhow::Result<usize> {
+        Ok(0)
+    }
     /// Replaces the bandwidth limits: exe id, bytes/s up, bytes/s down.
     /// Call after `set_rules`, which writes the exe ids.
     fn set_limits(&mut self, _limits: &[(u32, u64, u64)]) -> anyhow::Result<()> {
@@ -790,6 +801,28 @@ impl Kernel for Probe {
 
     fn sock_owner(&self, cookie: u64) -> Option<SockOwner> {
         self.sock_owner.get(&cookie, 0).ok()
+    }
+
+    fn set_sni_blocks(&mut self, names: &std::collections::HashMap<u64, u8>) -> anyhow::Result<usize> {
+        // Removed names first, so the map has room for the new ones.
+        let gone: Vec<u64> = self.sni_set.keys().filter(|k| !names.contains_key(k)).copied().collect();
+        for k in gone {
+            let _ = self.sni_blocks.remove(&k);
+            self.sni_set.remove(&k);
+        }
+        let mut failed = 0;
+        for (k, f) in names {
+            if self.sni_set.get(k) != Some(f) {
+                match self.sni_blocks.insert(k, f, 0) {
+                    Ok(()) => {
+                        self.sni_set.insert(*k, *f);
+                    }
+                    Err(_) => failed += 1,
+                }
+            }
+        }
+        self.rule_cfg.set(netmon_common::CFG_SNI, self.sni_set.len() as u32, 0)?;
+        Ok(failed)
     }
 
     fn set_limits(&mut self, limits: &[(u32, u64, u64)]) -> anyhow::Result<()> {

@@ -123,7 +123,36 @@ pub const CFG_GEN: u32 = 5;
 /// Number of bandwidth limits in LIMITS. Limits also turn on the
 /// connection state, so ingress packets find their process.
 pub const CFG_LIMITS: u32 = 6;
-pub const CFG_LEN: u32 = 7;
+/// Number of names in SNI_BLOCKS. Non-zero turns on the ClientHello check
+/// and the connection state.
+pub const CFG_SNI: u32 = 7;
+pub const CFG_LEN: u32 = 8;
+
+/// SNI_BLOCKS flags: the name itself is blocked, and the names below it.
+pub const SNI_SELF: u8 = 1;
+pub const SNI_BELOW: u8 = 2;
+/// Names SNI_BLOCKS holds at most (host blocks and block lists).
+pub const MAX_SNI_NAMES: u32 = 2_100_000;
+/// Longest server name the kernel reads.
+pub const MAX_SNI_LEN: usize = 255;
+
+pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// One step of the server name hash: FNV-1a over the name's bytes from
+/// the last to the first, lower case. Walking a name backwards, the hash
+/// at each dot is the hash of the parent domain to its right, so the
+/// kernel checks every parent with one pass.
+#[inline(always)]
+pub fn sni_step(h: u64, c: u8) -> u64 {
+    let c = if c.is_ascii_uppercase() { c + 32 } else { c };
+    (h ^ c as u64).wrapping_mul(FNV_PRIME)
+}
+
+/// The SNI_BLOCKS key of a name.
+pub fn sni_hash(name: &str) -> u64 {
+    name.bytes().rev().fold(FNV_OFFSET, sni_step)
+}
 
 /// Highest limit rate in bytes per second: keeps the token math in u64.
 pub const MAX_LIMIT_RATE: u64 = 10_000_000_000;

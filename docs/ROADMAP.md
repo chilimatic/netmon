@@ -539,6 +539,14 @@ Small, independent features after the firewall core:
   `[alerts]`: address change, offline (15 min), online again (from the
   second take on). Protocol 12. Tested: router ports 53/80/443/49152,
   WoL sent, IPv6 of two devices.
+- **Server name blocks in the kernel: done (2026-11-25).** SNI_BLOCKS
+  (u64 FNV-1a of the reversed lower-case name -> SNI_SELF/SNI_BELOW, no
+  prealloc, 2.1M). The egress TC program walks the first segment of a
+  ClientHello (session id, ciphers, compression, up to 32 extensions),
+  copies the name to a per-CPU buffer and hashes it from the end with
+  bpf_loop, one lookup per dot. A hit drops the packet, writes a deny
+  verdict to CONNS and sends a deny event. CFG_SNI turns it on. Tested:
+  same address, example.org passes, ad.doubleclick.net times out.
 - **History**: per-process daily totals in SQLite.
 
 ## Phase 9 – Connection graph

@@ -512,6 +512,29 @@ impl Rules {
     }
 
     /// Names in all lists together.
+    /// The SNI_BLOCKS table: hash of each blocked name -> SNI_SELF and
+    /// SNI_BELOW. `x.com` blocks the name itself, `*.x.com` and list names
+    /// also the names below. A list name without a dot (a top-level name)
+    /// blocks only itself, as in `blocklist::contains`.
+    pub fn sni_entries(&self) -> std::collections::HashMap<u64, u8> {
+        use netmon_common::{SNI_BELOW, SNI_SELF, sni_hash};
+        let mut out: std::collections::HashMap<u64, u8> = std::collections::HashMap::new();
+        for h in &self.hosts {
+            let (name, f) = match h.pattern.strip_prefix("*.") {
+                Some(base) => (base, SNI_SELF | SNI_BELOW),
+                None => (h.pattern.as_str(), SNI_SELF),
+            };
+            *out.entry(sni_hash(name)).or_default() |= f;
+        }
+        for l in &self.blocklists {
+            for n in l.names.iter() {
+                let f = if n.contains('.') { SNI_SELF | SNI_BELOW } else { SNI_SELF };
+                *out.entry(sni_hash(n)).or_default() |= f;
+            }
+        }
+        out
+    }
+
     pub fn blocklist_names(&self) -> usize {
         self.blocklists.iter().map(|l| l.count).sum()
     }
@@ -909,6 +932,48 @@ mod tests {
             full.block(BlockTarget::Port(IPPROTO_UDP, p as u16)).unwrap();
         }
         assert!(full.block(BlockTarget::Port(IPPROTO_TCP, 1)).unwrap_err().contains("limit"));
+    }
+
+    /// The kernel's walk over a server name (sni_byte and sni_blocked),
+    /// on the host.
+    fn kernel_blocks(map: &std::collections::HashMap<u64, u8>, name: &str) -> bool {
+        use netmon_common::{FNV_OFFSET, SNI_BELOW, SNI_SELF, sni_step};
+        let mut h = FNV_OFFSET;
+        for c in name.bytes().rev() {
+            if c == b'.' && map.get(&h).is_some_and(|f| f & SNI_BELOW != 0) {
+                return true;
+            }
+            h = sni_step(h, c);
+        }
+        map.get(&h).is_some_and(|f| f & SNI_SELF != 0)
+    }
+
+    #[test]
+    fn kernel_server_name_blocks_match_like_userspace() {
+        let mut r = Rules::default();
+        r.add_host("ads.example.com", "").unwrap();
+        r.add_host("*.tracker.net", "").unwrap();
+        let names: std::collections::HashSet<String> = ["doubleclick.net".to_string(), "com".to_string()].into();
+        r.add_blocklist("/etc/netmon/lists/a.txt", "", Ok((names, 0))).unwrap();
+        let map = r.sni_entries();
+        assert_eq!(map.len(), 4);
+        for name in [
+            "ads.example.com",
+            "x.ads.example.com",
+            "example.com",
+            "tracker.net",
+            "a.b.tracker.net",
+            "nottracker.net",
+            "doubleclick.net",
+            "AD.DoubleClick.NET",
+            "google.com",
+            "com",
+        ] {
+            let user = r.host_blocked(name);
+            assert_eq!(kernel_blocks(&map, name), user, "{name}: userspace says {user}");
+        }
+        assert!(kernel_blocks(&map, "AD.DoubleClick.NET"));
+        assert!(!kernel_blocks(&map, "x.ads.example.com"), "an exact host block does not cover names below");
     }
 
     #[test]

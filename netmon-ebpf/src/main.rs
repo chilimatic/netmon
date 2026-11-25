@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     EbpfContext,
-    bindings::{BPF_NOEXIST, TC_ACT_SHOT, TC_ACT_UNSPEC, __sk_buff, bpf_fib_lookup as FibParams},
+    bindings::{BPF_F_NO_PREALLOC, BPF_NOEXIST, TC_ACT_SHOT, TC_ACT_UNSPEC, __sk_buff, bpf_fib_lookup as FibParams},
     cty::c_void,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
@@ -15,7 +15,8 @@ use aya_ebpf::{
     programs::{SockAddrContext, SockContext, TcContext, TracePointContext},
 };
 use netmon_common::{
-    ACTION_ALLOW, ACTION_ASK, ACTION_DENY, CFG_LIMITS, Limit, take_tokens, ASK_RING_BYTES, AskEvent, DENY_RING_BYTES, DenyEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
+    ACTION_ALLOW, ACTION_ASK, ACTION_DENY, CFG_LIMITS, Limit, take_tokens, CFG_SNI, FNV_OFFSET, MAX_SNI_LEN,
+    MAX_SNI_NAMES, SNI_BELOW, SNI_SELF, sni_step, ASK_RING_BYTES, AskEvent, DENY_RING_BYTES, DenyEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
@@ -123,6 +124,15 @@ static TGID_EXE: HashMap<u32, u32> = HashMap::with_max_entries(MAX_MARKED_TGIDS,
 #[map]
 static TRACE_CFG: Array<TraceCfg> = Array::with_max_entries(1, 0);
 
+/// Blocked server names: sni_hash -> SNI_SELF | SNI_BELOW. Not
+/// preallocated: block lists can hold two million names.
+#[map]
+static SNI_BLOCKS: HashMap<u64, u8> = HashMap::with_max_entries(MAX_SNI_NAMES, BPF_F_NO_PREALLOC);
+
+/// The server name of the ClientHello being checked. Index 0 only.
+#[map]
+static SNI_BUF: PerCpuArray<[u8; 256]> = PerCpuArray::with_max_entries(1, 0);
+
 /// Bandwidth limits by exe id. Never LRU, like the verdict maps.
 #[map]
 static LIMITS: HashMap<u32, Limit> = HashMap::with_max_entries(MAX_RULES, 0);
@@ -149,7 +159,124 @@ fn live_rules() -> (u32, u32) {
 fn rules_active() -> bool {
     let (count, half) = live_rules();
     let d = cfg(CFG_DEFAULT + half);
-    count != 0 || d == ACTION_DENY as u32 || d == ACTION_ASK as u32 || cfg(CFG_LIMITS) != 0
+    count != 0 || d == ACTION_DENY as u32 || d == ACTION_ASK as u32 || cfg(CFG_LIMITS) != 0 || cfg(CFG_SNI) != 0
+}
+
+/// TLS extensions looked at for the server name at most. Browsers send
+/// about 20, GREASE included.
+const MAX_EXTENSIONS: u32 = 32;
+
+/// State of the walk over the server name, from its last byte to the first.
+#[repr(C)]
+struct SniScan {
+    len: u32,
+    hit: u32,
+    h: u64,
+}
+
+/// bpf_loop callback: one byte of the name, from the end. At a dot, the
+/// hash so far is the parent domain to the right: blocked if a block
+/// covers the names below it.
+#[inline(never)]
+extern "C" fn sni_byte(i: u64, ctx: *mut c_void) -> i64 {
+    let s = unsafe { &mut *(ctx as *mut SniScan) };
+    let i = i as u32;
+    if i >= s.len {
+        return 1;
+    }
+    let Some(buf) = SNI_BUF.get_ptr(0) else { return 1 };
+    let idx = ((s.len - 1 - i) & 0xff) as usize;
+    let c = unsafe { (*buf)[idx] };
+    if c == b'.'
+        && let Some(f) = unsafe { SNI_BLOCKS.get(&s.h) }
+        && *f & SNI_BELOW != 0
+    {
+        s.hit = 1;
+        return 1;
+    }
+    s.h = sni_step(s.h, c);
+    0
+}
+
+/// Does the TLS ClientHello at `off` name a blocked server? Only the
+/// first segment is read: a name in a later segment passes, and userspace
+/// blocks the addresses of that name instead.
+#[inline(never)]
+fn sni_blocked(ctx: &TcContext, off: u32) -> bool {
+    let Ok(b) = ctx.load::<[u8; 6]>(off as usize) else { return false };
+    if b[0] != 0x16 || b[1] != 0x03 || b[5] != 0x01 {
+        return false;
+    }
+    // Record header (5), handshake header (4), version (2), random (32).
+    let mut p = off + 43;
+    let Ok(sid) = ctx.load::<u8>(p as usize) else { return false };
+    p += 1 + sid as u32;
+    let Ok(cs) = ctx.load::<[u8; 2]>(p as usize) else { return false };
+    p += 2 + u16::from_be_bytes(cs) as u32;
+    let Ok(cm) = ctx.load::<u8>(p as usize) else { return false };
+    p += 1 + cm as u32;
+    let Ok(el) = ctx.load::<[u8; 2]>(p as usize) else { return false };
+    p += 2;
+    let mut end = p + u16::from_be_bytes(el) as u32;
+    if end > ctx.len() {
+        end = ctx.len();
+    }
+    let mut name = 0u32;
+    for _ in 0..MAX_EXTENSIONS {
+        if p + 4 > end {
+            break;
+        }
+        let Ok(e) = ctx.load::<[u8; 4]>(p as usize) else { break };
+        if e[0] == 0 && e[1] == 0 {
+            name = p + 4;
+            break;
+        }
+        p += 4 + u16::from_be_bytes([e[2], e[3]]) as u32;
+    }
+    if name == 0 {
+        return false;
+    }
+    // server_name_list: list length (2), name type (1, 0 = host), length (2).
+    let Ok(h) = ctx.load::<[u8; 5]>(name as usize) else { return false };
+    if h[2] != 0 {
+        return false;
+    }
+    let mut n = u16::from_be_bytes([h[3], h[4]]) as u32;
+    if n > MAX_SNI_LEN as u32 {
+        n = MAX_SNI_LEN as u32;
+    }
+    // As in name_event: the verifier needs n proven to be in 1..=255.
+    let n = unsafe { core::ptr::read_volatile(&n) };
+    if n == 0 || n > MAX_SNI_LEN as u32 {
+        return false;
+    }
+    let Some(buf) = SNI_BUF.get_ptr_mut(0) else { return false };
+    let ret = unsafe { bpf_skb_load_bytes(ctx.as_ptr() as *const c_void, name + 5, buf as *mut c_void, n) };
+    if ret != 0 {
+        return false;
+    }
+    let mut scan = SniScan { len: n, hit: 0, h: FNV_OFFSET };
+    unsafe {
+        bpf_loop(n, sni_byte as *mut c_void, &mut scan as *mut SniScan as *mut c_void, 0);
+    }
+    if scan.hit != 0 {
+        return true;
+    }
+    unsafe { SNI_BLOCKS.get(&scan.h) }.is_some_and(|f| *f & SNI_SELF != 0)
+}
+
+/// Marks the connection of a blocked ClientHello as denied, so its later
+/// packets drop too, and logs the denial once.
+#[inline(never)]
+fn sni_deny(key: &FlowKey, tgid: u32) {
+    let mut c = ConnKey::default();
+    conn_key(key, &mut c);
+    let prev = unsafe { CONNS.get(&c) }.map_or(0, |s| s.action);
+    let st = ConnState { generation: cfg(CFG_GEN), dir: DIR_OUT, action: ACTION_DENY, exe_known: 1, answered: 0, tgid };
+    let _ = CONNS.insert(&c, &st, 0);
+    if prev != ACTION_DENY {
+        deny_event(&c, tgid);
+    }
 }
 
 /// Is this packet over the bandwidth limit of its process's exe? Egress
@@ -643,6 +770,15 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
         let tgid = if local { packet_tgid(ctx, egress) } else { 0 };
         let denied = local && packet_denied(key, egress, tgid);
         if denied || (local && over_limit(key, egress, tgid, ctx.len() as u64)) {
+            action = TC_ACT_SHOT;
+        } else if local
+            && egress
+            && key.proto == IPPROTO_TCP
+            && payload > 0
+            && cfg(CFG_SNI) != 0
+            && sni_blocked(ctx, payload as u32)
+        {
+            sni_deny(key, tgid);
             action = TC_ACT_SHOT;
         }
         // DNS answers: from port 53, on every interface (lo carries the

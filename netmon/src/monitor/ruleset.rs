@@ -62,14 +62,26 @@ impl<K: Kernel> Monitor<K> {
             l.set_names(names);
             parts.push(if l.error.is_empty() { format!("{} {}", l.path, l.count) } else { format!("{} failed: {}", l.path, l.error) });
         }
-        let err = self.sync_host_blocks(Instant::now()).map(|e| format!("; {e}")).unwrap_or_default();
+        let (hosts, sni) = (self.sync_host_blocks(Instant::now()), self.sync_sni());
+        let err = hosts.or(sni).map(|e| format!("; {e}")).unwrap_or_default();
         format!("blocklists reloaded: {}{err}", parts.join(", "))
+    }
+
+    /// Writes the blocked server names to the kernel, which drops a TLS
+    /// ClientHello that names one. Returns an error message.
+    pub(crate) fn sync_sni(&mut self) -> Option<String> {
+        match self.probe.set_sni_blocks(&self.rules.sni_entries()) {
+            Ok(0) => None,
+            Ok(n) => Some(format!("{n} blocked server names not in the kernel: map full")),
+            Err(e) => Some(format!("server name blocks not set: {e:#}")),
+        }
     }
 
     pub(crate) fn remove_host(&mut self, id: u32) -> String {
         if self.rules.blocklists.iter().any(|l| l.id == id) {
             let path = self.rules.remove_blocklist(id).unwrap_or_default();
-            let err = self.sync_host_blocks(Instant::now()).map(|e| format!("; {e}")).unwrap_or_default();
+            let (hosts, sni) = (self.sync_host_blocks(Instant::now()), self.sync_sni());
+            let err = hosts.or(sni).map(|e| format!("; {e}")).unwrap_or_default();
             return format!("removed blocklist {path} (s saves the rules file without it){err}");
         }
         let mut name = String::new();
@@ -206,6 +218,9 @@ impl<K: Kernel> Monitor<K> {
                 let mut host_error = self.sync_host_blocks(Instant::now());
                 if let Err(e) = self.probe.set_limits(&self.rules.kernel_limits()) {
                     host_error = Some(format!("bandwidth limits not set: {e:#}"));
+                }
+                if let Some(e) = self.sync_sni() {
+                    host_error = Some(e);
                 }
                 if let Some(e) = self.sync_exe_blocks().or(host_error) {
                     return format!("{msg}; {e}");

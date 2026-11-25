@@ -71,9 +71,14 @@ struct Fake {
     marked: Vec<(u32, u32)>,
     blocked: HashSet<std::net::IpAddr>,
     limits: Vec<(u32, u64, u64)>,
+    sni: HashMap<u64, u8>,
 }
 
 impl Kernel for Fake {
+    fn set_sni_blocks(&mut self, names: &HashMap<u64, u8>) -> anyhow::Result<usize> {
+        self.sni = names.clone();
+        Ok(0)
+    }
     fn set_limits(&mut self, limits: &[(u32, u64, u64)]) -> anyhow::Result<()> {
         self.limits = limits.to_vec();
         Ok(())
@@ -214,6 +219,7 @@ fn monitor() -> (Monitor<Fake>, Instant) {
         table: Vec::new(),
         exe_ids: Default::default(),
         limits: Vec::new(),
+        sni: HashMap::new(),
         default: 0,
         conns: HashMap::new(),
         names: VecDeque::new(),
@@ -1024,4 +1030,15 @@ fn learned_allow_rules_go_to_the_end() {
     let bad = (crate::rules::Match { exe: Some("rel".into()), ..Default::default() }, String::new());
     assert!(m.request(Request::AddAllowRules(vec![rule(8080), bad])).contains("absolute path"));
     assert_eq!(m.rules.rules.len(), 3);
+}
+
+#[test]
+fn host_blocks_reach_the_kernel_server_name_check() {
+    let (mut m, _) = monitor();
+    m.request(Request::BlockHost { pattern: "*.doubleclick.net".into(), comment: String::new() });
+    let k = netmon_common::sni_hash("doubleclick.net");
+    assert_eq!(m.probe.sni.get(&k), Some(&(netmon_common::SNI_SELF | netmon_common::SNI_BELOW)));
+    let id = m.rules.hosts[0].id;
+    m.request(Request::RemoveHost(id));
+    assert!(m.probe.sni.is_empty());
 }

@@ -466,6 +466,27 @@ it reads, and blocks those addresses in the kernel (`HOST_BLOCKS`).
 - An address leaves the block 1 hour after the last answer for the name,
   like the names in the UI.
 
+The kernel also checks the server name (SNI) in each outbound TLS
+ClientHello against the host blocks and block lists (`SNI_BLOCKS`). A
+ClientHello that names a blocked host is dropped at once, and its
+connection is marked as denied. This also blocks a program that connects
+to an address without DNS (a hard-coded address, DNS over HTTPS) or to an
+address that serves many names.
+
+- The kernel reads only the first TCP segment of the ClientHello. Chrome
+  and Firefox send large ClientHellos (post-quantum key shares) and
+  shuffle the extensions, so the server name can be in the second
+  segment. Then the connection passes, and the address block above takes
+  over.
+- QUIC (HTTP/3) encrypts the ClientHello. `Q` in the Processes tab turns
+  QUIC off for a program, so it uses TCP.
+- The kernel stores a 64-bit hash of each name (FNV-1a over the name from
+  its end), not the name. It checks the name and each parent domain with
+  one lookup per dot.
+- The userspace still learns the address of the blocked name from the
+  ClientHello. That address is then blocked for 1 hour, also for other
+  names on it.
+
 #### Host block lists
 
 A host block list is a file with many names, for example the StevenBlack
