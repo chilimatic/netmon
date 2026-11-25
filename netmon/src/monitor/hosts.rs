@@ -170,4 +170,37 @@ impl<K: Kernel> Monitor<K> {
         self.blocked.insert(ip, (name, now));
         true
     }
+
+    /// Writes the blocked addresses with their age, so the next netmond
+    /// blocks them at once: a program that cached its DNS answer sends no
+    /// new one. Returns an error message.
+    pub(crate) fn save_blocked(&self, path: &std::path::Path, gid: Option<u32>, now: Instant) -> Option<String> {
+        let unix = rules::unix_now();
+        let list: Vec<(std::net::IpAddr, &str, u64)> = self
+            .blocked
+            .iter()
+            .map(|(ip, (name, seen))| (*ip, name.as_str(), unix.saturating_sub(now.duration_since(*seen).as_secs())))
+            .collect();
+        let text = serde_json::to_string(&list).unwrap_or_default();
+        crate::usage::write_private(path, text.as_bytes(), gid).err().map(|e| format!("blocked addresses {}: {e}", path.display()))
+    }
+
+    /// Reads the addresses that an earlier netmond saved, if they are not
+    /// older than names::KEEP and a host pattern still blocks their name,
+    /// and writes them to the kernel.
+    pub(crate) fn load_blocked(&mut self, path: &std::path::Path, now: Instant) -> Option<String> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let list: Vec<(std::net::IpAddr, String, u64)> = serde_json::from_str(&text).unwrap_or_default();
+        let unix = rules::unix_now();
+        for (ip, name, seen) in list {
+            let age = std::time::Duration::from_secs(unix.saturating_sub(seen));
+            if age < names::KEEP
+                && self.rules.host_pattern_blocked(&name)
+                && let Some(t) = now.checked_sub(age)
+            {
+                self.block_address(ip, name, t);
+            }
+        }
+        self.sync_host_blocks(now)
+    }
 }

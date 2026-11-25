@@ -1114,3 +1114,22 @@ fn only_trusted_answers_and_host_patterns_block_addresses() {
     }
     assert_eq!(m.blocked.values().filter(|(n, _)| n == "cdn.example.com").count(), 64);
 }
+
+#[test]
+fn blocked_addresses_survive_a_restart() {
+    let _lock = crate::test_fs_lock();
+    let dir = std::env::temp_dir().join(format!("netmon-blocked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("host-addrs.json");
+    let (mut m, t0) = monitor();
+    m.request(Request::BlockHost { pattern: "*.example.com".into(), comment: String::new() });
+    m.block_address("203.0.113.5".parse().unwrap(), "cdn.example.com".into(), t0);
+    m.block_address("203.0.113.6".parse().unwrap(), "other.org".into(), t0);
+    assert!(m.save_blocked(&path, None, t0).is_none());
+    let (mut n, t1) = monitor();
+    n.request(Request::BlockHost { pattern: "*.example.com".into(), comment: String::new() });
+    n.load_blocked(&path, t1);
+    assert_eq!(n.probe.blocked, HashSet::from(["203.0.113.5".parse().unwrap()]), "only names a pattern still blocks");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

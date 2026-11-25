@@ -100,4 +100,4 @@ Status column: the state after the fixes of 2026-11-25 (commits
 
 | # | Sev | Finding | Where | Src | Status |
 |---|-----|---------|-------|-----|--------|
-| N1 | Low | `systemctl restart netmond` leaves about 3 seconds without rules, also without host and server name blocks: the clean stop removes the pins, and loading the programs and rules takes about 3 s. A crash keeps the old rules. Found when a test ran right after a restart. | `netmon/src/daemon.rs`, `probe.rs` (`unpin`, `commit_pins`) | live test | documented |
+| N1 | Low | `systemctl restart netmond` leaves about 3 seconds without rules, also without host and server name blocks: the clean stop removes the pins, and loading the programs and rules takes about 3 s. A crash keeps the old rules. Found when a test ran right after a restart. | `netmon/src/daemon.rs`, `probe.rs` (`unpin`, `commit_pins`) | live test | fixed: a restart job keeps the pins; the blocked addresses are saved over the restart |

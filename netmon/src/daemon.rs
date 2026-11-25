@@ -233,21 +233,62 @@ pub fn run() -> anyhow::Result<()> {
     std::thread::spawn(move || accept(listener, gid, tx, count));
     let mut engine = Engine::new(mon, args.monitor.interval());
     let result = serve(&mut engine, &rx, &warnings);
-    // A clean stop: the kernel side goes with the process. Only a crash
-    // leaves the pins, and with them the rules.
-    engine.mon.probe.unpin();
+    // A clean stop: the kernel side goes with the process. A restart and a
+    // crash leave the pins, and with them the rules: the next netmond takes
+    // them over when its own rules are in force, so no moment without them.
+    let restart = own_unit().is_some_and(|u| restart_pending(&u));
+    if !restart {
+        engine.mon.probe.unpin();
+    }
     if let Some(e) = engine.mon.usage.as_mut().and_then(|u| u.save(Instant::now(), true)) {
         eprintln!("netmond: {e}");
     }
     if let Some(e) = engine.mon.alerts.save(Instant::now(), true) {
         eprintln!("netmond: {e}");
     }
+    if let Some(e) = engine.mon.save_blocked(Path::new(crate::monitor::BLOCKED_PATH), gid, Instant::now()) {
+        eprintln!("netmond: {e}");
+    }
     if let Some(e) = engine.mon.discovery.as_mut().and_then(|d| d.save(Instant::now(), true)) {
         eprintln!("netmond: {e}");
     }
     let _ = std::fs::remove_file(&args.socket);
-    eprintln!("netmond: stopped, rules removed");
+    if restart {
+        eprintln!("netmond: stopped for a restart, the rules stay in force until the new netmond takes over");
+    } else {
+        eprintln!("netmond: stopped, rules removed");
+    }
     result
+}
+
+/// The systemd service this process runs in, from /proc/self/cgroup.
+fn own_unit() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    unit_of_cgroup(&text)
+}
+
+/// `0::/system.slice/netmond.service` -> `netmond.service`.
+fn unit_of_cgroup(text: &str) -> Option<String> {
+    text.lines().find_map(|l| l.strip_prefix("0::")).and_then(|p| p.rsplit('/').find(|c| c.ends_with(".service"))).map(str::to_string)
+}
+
+/// Is systemd restarting the unit right now? Asked at the stop: a restart
+/// job (also try-restart and reload-or-restart) is still listed while the
+/// old process ends.
+fn restart_pending(unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(["list-jobs", "--no-legend", "--no-pager", unit])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| restart_job(&String::from_utf8_lossy(&o.stdout), unit))
+}
+
+/// Does the `systemctl list-jobs` output hold a restart job of the unit?
+fn restart_job(list: &str, unit: &str) -> bool {
+    list.lines().any(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.len() >= 3 && f[1] == unit && f[2].ends_with("restart")
+    })
 }
 
 fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> anyhow::Result<()> {
@@ -559,6 +600,18 @@ fn allowed(cred: &libc::ucred, groups: &[u32], gid: Option<u32>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restart_job_keeps_the_rules() {
+        assert_eq!(unit_of_cgroup("0::/system.slice/netmond.service\n").as_deref(), Some("netmond.service"));
+        assert_eq!(unit_of_cgroup("0::/user.slice/user-1000.slice/session-2.scope\n"), None);
+        let jobs = "1234 netmond.service restart running\n1240 other.service start waiting\n";
+        assert!(restart_job(jobs, "netmond.service"));
+        assert!(!restart_job("1234 netmond.service stop running\n", "netmond.service"), "a stop removes the rules");
+        assert!(restart_job("7 netmond.service try-restart running\n", "netmond.service"));
+        assert!(!restart_job(jobs, "other.service"));
+        assert!(!restart_job("", "netmond.service"));
+    }
 
     #[test]
     fn supplementary_groups() {

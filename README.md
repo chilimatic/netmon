@@ -1407,11 +1407,17 @@ questions and the capture itself are shared.
   socket and all programs. No rule is in force after a clean stop.
 - `SIGHUP` does not stop `netmond`. It writes a line to the journal, and the
   rules stay.
-- `systemctl restart netmond` is a clean stop and a new start. For about
-  3 seconds (loading the programs and the rules) no rule is in force,
-  also no host or server name block. Then the rules file loads. Rules that
-  were not saved are lost. A crash keeps the old rules in force instead
-  (see below).
+- `systemctl restart netmond` keeps the rules in force. The stopping
+  netmond asks systemd (`systemctl list-jobs`) whether a restart job runs.
+  If so, it leaves its pinned programs attached, as after a crash. The new
+  netmond loads its programs and the rules file next to them (about 3 s)
+  and only then detaches the old ones. Rules that were not saved are lost.
+  A restart that `netmond` does not run as a systemd service (or a stop
+  of the service) removes the rules.
+- The addresses of blocked names go to `/var/lib/netmon/host-addrs.json`
+  at each stop and come back at the start, if they are less than 1 hour
+  old and a host pattern still blocks the name. A program that cached its
+  DNS answer sends no new answer to learn them from.
 
 `netmond` pins its links under `/sys/fs/bpf/netmon`: the TC links per
 interface, the cgroup hooks and the tracepoints. A pinned link stays

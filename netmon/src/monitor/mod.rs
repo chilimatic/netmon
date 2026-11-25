@@ -39,6 +39,8 @@ pub(crate) use containers::{ContainerResult, container_of, container_reader};
 pub use ruleset::RulesFileError;
 use ruleset::{GUARD_REFRESH, Guard, read_resolv};
 pub(crate) use alerts::COUNTRIES_PATH;
+/// Blocked addresses kept over a restart.
+pub(crate) const BLOCKED_PATH: &str = "/var/lib/netmon/host-addrs.json";
 pub(crate) use ruleset::{PROFILES_DIR, check_profile_name};
 
 /// Options of the monitor itself: in `netmon` local mode and in `netmond`.
@@ -268,6 +270,13 @@ impl Monitor {
         let lost = mon.probe.seed(&conns, &listeners);
         if lost > 0 {
             errors.push(format!("{lost} existing sockets got no owner entry: maps full"));
+        }
+        // netmond: the addresses of blocked names that the earlier netmond
+        // learned, before its programs detach.
+        if pin_dir.is_some()
+            && let Some(e) = mon.load_blocked(std::path::Path::new(BLOCKED_PATH), Instant::now())
+        {
+            errors.push(e);
         }
         // Only now, with rules, guard and owners in place, the programs of
         // an earlier netmond detach.
