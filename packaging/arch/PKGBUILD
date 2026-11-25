@@ -1,0 +1,59 @@
+# Arch Linux package of netmon, built from the git repository.
+# Build: cd packaging/arch && makepkg -si
+# The eBPF part needs a nightly Rust toolchain and bpf-linker. prepare()
+# installs the nightly toolchain with rustup if it is missing.
+pkgname=netmon-git
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc="eBPF network monitor and per-program firewall with a terminal UI"
+arch=('x86_64' 'aarch64')
+url="https://github.com/chilimatic/netmon"
+license=('MIT OR Apache-2.0')
+depends=('glibc' 'gcc-libs' 'systemd')
+makedepends=('git' 'rustup' 'bpf-linker')
+optdepends=(
+    'libnotify: desktop notifications (netmon-notify)'
+    'curl: GeoIP and block list updates'
+    'gzip: GeoIP updates'
+)
+provides=('netmon')
+conflicts=('netmon')
+install=netmon.install
+# NETMON_GIT=file:///path/to/checkout builds a local commit instead.
+source=("netmon::git+${NETMON_GIT:-$url.git}")
+sha256sums=('SKIP')
+# The eBPF object must not be stripped or built with LTO flags of makepkg.
+options=('!lto' '!debug')
+
+pkgver() {
+    cd netmon
+    local v
+    v=$(sed -n 's/^version = "\(.*\)"/\1/p' netmon/Cargo.toml | head -n1)
+    printf '%s.r%s.g%s' "$v" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+    cd netmon
+    rustup toolchain list | grep -q '^nightly' || rustup toolchain install nightly --component rust-src
+    rustup component list --toolchain nightly --installed | grep -q '^rust-src' || rustup component add rust-src --toolchain nightly
+    cargo fetch --locked
+}
+
+build() {
+    cd netmon
+    # makepkg exports CFLAGS and RUSTFLAGS for the host; the bpf target
+    # must not get them.
+    unset RUSTFLAGS
+    cargo build --release --locked --frozen
+}
+
+check() {
+    cd netmon
+    unset RUSTFLAGS
+    AYA_BUILD_SKIP=1 cargo test --locked --frozen
+}
+
+package() {
+    cd netmon
+    sh packaging/install-tree.sh "$PWD" "$pkgdir"
+}

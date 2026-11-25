@@ -1,0 +1,18 @@
+post_install() {
+    cat <<'EOF'
+netmon is installed. To start the firewall daemon and use the UI without sudo:
+  sudo usermod -aG netmon "$USER"      (then log out and log in again)
+  sudo cp /usr/share/doc/netmon/rules.example.toml /etc/netmon/rules.toml   (optional)
+  sudo systemctl enable --now netmond
+  netmon
+Optional: systemctl --user enable --now netmon-notify   (desktop notifications)
+EOF
+}
+
+post_upgrade() {
+    echo "netmon: restart the daemon to load the new version: sudo systemctl restart netmond"
+}
+
+pre_remove() {
+    systemctl disable --now netmond.service >/dev/null 2>&1 || true
+}
