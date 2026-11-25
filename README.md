@@ -1764,3 +1764,12 @@ netmon-local --local
 
 This capability set comes from the kernel checks. It was not tested
 without root.
+
+## License
+
+netmon is licensed under either of the [MIT license](LICENSE-MIT) or the
+[Apache License 2.0](LICENSE-APACHE), at your option. The eBPF programs in
+`netmon-ebpf` declare `Dual MIT/GPL` to the kernel, because some kernel
+helpers that they call are only available to GPL-compatible programs. The
+DB-IP databases have their own license (see
+[Country and network owner](#country-and-network-owner)).
