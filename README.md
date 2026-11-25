@@ -78,6 +78,29 @@ rates, finds the owner of each connection, and sends a snapshot to each
 connected UI. The UI draws the snapshot and sends back requests, for
 example "block this address".
 
+## Screenshots
+
+Screenshots of a real host. Addresses, MAC addresses, domain names,
+container names and the host name are replaced with made-up values.
+
+![Connections tab](docs/screenshots/01-connections.png)
+
+![DNS log in the Log tab](docs/screenshots/08-dns-log.png)
+
+![Devices tab](docs/screenshots/10-devices.png)
+
+The other tabs:
+
+- [Processes](docs/screenshots/02-processes.png)
+- [Interfaces](docs/screenshots/03-interfaces.png)
+- [Capture](docs/screenshots/04-capture.png)
+- [Rules](docs/screenshots/05-rules.png)
+- [Graph](docs/screenshots/06-graph.png)
+- [Hosts](docs/screenshots/07-hosts.png)
+- [Connection log](docs/screenshots/08-log.png)
+- [Usage per program](docs/screenshots/09-usage.png) and
+  [per destination](docs/screenshots/09-usage-destinations.png)
+
 ## Network diagram
 
 ```
