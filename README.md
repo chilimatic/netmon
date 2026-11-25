@@ -153,6 +153,26 @@ cargo build --release
 
 The binaries are `target/release/netmond` and `target/release/netmon`.
 
+### Packages
+
+`packaging/` builds packages that install the binaries to `/usr/bin`, the
+units to `/usr/lib/systemd` and the group `netmon` with `sysusers.d`. Both
+need the toolchain above.
+
+- Arch Linux and Manjaro: `cd packaging/arch && makepkg -si` builds the
+  package `netmon-git` from the GitHub repository and installs it. To
+  build a local commit, set `NETMON_GIT=file:///path/to/checkout`.
+- Debian and Ubuntu: `packaging/deb/build.sh` builds
+  `target/debian/netmon_VERSION_ARCH.deb` with `dpkg-deb`. Install it with
+  `sudo apt install ./target/debian/netmon_*.deb`.
+
+After the install, add your user to the group `netmon`, log out and in
+again, copy `/usr/share/doc/netmon/rules.example.toml` to
+`/etc/netmon/rules.toml` if you want rules, and run
+`sudo systemctl enable --now netmond`. The optional timers
+(`netmon-geoip.timer`, `netmon-blocklists.timer`) and the user unit
+`netmon-notify.service` are installed, but not enabled.
+
 ### Install as a service
 
 With this installation, the rules are in force from boot, also when nobody

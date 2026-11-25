@@ -3,7 +3,7 @@
 # The eBPF part needs a nightly Rust toolchain and bpf-linker. prepare()
 # installs the nightly toolchain with rustup if it is missing.
 pkgname=netmon-git
-pkgver=0.1.0.r0.g0000000
+pkgver=0.1.0.r75.g88ee8dc
 pkgrel=1
 pkgdesc="eBPF network monitor and per-program firewall with a terminal UI"
 arch=('x86_64' 'aarch64')
@@ -41,15 +41,15 @@ prepare() {
 
 build() {
     cd netmon
-    # makepkg exports CFLAGS and RUSTFLAGS for the host; the bpf target
-    # must not get them.
-    unset RUSTFLAGS
+    # makepkg exports RUSTFLAGS for the host; the bpf target must not get
+    # them. Only the build path is remapped, so no binary names $srcdir.
+    export RUSTFLAGS="--remap-path-prefix=$srcdir=/usr/src/netmon"
     cargo build --release --locked --frozen
 }
 
 check() {
     cd netmon
-    unset RUSTFLAGS
+    export RUSTFLAGS="--remap-path-prefix=$srcdir=/usr/src/netmon"
     AYA_BUILD_SKIP=1 cargo test --locked --frozen
 }
 

@@ -547,6 +547,10 @@ Small, independent features after the firewall core:
   bpf_loop, one lookup per dot. A hit drops the packet, writes a deny
   verdict to CONNS and sends a deny event. CFG_SNI turns it on. Tested:
   same address, example.org passes, ad.doubleclick.net times out.
+- **Packaging: done (2026-11-25).** `packaging/install-tree.sh` (shared
+  layout), `packaging/arch/PKGBUILD` (`netmon-git`, nightly via rustup in
+  prepare), `packaging/deb/build.sh` (dpkg-deb). Not published: the AUR
+  needs an upload by the owner.
 - **History: done (2026-11-25).** No SQLite: the usage file keeps 400
   days per program and per destination (registrable domain, else
   address; 1000 per day). Today is in `usage.json` (every 60 s), older
