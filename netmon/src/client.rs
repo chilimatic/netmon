@@ -211,6 +211,14 @@ impl Client {
             }
             Action::ReloadBlocklists => Ok(Request::ReloadBlocklists),
             Action::ScanDevices => Ok(Request::ScanDevices),
+            Action::BlockDnsName => {
+                let rows = app.dns_rows();
+                let ids: Vec<_> = rows.iter().map(|(_, id)| id.clone()).collect();
+                match app.selected_in(&ids).map(|i| rows[i].0) {
+                    Some(e) => Ok(Request::BlockHost { pattern: e.name.clone(), comment: "from the DNS log".into() }),
+                    None => Err("no DNS entry selected".into()),
+                }
+            }
             Action::PickProfile => {
                 let dir = std::path::Path::new(crate::rulefile::DEFAULT_PATH).with_file_name(crate::monitor::PROFILES_DIR);
                 app.profiles = list_profiles(&dir);

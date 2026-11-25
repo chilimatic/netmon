@@ -90,6 +90,8 @@ pub enum RowId {
     Usage(String),
     /// A device by its MAC address.
     Device([u8; 6]),
+    /// A DNS log entry, by its content.
+    Dns(u64),
 }
 
 pub struct ConnRow {
@@ -224,6 +226,9 @@ pub struct App {
     pub usage_error: String,
     /// Devices on the LANs (Devices tab), from the monitor.
     pub devices: Vec<crate::devices::Device>,
+    /// The DNS log, oldest first, and whether the Log tab shows it.
+    pub dns: std::collections::VecDeque<crate::dnslog::DnsEntry>,
+    pub show_dns: bool,
     /// The profile picker is open (Rules tab, P): names and selection.
     pub picking_profile: bool,
     pub profiles: Vec<String>,
@@ -269,6 +274,8 @@ impl Default for App {
             usage: Vec::new(),
             usage_error: String::new(),
             devices: Vec::new(),
+            dns: Default::default(),
+            show_dns: false,
             picking_profile: false,
             profiles: Vec::new(),
             profile_sel: 0,
@@ -338,6 +345,8 @@ pub enum Action {
     ReloadBlocklists,
     /// ARP requests to every address of the LANs now.
     ScanDevices,
+    /// Block the name of the selected DNS log entry.
+    BlockDnsName,
     /// Open the profile picker (the client lists the profiles).
     PickProfile,
     /// Set the display filter of the capture; empty clears it.
@@ -551,6 +560,11 @@ impl App {
             Key::Char('d') if self.tab == Tab::Hosts => return Some(Action::RemoveHost),
             Key::Char('r') if self.tab == Tab::Hosts => return Some(Action::ReloadBlocklists),
             Key::Char('r') if self.tab == Tab::Devices => return Some(Action::ScanDevices),
+            Key::Char('d') if self.tab == Tab::Log => {
+                self.show_dns = !self.show_dns;
+                self.reset_selection();
+            }
+            Key::Char('b') if self.tab == Tab::Log && self.show_dns => return Some(Action::BlockDnsName),
             Key::Char('s') if self.tab == Tab::Hosts => return Some(Action::SaveRules),
             Key::Char('H') if self.tab == Tab::Connections => return Some(Action::BlockHostOfRow),
             Key::Char('b') if self.tab == Tab::Connections => return Some(Action::ToggleBlockRemote),
@@ -631,6 +645,35 @@ impl App {
         }
         let needle = self.filter.to_lowercase();
         fields.iter().any(|f| f.to_lowercase().contains(&needle))
+    }
+
+    /// Adds new DNS log entries; the oldest go first.
+    pub fn add_dns(&mut self, entries: Vec<crate::dnslog::DnsEntry>) {
+        for e in entries {
+            if self.dns.len() >= crate::dnslog::MAX_ENTRIES {
+                self.dns.pop_front();
+            }
+            self.dns.push_back(e);
+        }
+    }
+
+    /// The DNS log entries that match the filter, newest first, with their ids.
+    pub fn dns_rows(&self) -> Vec<(&crate::dnslog::DnsEntry, RowId)> {
+        use std::hash::{Hash, Hasher};
+        self.dns
+            .iter()
+            .rev()
+            .filter(|e| {
+                let (server, pid) = (e.server.to_string(), e.pid.map(|p| p.to_string()).unwrap_or_default());
+                let blocked = if e.blocked { "blocked" } else { "" };
+                self.matches(&[&e.program, &pid, &server, &e.name, &e.qtype, &e.rcode, &e.answers.join(" "), blocked])
+            })
+            .map(|e| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                e.hash(&mut h);
+                (e, RowId::Dns(h.finish()))
+            })
+            .collect()
     }
 
     /// The log lines that match the filter, newest first, with their ids.

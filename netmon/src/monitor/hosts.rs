@@ -8,6 +8,7 @@ impl<K: Kernel> Monitor<K> {
     /// this server for, while one address can serve many DNS names.
     pub(crate) fn refresh_hosts(&mut self, now: Instant) {
         self.poll_names(now);
+        self.log_dns();
         // Names of connections that are gone.
         let flows = &self.collector.flows;
         self.sni.retain(|k, _| flows.contains_key(k));
@@ -27,11 +28,30 @@ impl<K: Kernel> Monitor<K> {
     /// hostname goes to the kernel at once. Returns whether it found one.
     pub(crate) fn poll_names(&mut self, now: Instant) -> bool {
         let mut learned: Vec<(std::net::IpAddr, String)> = Vec::new();
-        let (hosts, sni, parts) = (&mut self.hosts, &mut self.sni, &mut self.hello_parts);
+        let (hosts, sni, parts, dns) = (&mut self.hosts, &mut self.sni, &mut self.hello_parts, &mut self.dns_pending);
+        let unix = rules::unix_now();
         self.probe.drain_names(NAME_BATCH, |ev| {
             let data = &ev.data[..(ev.len as usize).min(ev.data.len())];
             match ev.kind {
                 netmon_common::NAME_DNS => {
+                    if let Some(a) = names::dns_answer(data)
+                        && dns.len() < crate::dnslog::MAX_ENTRIES
+                    {
+                        dns.push((
+                            ev.key,
+                            crate::dnslog::DnsEntry {
+                                time: unix,
+                                program: String::new(),
+                                pid: None,
+                                server: procmap::normalize(collector::addr(ev.key.family, &ev.key.remote_addr, 0)).ip(),
+                                name: a.name,
+                                qtype: names::qtype_text(a.qtype),
+                                rcode: names::rcode_text(a.rcode),
+                                answers: a.answers,
+                                blocked: false,
+                            },
+                        ));
+                    }
                     for (ip, name, _ttl) in names::dns_answers(data) {
                         learned.push((ip, name.clone()));
                         hosts.insert(ip, name, now);
@@ -73,5 +93,27 @@ impl<K: Kernel> Monitor<K> {
             let _ = self.sync_host_blocks(now);
         }
         found
+    }
+
+    /// Moves the answers read since the last tick into the DNS log, with
+    /// the program that owns the asking socket. The owners are resolved at
+    /// this point of the tick.
+    pub(crate) fn log_dns(&mut self) {
+        for (k, mut e) in std::mem::take(&mut self.dns_pending) {
+            if let Some(f) = self.collector.flows.get(&k) {
+                e.program = crate::usage::program(f);
+                e.pid = f.owner.as_ref().map(|o| o.pid);
+            } else {
+                e.program = crate::usage::UNKNOWN.into();
+            }
+            e.blocked = self.rules.host_blocked(&e.name);
+            if self.dns_log.len() >= crate::dnslog::MAX_ENTRIES {
+                self.dns_log.pop_front();
+            }
+            self.dns_log.push_back(e.clone());
+            if self.new_dns.len() < crate::dnslog::MAX_ENTRIES {
+                self.new_dns.push(e);
+            }
+        }
     }
 }

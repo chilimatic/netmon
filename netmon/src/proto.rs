@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Version of this protocol. Client and daemon must have the same.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 /// Where `netmond` listens.
 pub const DEFAULT_SOCKET: &str = "/run/netmon.sock";
@@ -53,6 +53,9 @@ pub enum ToClient {
     Listener(crate::monitor::listen::NewListener),
     /// A rate, new-country or new-device alert (`[alerts]` in the rules file).
     Alert(String),
+    /// New DNS log entries, oldest first. A new client first gets the
+    /// entries the monitor keeps.
+    Dns(Vec<crate::dnslog::DnsEntry>),
 }
 
 /// One JSON line with its newline.

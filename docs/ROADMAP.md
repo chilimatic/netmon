@@ -512,6 +512,12 @@ Small, independent features after the firewall core:
   unknown MAC, 2 min learning without the file. Protocol 8. The unit got
   `AF_PACKET` and `CAP_NET_RAW`. Tested on the host: 4 devices, router
   marked, alerts for the new ones, none after a restart.
+- **DNS log: done (2026-11-25).** `d` in the Log tab. Every DNS answer
+  from the NAMES ring (all interfaces, also NXDOMAIN) with the program of
+  the asking flow (looked up at the tick, after owner resolution), type,
+  result, server and a blocked mark. netmond keeps 5000 in memory and
+  sends new ones as `ToClient::Dns` (backlog at connect). `b` blocks the
+  name. Protocol 9. Tested: getent, NXDOMAIN, a blocked ad domain.
 - **History**: per-process daily totals in SQLite.
 
 ## Phase 9 – Connection graph

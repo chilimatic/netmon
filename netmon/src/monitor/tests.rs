@@ -953,3 +953,34 @@ fn a_question_of_several_containers_gets_no_single_name() {
     assert_eq!(m.asks.pending[0].comm, SEVERAL, "not the first container's name");
     assert_eq!(m.asks.pending[0].pid, 0);
 }
+
+#[test]
+fn dns_log_names_the_asking_program_and_marks_blocked_names() {
+    let (mut m, t0) = monitor();
+    m.probe.flows = vec![(key(53), tx(10))];
+    m.tick_at(secs(t0, 1));
+    m.collector.flows.get_mut(&key(53)).unwrap().owner = Some(Owner::new(4242, "curl"));
+    m.rules.add_blocklist("/etc/netmon/lists/test.txt", "test", Ok((["example.com".to_string()].into(), 1))).unwrap();
+    let mut dns = vec![0, 2, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+    dns.extend_from_slice(b"\x03cdn\x07example\x03com\x00\x00\x01\x00\x01");
+    dns.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 5]);
+    let mut ev = netmon_common::NameEvent {
+        key: key(53),
+        len: dns.len() as u16,
+        kind: netmon_common::NAME_DNS,
+        _pad: 0,
+        data: [0; netmon_common::NAME_DATA],
+    };
+    ev.data[..dns.len()].copy_from_slice(&dns);
+    m.probe.names.push_back(ev);
+    // Read between ticks (host blocks exist), logged at the next tick.
+    assert!(m.poll_names(secs(t0, 1)));
+    assert!(m.dns_log.is_empty());
+    m.tick_at(secs(t0, 2));
+    let e = m.dns_log.back().unwrap();
+    assert_eq!((e.program.as_str(), e.pid, e.name.as_str(), e.qtype.as_str()), ("curl", Some(4242), "cdn.example.com", "A"));
+    assert_eq!(e.answers, vec!["203.0.113.5"]);
+    assert!(e.blocked);
+    assert_eq!(e.result(), "203.0.113.5");
+    assert_eq!(m.new_dns.len(), 1);
+}

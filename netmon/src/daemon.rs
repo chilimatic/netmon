@@ -272,6 +272,10 @@ fn serve(engine: &mut Engine, rx: &Receiver<Incoming>, warnings: &[String]) -> a
                     };
                     out.push(proto::line(&hello).into(), false);
                     out.push(proto::line(&engine.snapshot()).into(), true);
+                    if !engine.mon.dns_log.is_empty() {
+                        let backlog = ToClient::Dns(engine.mon.dns_log.iter().cloned().collect());
+                        out.push(proto::line(&backlog).into(), false);
+                    }
                     clients.insert(id, out);
                 }
                 Ok(Incoming::Request { id, req }) => {

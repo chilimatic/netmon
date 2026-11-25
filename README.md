@@ -312,6 +312,8 @@ and `--no-devices` (no ARP requests and no Devices tab).
 | `z` | Graph | Switch the level: process, container, domain |
 | `s` `S` | Usage | Sort by the next column, reverse the order |
 | `r` | Devices | Send ARP requests to the LANs now |
+| `d` | Log | Switch between the connection log and the DNS log |
+| `b` | Log (DNS) | Block the name of the selected DNS answer |
 | `a` `A` `d` `D` `o` `x` | question window | Answer a question (see [Ask mode](#ask-mode)) |
 | `Esc` | question window | Put the questions aside: the tab gets its keys back |
 | `?` | everywhere | Show the questions again |
@@ -585,6 +587,31 @@ object per line:
 - The file belongs to root and group `netmon`, mode 0640. It shows which
   program talks to which host, so only the group can read it.
 - With `sudo netmon --local`, no log is written.
+
+#### DNS log
+
+`d` in the Log tab switches between the connection log and the DNS log.
+The DNS log shows every DNS answer that the host receives, newest first:
+time (UTC), the program that asked and its PID, the name, the query type,
+the result and the DNS server that answered.
+
+- The result is the addresses and CNAME targets of the answer, or the
+  error (`NXDOMAIN`: the name does not exist, `SERVFAIL`, `REFUSED`).
+  Errors are yellow.
+- A red line with `blocked:` is a name that a host block or a block list
+  matches. The program got an answer, but `netmond` blocks connections to
+  its addresses.
+- `b` blocks the name of the selected line (as `a` in the Hosts tab).
+- `/` filters by program, name, type, result or server. Type `blocked` to
+  see only the blocked names.
+- With a local resolver (systemd-resolved, a VPN client, dnsmasq), the
+  program asks the resolver and the resolver asks upstream. Both lines
+  show: the program with the local server, the resolver with the
+  upstream server.
+- Encrypted DNS (DNS over HTTPS or TLS, for example in a browser) is not
+  visible. Answers over TCP are not logged.
+- `netmond` keeps the newest 5000 answers in memory only, and sends them
+  to a UI when it connects. A restart of `netmond` clears them.
 
 ### Usage tab
 

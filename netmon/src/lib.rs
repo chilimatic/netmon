@@ -12,6 +12,7 @@ mod connlog;
 mod daemon;
 mod decode;
 mod devices;
+mod dnslog;
 mod engine;
 mod geo;
 mod graph;

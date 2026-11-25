@@ -139,7 +139,14 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             app.filter
         )
     } else if app.tab == Tab::Log {
-        format!(" q quit  ←→/0-9 view  ↑↓ select  / filter [{}]   newest first, read every 2 s", app.filter)
+        if app.show_dns {
+            format!(
+                " q quit  ←→/0-9 view  ↑↓ select  d connection log  b block name  / filter [{}]   DNS answers, newest first",
+                app.filter
+            )
+        } else {
+            format!(" q quit  ←→/0-9 view  ↑↓ select  d DNS log  / filter [{}]   newest first, read every 2 s", app.filter)
+        }
     } else if app.tab == Tab::Rules {
         " q quit  ←→/0-9 view  ↑↓ select  d remove rule  t end time 1h/1d/never  P profile  s save to rules file   tmp rules end when the monitor stops".to_string()
     } else {
@@ -755,8 +762,69 @@ fn draw_devices(f: &mut Frame, app: &mut App, area: Rect) {
     render_table(f, app, table, &ids, area);
 }
 
+/// The DNS view of the Log tab: the newest DNS answers.
+fn draw_dns(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.dns.is_empty() {
+        f.render_widget(
+            Paragraph::new(
+                "\n  No DNS answers yet.\n\n  The monitor logs every DNS answer the host receives, with the program that asked.\n  \
+                 Encrypted DNS (DNS over HTTPS or TLS) is not visible (see README).",
+            )
+            .block(Block::new().borders(Borders::TOP)),
+            area,
+        );
+        return;
+    }
+    let rows = app.dns_rows();
+    let ids: Vec<RowId> = rows.iter().map(|(_, id)| id.clone()).collect();
+    let lines: Vec<Row> = rows
+        .iter()
+        .map(|(e, _)| {
+            let color = if e.blocked {
+                Color::Red
+            } else if e.rcode != "ok" {
+                Color::Yellow
+            } else {
+                Color::Reset
+            };
+            let program = std::path::Path::new(&e.program).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(e.program.clone());
+            let program = match e.pid {
+                Some(p) => format!("{program} ({p})"),
+                None => program,
+            };
+            let result = if e.blocked { format!("blocked: {}", e.result()) } else { e.result() };
+            Row::new(vec![
+                Cell::from(crate::rulefile::utc(e.time).replace('T', " ").trim_end_matches('Z').to_string()),
+                Cell::from(program),
+                Cell::from(e.name.clone()),
+                Cell::from(e.qtype.clone()),
+                Cell::from(result),
+                Cell::from(e.server.to_string()),
+            ])
+            .style(Style::new().fg(color))
+        })
+        .collect();
+    let table = Table::new(
+        lines,
+        [
+            Constraint::Length(19),
+            Constraint::Length(22),
+            Constraint::Fill(2),
+            Constraint::Length(6),
+            Constraint::Fill(3),
+            Constraint::Length(15),
+        ],
+    )
+    .header(header_row(&["Time (UTC)", "Program", "Name", "Type", "Result", "Server"]));
+    render_table(f, app, table, &ids, area);
+}
+
 /// The Log tab: the newest lines of the connection log.
 fn draw_log(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.show_dns {
+        draw_dns(f, app, area);
+        return;
+    }
     if app.log.is_empty() {
         let why = if app.log_error.is_empty() { "The log is empty.".to_string() } else { app.log_error.clone() };
         f.render_widget(
@@ -1141,6 +1209,37 @@ mod tests {
         assert!(ff.contains(&human(300_000_000.0)) && ff.contains(&human(1_000_000_000.0)), "{ff}");
         assert!(s.find("firefox").unwrap() < s.find("curl").unwrap(), "busiest first");
         assert!(s.contains("Today ↓ ▼"), "{s}");
+    }
+
+    #[test]
+    fn log_tab_switches_to_the_dns_log() {
+        let mut app = App { tab: Tab::Log, show_graph: false, ..App::default() };
+        let e = |name: &str, rcode: &str, blocked: bool| crate::dnslog::DnsEntry {
+            time: 1_764_000_000,
+            program: "/usr/bin/curl".into(),
+            pid: Some(77),
+            server: "100.95.0.251".parse().unwrap(),
+            name: name.into(),
+            qtype: "A".into(),
+            rcode: rcode.into(),
+            answers: if rcode == "ok" { vec!["93.184.215.14".into()] } else { Vec::new() },
+            blocked,
+        };
+        app.add_dns(vec![e("example.com", "ok", false), e("nope.invalid", "NXDOMAIN", false), e("ad.doubleclick.net", "ok", true)]);
+        assert_eq!(app.on_key(crate::app::Key::Char('d')), None);
+        assert!(app.show_dns);
+        let mut term = Terminal::new(TestBackend::new(140, 12)).unwrap();
+        term.draw(|fr| draw(fr, &mut app, &Collector::new(1), &Names::default(), None, &Rules::default())).unwrap();
+        let s = screen(&term);
+        assert!(s.contains("Result") && s.contains("b block name"), "{s}");
+        let row = |n: &str| s.lines().find(|l| l.contains(n)).unwrap().to_string();
+        assert!(row("example.com").contains("curl (77)") && row("example.com").contains("93.184.215.14"));
+        assert!(row("nope.invalid").contains("NXDOMAIN"));
+        assert!(row("ad.doubleclick.net").contains("blocked: 93.184.215.14"));
+        assert!(s.find("ad.doubleclick.net").unwrap() < s.find("example.com ").unwrap(), "newest first");
+        assert_eq!(app.on_key(crate::app::Key::Char('b')), Some(crate::app::Action::BlockDnsName));
+        app.filter = "nxdomain".into();
+        assert_eq!(app.dns_rows().len(), 1);
     }
 
     #[test]

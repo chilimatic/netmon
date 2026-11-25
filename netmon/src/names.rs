@@ -136,6 +136,84 @@ pub fn ptr_answer(p: &[u8]) -> Option<String> {
     None
 }
 
+/// A DNS response as the DNS log shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DnsAnswer {
+    /// The name that was asked.
+    pub name: String,
+    pub qtype: u16,
+    pub rcode: u8,
+    /// Addresses and CNAME targets, in answer order.
+    pub answers: Vec<String>,
+}
+
+/// Answers kept per response in the DNS log.
+const LOG_ANSWERS: usize = 8;
+
+/// Any DNS response with one question: also errors (NXDOMAIN) and answers
+/// without addresses.
+pub fn dns_answer(p: &[u8]) -> Option<DnsAnswer> {
+    let (flags, qd, an) = (u16_at(p, 2)?, u16_at(p, 4)?, u16_at(p, 6)?);
+    if flags & 0x8000 == 0 || qd != 1 {
+        return None;
+    }
+    let (name, off) = read_name(p, 12)?;
+    let qtype = u16_at(p, off)?;
+    let mut off = off + 4;
+    let mut answers = Vec::new();
+    for _ in 0..(an as usize).min(MAX_ANSWERS) {
+        let Some((_, after)) = read_name(p, off) else { break };
+        let (Some(ty), Some(rdlen)) = (u16_at(p, after), u16_at(p, after + 8)) else { break };
+        let data = after + 10;
+        let Some(rdata) = p.get(data..data + rdlen as usize) else { break };
+        let text = match (ty, rdata.len()) {
+            (TYPE_A, 4) => Some(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]).to_string()),
+            (TYPE_AAAA, 16) => Some(Ipv6Addr::from(<[u8; 16]>::try_from(rdata).unwrap()).to_string()),
+            (TYPE_CNAME, _) => read_name(p, data).map(|(n, _)| n),
+            _ => None,
+        };
+        if let Some(t) = text
+            && answers.len() < LOG_ANSWERS
+        {
+            answers.push(t);
+        }
+        off = data + rdlen as usize;
+    }
+    Some(DnsAnswer { name: if name.is_empty() { ".".into() } else { name }, qtype, rcode: (flags & 0x000f) as u8, answers })
+}
+
+const TYPE_CNAME: u16 = 5;
+
+pub fn qtype_text(t: u16) -> String {
+    match t {
+        1 => "A".into(),
+        2 => "NS".into(),
+        5 => "CNAME".into(),
+        6 => "SOA".into(),
+        12 => "PTR".into(),
+        15 => "MX".into(),
+        16 => "TXT".into(),
+        28 => "AAAA".into(),
+        33 => "SRV".into(),
+        64 => "SVCB".into(),
+        65 => "HTTPS".into(),
+        255 => "ANY".into(),
+        _ => format!("TYPE{t}"),
+    }
+}
+
+pub fn rcode_text(r: u8) -> String {
+    match r {
+        0 => "ok".into(),
+        1 => "FORMERR".into(),
+        2 => "SERVFAIL".into(),
+        3 => "NXDOMAIN".into(),
+        4 => "NOTIMP".into(),
+        5 => "REFUSED".into(),
+        _ => format!("RCODE{r}"),
+    }
+}
+
 /// The server name (SNI) of a TLS ClientHello that starts at `p[0]`. None
 /// if the bytes are not a ClientHello, have no SNI, or the SNI is cut off
 /// (it is past the first segment) or is not a plausible hostname.
@@ -272,6 +350,28 @@ mod tests {
                 ("2001:db8::1".parse().unwrap(), "www.example.com".into(), 70000),
             ]
         );
+    }
+
+    #[test]
+    fn log_answer_keeps_type_code_and_all_answers() {
+        let a = dns_answer(&response()).unwrap();
+        assert_eq!((a.name.as_str(), qtype_text(a.qtype).as_str(), rcode_text(a.rcode).as_str()), ("www.example.com", "A", "ok"));
+        assert_eq!(a.answers, vec!["cdn.example.net", "93.184.215.14", "2001:db8::1"]);
+        // NXDOMAIN: no answers, still logged.
+        let mut nx = response();
+        nx[3] = 0x83;
+        nx[7] = 0;
+        nx.truncate(33);
+        let a = dns_answer(&nx).unwrap();
+        assert_eq!((rcode_text(a.rcode).as_str(), a.answers.len()), ("NXDOMAIN", 0));
+        let mut q = response();
+        q[2] = 0x01;
+        assert!(dns_answer(&q).is_none(), "a query");
+        for n in 0..response().len() {
+            let _ = dns_answer(&response()[..n]);
+        }
+        assert_eq!(qtype_text(65), "HTTPS");
+        assert_eq!(qtype_text(99), "TYPE99");
     }
 
     #[test]
