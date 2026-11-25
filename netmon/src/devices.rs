@@ -29,6 +29,12 @@ const SEND_GAP: Duration = Duration::from_millis(2);
 /// Addresses swept per LAN at most. A larger LAN sweeps the /24 of the host.
 const MAX_SWEEP: u32 = 1024;
 const MAX_DEVICES: usize = 4096;
+/// Other IPv4 addresses kept per device.
+const MAX_OTHER_IPS: usize = 4;
+/// Name lookups waiting at most; more are dropped until the queue drains.
+const NAME_QUEUE: usize = 256;
+/// Shortest time between two scans on request.
+const SCAN_GAP: Duration = Duration::from_secs(60);
 /// Without a devices file, the first minutes only learn: every device is new.
 const LEARN: Duration = Duration::from_secs(120);
 const SAVE_EVERY: Duration = Duration::from_secs(60);
@@ -64,6 +70,10 @@ pub struct Device {
     pub open_ports: Vec<u16>,
     #[serde(default)]
     pub ports_checked: u64,
+    /// Other IPv4 addresses of the same MAC (a second address, proxy ARP,
+    /// a Wi-Fi extender that uses one MAC for its clients), newest first.
+    #[serde(default)]
+    pub other_ips: Vec<Ipv4Addr>,
 }
 
 /// IPv6 addresses kept per device.
@@ -452,6 +462,12 @@ fn lans() -> Vec<Lan> {
     out
 }
 
+/// The state, also after a thread panicked while it held the lock: the
+/// data is plain, and discovery goes on.
+fn lock(m: &Mutex<State>) -> Result<std::sync::MutexGuard<'_, State>, ()> {
+    Ok(m.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// What the discovery threads found, shared with the monitor.
 #[derive(Default)]
 struct State {
@@ -481,16 +497,29 @@ impl State {
     #[allow(clippy::too_many_arguments)]
     fn see(&mut self, oui: &HashMap<[u8; 3], String>, iface: &str, mac: [u8; 6], ip: Ipv4Addr, heard: bool, unix: u64, now: Instant) -> bool {
         if let Some(d) = self.devices.get_mut(&mac) {
-            let moved = d.ip != ip || d.iface != iface;
-            if moved && !d.ip.is_unspecified() && !ip.is_unspecified() && !d.this_host {
-                let who = if d.name.is_empty() { mac_text(&mac) } else { d.name.clone() };
-                self.changes.push(format!("device {who} moved from {} to {ip} on {iface}", d.ip));
-            }
+            // A known address is no move: one MAC can use several addresses,
+            // and the neighbor table lists each of them.
+            let known = ip.is_unspecified() || d.ip == ip || d.other_ips.contains(&ip);
+            let moved = !known;
             if moved {
+                if !d.ip.is_unspecified() {
+                    if !d.this_host {
+                        let who = if d.name.is_empty() { mac_text(&mac) } else { d.name.clone() };
+                        self.changes.push(format!("device {who} uses a new address {ip} on {iface} (before {})", d.ip));
+                    }
+                    d.other_ips.insert(0, d.ip);
+                    d.other_ips.truncate(MAX_OTHER_IPS);
+                }
                 d.ip = ip;
-                d.iface = iface.to_string();
                 d.name.clear();
                 d.gateway = self.gateways.iter().any(|(dev, gw)| dev == iface && *gw == ip);
+            }
+            // The interface changes without an alert (a laptop on cable and
+            // Wi-Fi in one subnet); only a packet from the device moves it.
+            if heard && d.iface != iface {
+                d.iface = iface.to_string();
+                self.changed = true;
+                self.dirty = true;
             }
             if heard && d.last_seen != unix {
                 d.last_seen = unix;
@@ -501,8 +530,14 @@ impl State {
             self.dirty = true;
             return moved;
         }
+        // Full: the device that was not seen for the longest time goes, so
+        // a flood of random MAC addresses cannot lock the table for good.
         if self.devices.len() >= MAX_DEVICES {
-            return false;
+            let Some(old) = self.devices.values().filter(|d| !d.this_host && !d.gateway).min_by_key(|d| d.last_seen).map(|d| d.mac)
+            else {
+                return false;
+            };
+            self.devices.remove(&old);
         }
         let d = Device {
             mac,
@@ -517,6 +552,7 @@ impl State {
             ipv6: Vec::new(),
             open_ports: Vec::new(),
             ports_checked: 0,
+            other_ips: Vec::new(),
         };
         self.devices.insert(mac, d);
         if self.learn_until.is_none_or(|t| now >= t) {
@@ -576,8 +612,10 @@ pub(crate) struct Discovery {
     path: Option<PathBuf>,
     gid: Option<u32>,
     saved: Option<Instant>,
-    /// Devices online at the last `take`; None before the first.
+    /// Devices online at the last `take`; None before the first and during
+    /// the learning window.
     online: Option<HashSet<[u8; 6]>>,
+    last_scan: Option<Instant>,
 }
 
 impl Discovery {
@@ -604,10 +642,10 @@ impl Discovery {
         st.changed = true;
         let state = Arc::new(Mutex::new(st));
         let (scan, scan_rx) = mpsc::channel();
-        let (names_tx, names_rx) = mpsc::channel();
+        let (names_tx, names_rx) = mpsc::sync_channel(NAME_QUEUE);
         // Tests never send ARP requests into the network they run on.
         if cfg!(test) {
-            return (Discovery { state, scan, path, gid, saved: None, online: None }, msg);
+            return (Discovery { state, scan, path, gid, saved: None, online: None, last_scan: None }, msg);
         }
         let s = state.clone();
         std::thread::Builder::new()
@@ -616,18 +654,27 @@ impl Discovery {
             .ok();
         let s = state.clone();
         std::thread::Builder::new().name("netmon-names".into()).spawn(move || name_thread(s, names_rx)).ok();
-        (Discovery { state, scan, path, gid, saved: None, online: None }, msg)
+        (Discovery { state, scan, path, gid, saved: None, online: None, last_scan: None }, msg)
     }
 
     /// Asks for a sweep now.
-    pub(crate) fn scan(&self) {
+    /// Asks for a sweep now, at most once per SCAN_GAP. Returns the
+    /// status message.
+    pub(crate) fn scan(&mut self) -> String {
+        if let Some(t) = self.last_scan
+            && t.elapsed() < SCAN_GAP
+        {
+            return format!("the last scan was {} s ago; wait a minute between scans", t.elapsed().as_secs());
+        }
+        self.last_scan = Some(Instant::now());
         let _ = self.scan.send(());
+        "device scan started: ARP requests to every address of the LANs".into()
     }
 
     /// What was found since the last call. Online and offline changes
     /// start at the second call: the first only notes who is online.
     pub(crate) fn take(&mut self, unix: u64) -> Found {
-        let Ok(mut st) = self.state.lock() else { return Found::default() };
+        let Ok(mut st) = lock(&self.state) else { return Found::default() };
         let new: Vec<Device> = std::mem::take(&mut st.new).iter().filter_map(|m| st.devices.get(m).cloned()).collect();
         let mut changes = std::mem::take(&mut st.changes);
         let online: HashSet<[u8; 6]> = st
@@ -636,7 +683,12 @@ impl Discovery {
             .filter(|d| !d.this_host && unix.saturating_sub(d.last_seen) <= ONLINE_SECS)
             .map(|d| d.mac)
             .collect();
-        if let Some(before) = &self.online {
+        // While learning, every device is new to the monitor: no online
+        // changes until the window ends.
+        let learning = st.learn_until.is_some_and(|t| Instant::now() < t);
+        if learning {
+            self.online = None;
+        } else if let Some(before) = &self.online {
             let label = |m: &[u8; 6]| {
                 st.devices.get(m).map_or(mac_text(m), |d| {
                     let ip = if d.ip.is_unspecified() { String::new() } else { format!(" {}", d.ip) };
@@ -652,7 +704,9 @@ impl Discovery {
                 changes.push(format!("device {} went offline (not seen for 15 min)", label(m)));
             }
         }
-        self.online = Some(online);
+        if !learning {
+            self.online = Some(online);
+        }
         let list = std::mem::take(&mut st.changed).then(|| {
             let mut l: Vec<Device> = st.devices.values().cloned().collect();
             l.sort_by_key(|d| (d.iface.clone(), u32::from(d.ip)));
@@ -664,7 +718,7 @@ impl Discovery {
     /// Sends a Wake-on-LAN packet for `mac` to the broadcast address of its
     /// LAN. Returns the status message.
     pub(crate) fn wake(&self, mac: [u8; 6]) -> String {
-        let Ok(st) = self.state.lock() else { return "device list busy".into() };
+        let Ok(st) = lock(&self.state) else { return "device list busy".into() };
         let Some(d) = st.devices.get(&mac) else { return "unknown device".into() };
         let Some(l) = st.lans.iter().find(|l| l.name == d.iface) else { return format!("{} is not up", d.iface) };
         let to = broadcast(l.ip, l.prefix);
@@ -682,7 +736,7 @@ impl Discovery {
     /// message. Returns the status message.
     pub(crate) fn check_ports(&self, mac: [u8; 6]) -> String {
         let ip = {
-            let Ok(mut st) = self.state.lock() else { return "device list busy".into() };
+            let Ok(mut st) = lock(&self.state) else { return "device list busy".into() };
             if st.checking {
                 return "a port check runs already".into();
             }
@@ -701,7 +755,7 @@ impl Discovery {
                 .copied()
                 .filter(|p| TcpStream::connect_timeout(&SocketAddr::from((ip, *p)), PORT_WAIT).is_ok())
                 .collect();
-            if let Ok(mut st) = state.lock() {
+            if let Ok(mut st) = lock(&state) {
                 st.checking = false;
                 let text = if open.is_empty() {
                     "none".to_string()
@@ -720,7 +774,7 @@ impl Discovery {
         match spawned {
             Ok(_) => format!("checking {} TCP ports of {ip}", CHECK_PORTS.len()),
             Err(e) => {
-                if let Ok(mut st) = self.state.lock() {
+                if let Ok(mut st) = lock(&self.state) {
                     st.checking = false;
                 }
                 format!("port check failed: {e}")
@@ -736,7 +790,7 @@ impl Discovery {
             return None;
         }
         let text = {
-            let mut st = self.state.lock().ok()?;
+            let mut st = lock(&self.state).ok()?;
             if !std::mem::take(&mut st.dirty) {
                 return None;
             }
@@ -751,9 +805,9 @@ impl Discovery {
 
 /// Sends ARP requests, listens to ARP and reads the neighbor table. Ends
 /// when the Discovery is dropped.
-fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::Sender<([u8; 6], Ipv4Addr)>) {
+fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::SyncSender<([u8; 6], Ipv4Addr)>) {
     let report = |e: String| {
-        if let Ok(mut st) = state.lock() {
+        if let Ok(mut st) = lock(&state) {
             st.error = Some(e);
         }
     };
@@ -774,7 +828,8 @@ fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::S
     let (mut next_lan, mut next_sweep, mut next_neigh) = (Instant::now(), Instant::now(), Instant::now());
     let mut buf = [0u8; 256];
     let lookup = |mac, ip| {
-        let _ = names.send((mac, ip));
+        // A full queue drops the lookup: a manual scan asks again.
+        let _ = names.try_send((mac, ip));
     };
     loop {
         let now = Instant::now();
@@ -795,10 +850,11 @@ fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::S
             next_lan = now + LAN_EVERY;
             lan_list = lans();
             let gws = std::fs::read_to_string("/proc/net/route").map(|t| gateways(&t)).unwrap_or_default();
-            if let Ok(mut st) = state.lock() {
+            let own6: Vec<Vec<Ipv6Addr>> = lan_list.iter().map(|l| own_ipv6(&l.name)).collect();
+            if let Ok(mut st) = lock(&state) {
                 st.gateways = gws.clone();
                 st.lans = lan_list.clone();
-                for l in &lan_list {
+                for (l, own) in lan_list.iter().zip(own6) {
                     st.see(&oui, &l.name, l.mac, l.ip, true, unix, now);
                     // The host itself is no new device, and has its own name.
                     st.new.retain(|m| *m != l.mac);
@@ -809,7 +865,6 @@ fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::S
                         d.name = host.clone();
                         st.changed = true;
                     }
-                    let own = own_ipv6(&l.name);
                     if let Some(d) = st.devices.get_mut(&l.mac)
                         && d.ipv6 != own
                     {
@@ -830,7 +885,7 @@ fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::S
         }
         if now >= next_sweep || manual {
             next_sweep = now + SWEEP_EVERY;
-            if manual && let Ok(st) = state.lock() {
+            if manual && let Ok(st) = lock(&state) {
                 for d in st.devices.values().filter(|d| d.name.is_empty() && !d.this_host) {
                     lookup(d.mac, d.ip);
                 }
@@ -846,7 +901,9 @@ fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::S
         if now >= next_neigh {
             next_neigh = now + NEIGH_EVERY;
             let neigh = std::fs::read_to_string("/proc/net/arp").map(|t| parse_neighbors(&t)).unwrap_or_default();
-            if let Ok(mut st) = state.lock() {
+            // The netlink dump waits up to 1 s: not while holding the lock.
+            let neigh6 = neighbors6();
+            if let Ok(mut st) = lock(&state) {
                 for (ip, mac, dev) in neigh {
                     if let Some(l) = lan_list.iter().find(|l| l.name == dev && in_subnet(ip, l.ip, l.prefix))
                         && st.see(&oui, &l.name, mac, ip, false, unix, now)
@@ -854,7 +911,7 @@ fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::S
                         lookup(mac, ip);
                     }
                 }
-                for (index, ip, mac, reachable) in neighbors6() {
+                for (index, ip, mac, reachable) in neigh6 {
                     if let Some(l) = lan_list.iter().find(|l| l.index == index)
                         && mac != l.mac
                     {
@@ -877,7 +934,7 @@ fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::S
         if mac == l.mac || !in_subnet(ip, l.ip, l.prefix) {
             continue;
         }
-        if let Ok(mut st) = state.lock()
+        if let Ok(mut st) = lock(&state)
             && st.see(&oui, &l.name, mac, ip, true, crate::rules::unix_now(), Instant::now())
         {
             lookup(mac, ip);
@@ -928,7 +985,7 @@ fn name_thread(state: Arc<Mutex<State>>, rx: mpsc::Receiver<([u8; 6], Ipv4Addr)>
             continue;
         }
         let Some(name) = mdns_name(ip).or_else(|| reverse_dns(ip)) else { continue };
-        if let Ok(mut st) = state.lock()
+        if let Ok(mut st) = lock(&state)
             && let Some(d) = st.devices.get_mut(&mac)
             && d.ip == ip
             && !d.this_host
@@ -1176,13 +1233,66 @@ mod tests {
         assert_eq!(da.ipv6, vec!["2a02::5".parse::<Ipv6Addr>().unwrap(), "fe80::5".parse().unwrap()], "global first");
         assert!(list.iter().any(|x| x.mac == b && x.ip.is_unspecified()), "IPv6-only device");
         d.state.lock().unwrap().see(&oui, "eth0", a, Ipv4Addr::new(10, 0, 0, 9), true, 1100, t0);
-        assert_eq!(d.take(1100).changes, vec!["device nas moved from 10.0.0.2 to 10.0.0.9 on eth0"]);
+        assert_eq!(d.take(1100).changes, vec!["device nas uses a new address 10.0.0.9 on eth0 (before 10.0.0.2)"]);
         let f = d.take(1000 + ONLINE_SECS + 50);
         assert_eq!(f.changes.len(), 1, "{:?}", f.changes);
         assert!(f.changes[0].contains("02:03:04:06") || f.changes[0].starts_with("device 00:01:02:03:04:06 went offline"), "{:?}", f.changes);
         d.state.lock().unwrap().see(&oui, "eth0", b, Ipv4Addr::new(10, 0, 0, 7), true, 1000 + ONLINE_SECS + 60, t0);
         let f = d.take(1000 + ONLINE_SECS + 60);
         assert!(f.changes.iter().any(|c| c == "device 00:01:02:03:04:06 10.0.0.7 is online again"), "{:?}", f.changes);
+    }
+
+    #[test]
+    fn several_addresses_and_interfaces_are_no_moves() {
+        let oui = HashMap::new();
+        let t0 = Instant::now();
+        let mut st = State::default();
+        let m = [0, 1, 2, 3, 4, 5];
+        let (a, b) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
+        st.see(&oui, "eth0", m, a, true, 100, t0);
+        st.see(&oui, "eth0", m, b, false, 100, t0);
+        assert_eq!(st.changes.len(), 1, "the second address is reported once");
+        st.devices.get_mut(&m).unwrap().name = "box".into();
+        // The neighbor table lists both addresses every 5 s.
+        for i in 0..10 {
+            st.see(&oui, "eth0", m, if i % 2 == 0 { a } else { b }, false, 100 + i, t0);
+        }
+        assert_eq!(st.changes.len(), 1, "no flip-flop");
+        assert_eq!(st.devices[&m].name, "box", "the name stays");
+        assert_eq!((st.devices[&m].ip, st.devices[&m].other_ips.clone()), (b, vec![a]));
+        // Same address on another interface: no alert, no name lookup.
+        assert!(!st.see(&oui, "wlan0", m, b, true, 200, t0));
+        assert_eq!((st.devices[&m].iface.as_str(), st.changes.len()), ("wlan0", 1));
+    }
+
+    #[test]
+    fn a_full_table_drops_the_oldest_device() {
+        let oui = HashMap::new();
+        let t0 = Instant::now();
+        let mut st = State::default();
+        for i in 0..MAX_DEVICES as u32 {
+            let b = i.to_be_bytes();
+            st.see(&oui, "eth0", [2, 0, b[0], b[1], b[2], b[3]], Ipv4Addr::from(0x0a00_0000 + i), true, 1000 + i as u64, t0);
+        }
+        let newest = [0, 9, 9, 9, 9, 9];
+        assert!(st.see(&oui, "eth0", newest, Ipv4Addr::new(10, 9, 9, 9), true, 99_999, t0));
+        assert_eq!(st.devices.len(), MAX_DEVICES);
+        assert!(st.devices.contains_key(&newest) && !st.devices.contains_key(&[2, 0, 0, 0, 0, 0]), "the oldest went");
+    }
+
+    #[test]
+    fn no_online_changes_during_learning_and_scans_wait() {
+        let oui = HashMap::new();
+        let t0 = Instant::now();
+        let (mut d, _) = Discovery::start(None, None);
+        assert!(d.state.lock().unwrap().learn_until.is_some(), "no file: learning");
+        d.take(1000);
+        d.state.lock().unwrap().see(&oui, "eth0", [0, 1, 2, 3, 4, 5], Ipv4Addr::new(10, 0, 0, 2), true, 1000, t0);
+        assert!(d.take(1000).changes.is_empty(), "a device that answers while learning is not 'online again'");
+        d.state.lock().unwrap().learn_until = None;
+        assert!(d.take(1000).changes.is_empty(), "the first take after learning only notes who is online");
+        assert!(d.scan().starts_with("device scan started"));
+        assert!(d.scan().contains("wait a minute"));
     }
 
     #[test]

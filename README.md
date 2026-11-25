@@ -760,7 +760,15 @@ IP column.
   stops. `new_device = true` in `[alerts]` sends an alert for each device
   that is not in the file (see [Alerts](#alerts)).
 - Some managed networks report ARP sweeps as a scan. On such a network,
-  start `netmond --no-devices`.
+  start `netmond --no-devices`. Discovery is on by default. `r` starts a
+  scan at most once per minute.
+- One MAC address can use several IPv4 addresses (a second address, a
+  Wi-Fi extender that uses one MAC for its clients). The IP column shows
+  the newest; the others are kept and are no move. A device on another
+  interface of the same subnet (cable and Wi-Fi) is no move either.
+- The table holds 4096 devices. When it is full, the device that was not
+  seen for the longest time goes. Each tick sends at most 5 device alerts
+  and counts the rest in one alert.
 
 ### Country and network owner
 
@@ -1235,8 +1243,9 @@ An alert goes to the journal (`netmond: alert: ...`), the UI status line
 - New device: a MAC address that is not in `/var/lib/netmon/devices.json`
   (see [Devices tab](#devices-tab)). Without that file, the first 2
   minutes only learn. The host itself never alerts.
-- `device_changes = true`: a known device changes its IPv4 address, goes
-  offline (not seen for 15 minutes) or comes back. Phones sleep often and
+- `device_changes = true`: a known device uses a new IPv4 address, goes
+  offline (not seen for 15 minutes) or comes back. While netmond learns
+  (the first 2 minutes without a devices file), these alerts wait. Phones sleep often and
   then cause many of these alerts.
 
 ### New listeners

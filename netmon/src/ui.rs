@@ -1402,6 +1402,7 @@ mod tests {
             ipv6: vec!["2a02::1".parse().unwrap()],
             open_ports: vec![80, 443],
             ports_checked: if ip[3] == 1 { now } else { 0 },
+            other_ips: Vec::new(),
         };
         app.devices = vec![dev(now, [192, 168, 1, 1], "router-box"), dev(now - 7200, [192, 168, 1, 50], "")];
         let mut term = Terminal::new(TestBackend::new(140, 12)).unwrap();

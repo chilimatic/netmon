@@ -115,6 +115,8 @@ pub(crate) const ASK_BATCH: usize = 256;
 pub(crate) const MAX_HELLO_PARTS: usize = 256;
 /// Most name events read per refresh; the rest wait in the ring.
 pub(crate) const NAME_BATCH: usize = 4_096;
+/// Device alerts per tick at most; the rest are counted in one alert.
+pub(crate) const MAX_DEVICE_ALERTS: usize = 5;
 /// How often the TUI loop checks for interface events between ticks.
 pub(crate) const LINK_POLL: Duration = Duration::from_millis(200);
 
@@ -353,11 +355,8 @@ impl<K: Kernel> Monitor<K> {
                 Some(d) => d.check_ports(mac),
                 None => "device discovery is off (netmond --no-devices)".into(),
             },
-            Request::ScanDevices => match &self.discovery {
-                Some(d) => {
-                    d.scan();
-                    "device scan started: ARP requests to every address of the LANs".into()
-                }
+            Request::ScanDevices => match &mut self.discovery {
+                Some(d) => d.scan(),
                 None => "device discovery is off (netmond --no-devices)".into(),
             },
         }
@@ -493,15 +492,24 @@ impl<K: Kernel> Monitor<K> {
             if let Some(list) = found.list {
                 self.devices = list;
             }
+            // A flood of new MAC addresses gives a few alerts and a count.
+            let more = found.new.len().saturating_sub(MAX_DEVICE_ALERTS);
             if self.rules.alerts.new_device {
-                for n in found.new {
+                for n in found.new.into_iter().take(MAX_DEVICE_ALERTS) {
                     let maker = if n.vendor.is_empty() { String::new() } else { format!(" ({})", n.vendor) };
                     let ip = if n.ip.is_unspecified() { "IPv6 only".to_string() } else { n.ip.to_string() };
                     self.new_alerts.push(format!("new device on {}: {ip} {}{maker}", n.iface, crate::devices::mac_text(&n.mac)));
                 }
             }
+            if self.rules.alerts.new_device && more > 0 {
+                self.new_alerts.push(format!("{more} more new devices (see the Devices tab)"));
+            }
             if self.rules.alerts.device_changes {
-                self.new_alerts.extend(found.changes);
+                let more = found.changes.len().saturating_sub(MAX_DEVICE_ALERTS);
+                self.new_alerts.extend(found.changes.into_iter().take(MAX_DEVICE_ALERTS));
+                if more > 0 {
+                    self.new_alerts.push(format!("{more} more device changes (see the Devices tab)"));
+                }
             }
             errors.extend(found.messages);
             errors.extend(found.error);
