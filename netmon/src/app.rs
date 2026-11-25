@@ -21,10 +21,11 @@ pub enum Tab {
     Hosts,
     Log,
     Usage,
+    Devices,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 9] = [
+    pub const ALL: [Tab; 10] = [
         Tab::Connections,
         Tab::Processes,
         Tab::Interfaces,
@@ -34,6 +35,7 @@ impl Tab {
         Tab::Hosts,
         Tab::Log,
         Tab::Usage,
+        Tab::Devices,
     ];
 
     pub fn title(self) -> &'static str {
@@ -47,6 +49,7 @@ impl Tab {
             Tab::Hosts => "Hosts",
             Tab::Log => "Log",
             Tab::Usage => "Usage",
+            Tab::Devices => "Devices",
         }
     }
 
@@ -85,6 +88,8 @@ pub enum RowId {
     Log(u64),
     /// A program in the Usage tab.
     Usage(String),
+    /// A device by its MAC address.
+    Device([u8; 6]),
 }
 
 pub struct ConnRow {
@@ -217,6 +222,8 @@ pub struct App {
     /// Traffic per program (Usage tab), and why the file could not be read.
     pub usage: Vec<crate::usage::UsageRow>,
     pub usage_error: String,
+    /// Devices on the LANs (Devices tab), from the monitor.
+    pub devices: Vec<crate::devices::Device>,
     /// The profile picker is open (Rules tab, P): names and selection.
     pub picking_profile: bool,
     pub profiles: Vec<String>,
@@ -261,6 +268,7 @@ impl Default for App {
             geo: crate::geo::Geo::default(),
             usage: Vec::new(),
             usage_error: String::new(),
+            devices: Vec::new(),
             picking_profile: false,
             profiles: Vec::new(),
             profile_sel: 0,
@@ -328,6 +336,8 @@ pub enum Action {
     RemoveHost,
     /// Read the host block lists again.
     ReloadBlocklists,
+    /// ARP requests to every address of the LANs now.
+    ScanDevices,
     /// Open the profile picker (the client lists the profiles).
     PickProfile,
     /// Set the display filter of the capture; empty clears it.
@@ -536,9 +546,11 @@ impl App {
             Key::Char('7') => self.set_tab(Tab::Hosts),
             Key::Char('8') => self.set_tab(Tab::Log),
             Key::Char('9') => self.set_tab(Tab::Usage),
+            Key::Char('0') => self.set_tab(Tab::Devices),
             Key::Char('a') if self.tab == Tab::Hosts => self.editing_host = true,
             Key::Char('d') if self.tab == Tab::Hosts => return Some(Action::RemoveHost),
             Key::Char('r') if self.tab == Tab::Hosts => return Some(Action::ReloadBlocklists),
+            Key::Char('r') if self.tab == Tab::Devices => return Some(Action::ScanDevices),
             Key::Char('s') if self.tab == Tab::Hosts => return Some(Action::SaveRules),
             Key::Char('H') if self.tab == Tab::Connections => return Some(Action::BlockHostOfRow),
             Key::Char('b') if self.tab == Tab::Connections => return Some(Action::ToggleBlockRemote),
@@ -635,6 +647,15 @@ impl App {
                 e.hash(&mut h);
                 (e, RowId::Log(h.finish()))
             })
+            .collect()
+    }
+
+    /// The devices that match the filter, in the monitor's order (by
+    /// interface and address).
+    pub fn device_rows(&self) -> Vec<&crate::devices::Device> {
+        self.devices
+            .iter()
+            .filter(|d| self.matches(&[&d.ip.to_string(), &crate::devices::mac_text(&d.mac), &d.vendor, &d.name, &d.iface]))
             .collect()
     }
 
@@ -906,7 +927,7 @@ mod tests {
     fn arrows_switch_tabs_and_esc_does_not_quit() {
         let mut app = App::default();
         app.on_key(Key::Left);
-        assert_eq!(app.tab, Tab::Usage, "wraps around");
+        assert_eq!(app.tab, Tab::Devices, "wraps around");
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Connections);
         app.on_key(Key::Right);
@@ -1080,7 +1101,13 @@ mod tests {
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Usage);
         app.on_key(Key::Right);
+        assert_eq!(app.tab, Tab::Devices);
+        assert_eq!(app.on_key(Key::Char('r')), Some(Action::ScanDevices));
+        app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Connections, "wraps");
+        app.on_key(Key::Char('0'));
+        assert_eq!(app.tab, Tab::Devices);
+        app.on_key(Key::Char('1'));
         assert_eq!(app.on_key(Key::Char('H')), Some(Action::BlockHostOfRow));
     }
 

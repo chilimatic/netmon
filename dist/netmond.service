@@ -32,17 +32,19 @@ RestartPreventExitStatus=78
 #   CAP_DAC_READ_SEARCH      read /proc and tracefs files of other users
 #   CAP_SYS_RESOURCE         locked memory for maps on kernels < 5.11
 #   CAP_CHOWN, CAP_FOWNER    give the socket and the connection log to group netmon
+#   CAP_NET_RAW              ARP requests and replies (Devices tab)
 # Kernels before 5.8 have no CAP_BPF: add CAP_SYS_ADMIN there.
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE CAP_CHOWN CAP_FOWNER
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE CAP_CHOWN CAP_FOWNER CAP_NET_RAW
 NoNewPrivileges=yes
 # It writes only the socket in /run, its pins, /etc/netmon (s in the
 # Rules tab saves there), the connection log in /var/log/netmon and the
-# usage file in /var/lib/netmon.
+# usage and devices files in /var/lib/netmon.
 ProtectSystem=strict
 ReadWritePaths=/run /sys/fs/bpf -/etc/netmon
 LogsDirectory=netmon
 LogsDirectoryMode=0755
-# Traffic per program and day: /var/lib/netmon/usage.json.
+# Traffic per program and day: /var/lib/netmon/usage.json. Known LAN
+# devices: /var/lib/netmon/devices.json.
 StateDirectory=netmon
 StateDirectoryMode=0755
 ProtectHome=read-only
@@ -53,7 +55,8 @@ ProtectKernelLogs=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+# AF_PACKET: ARP sweeps of the LANs (Devices tab; off with --no-devices).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
@@ -64,7 +67,7 @@ SystemCallFilter=@system-service bpf perf_event_open
 SystemCallErrorNumber=EPERM
 # Snapshots for 16 UIs with 30 000 flows stay far below this.
 MemoryMax=1G
-# Two threads per UI, plus the main, accept and container threads.
+# Two threads per UI, plus the main, accept, container and two device threads.
 TasksMax=64
 
 [Install]

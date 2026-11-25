@@ -61,6 +61,12 @@ struct DaemonArgs {
     /// Count no traffic per program and day.
     #[arg(long)]
     no_usage: bool,
+    /// Known devices on the LANs.
+    #[arg(long, value_name = "PATH", default_value = crate::devices::DEFAULT_PATH)]
+    devices: PathBuf,
+    /// Find no devices: no ARP requests, no Devices tab.
+    #[arg(long)]
+    no_devices: bool,
 }
 
 /// Local TCP port netmond never blocks unless --guard-port says otherwise.
@@ -204,6 +210,13 @@ pub fn run() -> anyhow::Result<()> {
         }
         mon.usage = Some(u);
     }
+    if !args.no_devices {
+        let (d, err) = crate::devices::Discovery::start(Some(args.devices.clone()), gid);
+        if let Some(e) = err {
+            eprintln!("netmond: {e}");
+        }
+        mon.discovery = Some(d);
+    }
     // Start messages: problems and the rules file summary.
     for w in &warnings {
         eprintln!("netmond: {w}");
@@ -227,6 +240,9 @@ pub fn run() -> anyhow::Result<()> {
         eprintln!("netmond: {e}");
     }
     if let Some(e) = engine.mon.alerts.save(Instant::now(), true) {
+        eprintln!("netmond: {e}");
+    }
+    if let Some(e) = engine.mon.discovery.as_mut().and_then(|d| d.save(Instant::now(), true)) {
         eprintln!("netmond: {e}");
     }
     let _ = std::fs::remove_file(&args.socket);

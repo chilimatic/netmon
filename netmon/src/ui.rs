@@ -84,7 +84,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
 
     let idx = Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0);
     f.render_widget(
-        Tabs::new(Tab::ALL.iter().enumerate().map(|(i, t)| format!("{} {}", i + 1, t.title())))
+        Tabs::new(Tab::ALL.iter().enumerate().map(|(i, t)| format!("{} {}", (i + 1) % 10, t.title())))
             .select(idx)
             .highlight_style(Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         tabs,
@@ -100,6 +100,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         Tab::Hosts => draw_hosts(f, app, rules, body),
         Tab::Log => draw_log(f, app, body),
         Tab::Usage => draw_usage(f, app, body),
+        Tab::Devices => draw_devices(f, app, body),
     }
 
     let sort = match app.sort {
@@ -117,25 +118,30 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
     } else if app.editing_filter {
         format!(" filter: {}█   (Enter keep, Esc clear)", app.filter)
     } else if app.tab == Tab::Capture {
-        " q quit  ←→/1-9 view  ↑↓ PgUp/PgDn Home select  End/f follow  / filter  S tcp stream  s save shown as .pcap  c clear  x stop  g graph".to_string()
+        " q quit  ←→/0-9 view  ↑↓ PgUp/PgDn Home select  End/f follow  / filter  S tcp stream  s save shown as .pcap  c clear  x stop  g graph".to_string()
     } else if app.tab == Tab::Hosts {
-        " q quit  ←→/1-9 view  ↑↓ select  a block a host  d remove  r reload lists  s save to rules file".to_string()
+        " q quit  ←→/0-9 view  ↑↓ select  a block a host  d remove  r reload lists  s save to rules file".to_string()
     } else if app.tab == Tab::Graph {
         format!(
-            " q quit  ←→/1-9 view  ↑↓ select node  Enter its connections  b block it  z level [{}]  p pause  h names  v veth/bridge [{}]",
+            " q quit  ←→/0-9 view  ↑↓ select node  Enter its connections  b block it  z level [{}]  p pause  h names  v veth/bridge [{}]",
             app.graph_level.label(),
             if app.show_virtual { "on" } else { "off" }
         )
     } else if app.tab == Tab::Usage {
         format!(
-            " q quit  ←→/1-9 view  ↑↓ select  s sort column [{}]  S reverse  / filter [{}]   local days; netmond writes every 60 s",
+            " q quit  ←→/0-9 view  ↑↓ select  s sort column [{}]  S reverse  / filter [{}]   local days; netmond writes every 60 s",
             crate::app::USAGE_COLUMNS[app.usage_sort],
             app.filter
         )
+    } else if app.tab == Tab::Devices {
+        format!(
+            " q quit  ←→/0-9 view  ↑↓ select  r scan now  / filter [{}]   netmond sweeps every 10 min; gray: not seen for 15 min",
+            app.filter
+        )
     } else if app.tab == Tab::Log {
-        format!(" q quit  ←→/1-9 view  ↑↓ select  / filter [{}]   newest first, read every 2 s", app.filter)
+        format!(" q quit  ←→/0-9 view  ↑↓ select  / filter [{}]   newest first, read every 2 s", app.filter)
     } else if app.tab == Tab::Rules {
-        " q quit  ←→/1-9 view  ↑↓ select  d remove rule  t end time 1h/1d/never  P profile  s save to rules file   tmp rules end when the monitor stops".to_string()
+        " q quit  ←→/0-9 view  ↑↓ select  d remove rule  t end time 1h/1d/never  P profile  s save to rules file   tmp rules end when the monitor stops".to_string()
     } else {
         let block = match app.tab {
             Tab::Connections => "  b/B/H block ip/port/host",
@@ -143,7 +149,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
             _ => "",
         };
         format!(
-            " q quit  ←→/1-9 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  v veth/bridge [{}]  p pause  g graph",
+            " q quit  ←→/0-9 view  Enter capture{block}  r/t/n sort [{sort}]  / filter [{}]  h names  v veth/bridge [{}]  p pause  g graph",
             app.filter,
             if app.show_virtual { "on" } else { "off" }
         )
@@ -692,6 +698,63 @@ fn draw_usage(f: &mut Frame, app: &mut App, area: Rect) {
     render_table(f, app, table, &ids, area);
 }
 
+/// The Devices tab: devices on the LANs of the host.
+fn draw_devices(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.devices.is_empty() {
+        f.render_widget(
+            Paragraph::new(
+                "\n  No devices found yet.\n\n  The monitor sends ARP requests to every address of each LAN at start, every 10 min\n  \
+                 and when you press r. It also reads the ARP traffic it hears (see README).",
+            )
+            .block(Block::new().borders(Borders::TOP)),
+            area,
+        );
+        return;
+    }
+    let now = crate::rules::unix_now();
+    let rows = app.device_rows();
+    let ids: Vec<RowId> = rows.iter().map(|d| RowId::Device(d.mac)).collect();
+    let lines: Vec<Row> = rows
+        .iter()
+        .map(|d| {
+            let mut name = d.name.clone();
+            for (on, tag) in [(d.this_host, "this host"), (d.gateway, "router")] {
+                if on {
+                    name = if name.is_empty() { format!("({tag})") } else { format!("{name} ({tag})") };
+                }
+            }
+            let row = Row::new(vec![
+                Cell::from(d.ip.to_string()),
+                Cell::from(crate::devices::mac_text(&d.mac)),
+                Cell::from(d.vendor.clone()),
+                Cell::from(name),
+                Cell::from(d.iface.clone()),
+                Cell::from(Line::from(crate::devices::ago(d.last_seen, now)).right_aligned()),
+                Cell::from(crate::rulefile::utc(d.first_seen).get(..10).unwrap_or_default().to_string()),
+            ]);
+            if now.saturating_sub(d.last_seen) > crate::devices::ONLINE_SECS {
+                row.style(Style::new().fg(Color::DarkGray))
+            } else {
+                row
+            }
+        })
+        .collect();
+    let table = Table::new(
+        lines,
+        [
+            Constraint::Length(15),
+            Constraint::Length(17),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Length(10),
+            Constraint::Length(5),
+            Constraint::Length(10),
+        ],
+    )
+    .header(header_row(&["IP", "MAC", "Maker", "Name", "Iface", "Seen", "First seen"]));
+    render_table(f, app, table, &ids, area);
+}
+
 /// The Log tab: the newest lines of the connection log.
 fn draw_log(f: &mut Frame, app: &mut App, area: Rect) {
     if app.log.is_empty() {
@@ -1078,6 +1141,37 @@ mod tests {
         assert!(ff.contains(&human(300_000_000.0)) && ff.contains(&human(1_000_000_000.0)), "{ff}");
         assert!(s.find("firefox").unwrap() < s.find("curl").unwrap(), "busiest first");
         assert!(s.contains("Today ↓ ▼"), "{s}");
+    }
+
+    #[test]
+    fn devices_tab_lists_devices_and_grays_old_ones() {
+        let mut app = App { tab: Tab::Devices, show_graph: false, ..App::default() };
+        let now = crate::rules::unix_now();
+        let dev = |last: u64, ip: [u8; 4], name: &str| crate::devices::Device {
+            mac: [0xe8, 0x1b, 0x69, 0x50, 0xb4, ip[3]],
+            ip: ip.into(),
+            iface: "enp5s0".into(),
+            vendor: "Sagemcom".into(),
+            name: name.into(),
+            first_seen: 1_764_000_000,
+            last_seen: last,
+            this_host: false,
+            gateway: ip[3] == 1,
+        };
+        app.devices = vec![dev(now, [192, 168, 1, 1], "router-box"), dev(now - 7200, [192, 168, 1, 50], "")];
+        let mut term = Terminal::new(TestBackend::new(140, 12)).unwrap();
+        term.draw(|fr| draw(fr, &mut app, &Collector::new(1), &Names::default(), None, &Rules::default())).unwrap();
+        let s = screen(&term);
+        assert!(s.contains("0 Devices") && s.contains("Maker"), "{s}");
+        let r = s.lines().find(|l| l.contains("192.168.1.1 ")).unwrap();
+        assert!(r.contains("e8:1b:69:50:b4:01") && r.contains("router-box (router)") && r.contains("now") && r.contains("2025-11-24"), "{r}");
+        let old = s.lines().find(|l| l.contains("192.168.1.50")).unwrap();
+        assert!(old.contains("2h"), "{old}");
+        let y = s.lines().position(|l| l.contains("192.168.1.50")).unwrap() as u16;
+        let x = s.lines().nth(y as usize).unwrap().find("192.168.1.50").unwrap() as u16;
+        assert_eq!(term.backend().buffer()[(x, y)].fg, Color::DarkGray, "not seen for 2 h: gray");
+        app.filter = "router".into();
+        assert_eq!(app.device_rows().len(), 1);
     }
 
     #[test]

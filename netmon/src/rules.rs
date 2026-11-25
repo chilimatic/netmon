@@ -288,6 +288,9 @@ pub struct AlertConfig {
     pub rate_seconds: u32,
     /// Alert when a program connects to a country it never used before.
     pub new_country: bool,
+    /// Alert when a device that netmond never saw joins a LAN.
+    #[serde(default)]
+    pub new_device: bool,
 }
 
 impl AlertConfig {

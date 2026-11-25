@@ -503,6 +503,15 @@ Small, independent features after the firewall core:
   retransmits once, holes and cut segments as "missing", sequence numbers
   across 2^32, FIN counted. Client red, server blue, TLS noted.
   Tested on a recorded HTTP exchange.
+- **Devices tab: done (2026-11-25).** Tab 0. A thread in netmond sends ARP
+  requests to each address of every physical IPv4 LAN (start, every 10 min,
+  `r`), records the ARP traffic it hears and reads `/proc/net/arp`. Maker
+  from the OUI list (`hwdata`), name from mDNS (legacy unicast PTR query to
+  the device) or reverse DNS. Known devices in
+  `/var/lib/netmon/devices.json`; `new_device` in `[alerts]` alerts for an
+  unknown MAC, 2 min learning without the file. Protocol 8. The unit got
+  `AF_PACKET` and `CAP_NET_RAW`. Tested on the host: 4 devices, router
+  marked, alerts for the new ones, none after a restart.
 - **History**: per-process daily totals in SQLite.
 
 ## Phase 9 – Connection graph

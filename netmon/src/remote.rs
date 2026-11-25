@@ -123,7 +123,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     fn empty() -> Snapshot {
-        Snapshot { collector: Collector::new(1), names: Names::default(), rules: Rules::default(), questions: Vec::new(), capture: None }
+        Snapshot { collector: Collector::new(1), names: Names::default(), rules: Rules::default(), questions: Vec::new(), capture: None, devices: Vec::new() }
     }
 
     /// A daemon that reads one line, then writes `lines`, then reads

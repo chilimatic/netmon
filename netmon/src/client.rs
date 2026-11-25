@@ -60,6 +60,7 @@ impl Client {
             }
             (q, snap.questions.len() - 1)
         });
+        app.devices = snap.devices.clone();
         self.snap = snap;
     }
 
@@ -209,6 +210,7 @@ impl Client {
                 }
             }
             Action::ReloadBlocklists => Ok(Request::ReloadBlocklists),
+            Action::ScanDevices => Ok(Request::ScanDevices),
             Action::PickProfile => {
                 let dir = std::path::Path::new(crate::rulefile::DEFAULT_PATH).with_file_name(crate::monitor::PROFILES_DIR);
                 app.profiles = list_profiles(&dir);
@@ -290,7 +292,7 @@ impl Client {
                     label: format!("{} {} → {} on {}", r.proto, r.local, r.remote, r.iface),
                 })
             }
-            Tab::Capture | Tab::Rules | Tab::Graph | Tab::Hosts | Tab::Log | Tab::Usage => Err("select a row in another tab".into()),
+            Tab::Capture | Tab::Rules | Tab::Graph | Tab::Hosts | Tab::Log | Tab::Usage | Tab::Devices => Err("select a row in another tab".into()),
         }
     }
 }

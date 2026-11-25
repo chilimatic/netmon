@@ -11,6 +11,7 @@ mod collector;
 mod connlog;
 mod daemon;
 mod decode;
+mod devices;
 mod engine;
 mod geo;
 mod graph;

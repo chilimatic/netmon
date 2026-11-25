@@ -43,6 +43,8 @@ struct RawAlerts {
     rate_seconds: Option<u32>,
     #[serde(default)]
     new_country: bool,
+    #[serde(default)]
+    new_device: bool,
 }
 
 #[derive(Deserialize)]
@@ -255,7 +257,12 @@ pub fn parse(text: &str) -> Result<RulesFile, String> {
             if a.rate_seconds.is_some_and(|s| !(1..=3600).contains(&s)) {
                 return Err(format!("line {line}: alerts rate_seconds: use 1 to 3600"));
             }
-            Ok(crate::rules::AlertConfig { rate_mb: a.rate_mb, rate_seconds: a.rate_seconds.unwrap_or(0), new_country: a.new_country })
+            Ok(crate::rules::AlertConfig {
+                rate_mb: a.rate_mb,
+                rate_seconds: a.rate_seconds.unwrap_or(0),
+                new_country: a.new_country,
+                new_device: a.new_device,
+            })
         })
         .transpose()?;
     Ok(RulesFile { default: raw.default.map(action), rules, hosts, blocklists, alerts })
@@ -385,7 +392,7 @@ pub fn render(rules: &Rules) -> String {
     let mut out = String::from("# netmon rules, first match wins. Written by netmon.\n");
     let _ = writeln!(out, "default = {}", q(&rules.default.to_string()));
     let a = &rules.alerts;
-    if a.any() || a.rate_seconds != 0 {
+    if a.any() || a.new_device || a.rate_seconds != 0 {
         out.push_str("\n[alerts]\n");
         if let Some(r) = a.rate_mb {
             let _ = writeln!(out, "rate_mb = {r:?}");
@@ -395,6 +402,9 @@ pub fn render(rules: &Rules) -> String {
         }
         if a.new_country {
             out.push_str("new_country = true\n");
+        }
+        if a.new_device {
+            out.push_str("new_device = true\n");
         }
     }
     for r in rules.rules.iter().filter(|r| !r.temporary) {
@@ -528,9 +538,9 @@ remote = "2001:db8::1"
 
     #[test]
     fn alerts_table_parses_checks_and_round_trips() {
-        let f = parse("default = \"allow\"\n\n[alerts]\nrate_mb = 50\nnew_country = true\n\n[[rule]]\naction = \"deny\"\nport = 25\n").unwrap();
+        let f = parse("default = \"allow\"\n\n[alerts]\nrate_mb = 50\nnew_country = true\nnew_device = true\n\n[[rule]]\naction = \"deny\"\nport = 25\n").unwrap();
         let a = f.alerts.unwrap();
-        assert_eq!((a.rate_mb, a.rate_seconds(), a.new_country), (Some(50.0), 10, true));
+        assert_eq!((a.rate_mb, a.rate_seconds(), a.new_country, a.new_device), (Some(50.0), 10, true, true));
         assert!(parse("").unwrap().alerts.is_none());
         assert!(err("[alerts]\nrate_mb = 0\n").contains("above 0"));
         assert!(err("[alerts]\nrate_seconds = 0\n").contains("1 to 3600"));

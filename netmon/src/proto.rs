@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Version of this protocol. Client and daemon must have the same.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// Where `netmond` listens.
 pub const DEFAULT_SOCKET: &str = "/run/netmon.sock";
@@ -51,7 +51,7 @@ pub enum ToClient {
     Status(String),
     /// A program bound a port that other hosts can reach.
     Listener(crate::monitor::listen::NewListener),
-    /// A rate or new-country alert (`[alerts]` in the rules file).
+    /// A rate, new-country or new-device alert (`[alerts]` in the rules file).
     Alert(String),
 }
 
@@ -87,6 +87,8 @@ pub enum Request {
     Answer { question: u64, dest: DestId, scope: Scope, answer: Answer },
     StartCapture(Target),
     StopCapture,
+    /// Send ARP requests to every address of the LANs now.
+    ScanDevices,
 }
 
 /// One destination of a question.
@@ -106,6 +108,9 @@ pub struct Snapshot {
     /// Open questions, oldest first.
     pub questions: Vec<Prompt>,
     pub capture: Option<CaptureInfo>,
+    /// Devices on the LANs, by interface and address.
+    #[serde(default)]
+    pub devices: Vec<crate::devices::Device>,
 }
 
 /// The running or last capture. The packets come separately.

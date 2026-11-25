@@ -171,6 +171,9 @@ pub(crate) struct Monitor<K: Kernel = Probe> {
     pub(crate) conn_log: Option<crate::connlog::ConnLog>,
     /// Traffic per program and day (daemon only).
     pub(crate) usage: Option<crate::usage::Usage>,
+    /// Finds devices on the LANs; None in tests and with --no-devices.
+    pub(crate) discovery: Option<crate::devices::Discovery>,
+    pub(crate) devices: Vec<crate::devices::Device>,
     /// Rate and new-country alerts, and the ones not sent yet.
     pub(crate) alerts: alerts::Alerts,
     pub(crate) new_alerts: Vec<String>,
@@ -277,7 +280,7 @@ impl<K: Kernel> Monitor<K> {
         let mut collector = Collector::new(args.expire_ticks());
         collector.counted = names.physical();
         let (containers_tx, containers_rx) = container_reader();
-        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), base_rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new(), conn_log: None, usage: None, alerts: Default::default(), new_alerts: Vec::new(), log_done: HashSet::new(), log_pending: HashSet::new() };
+        let mon = Monitor { probe, collector, names, last: Instant::now(), ticks: 0, capture: None, packets: Vec::new(), owners: OwnerCache::default(), procs: ProcCache::default(), rules: Rules::default(), links: None, rules_path: rulefile::DEFAULT_PATH.into(), base_rules_path: rulefile::DEFAULT_PATH.into(), hosts: Default::default(), asks: Default::default(), containers: Vec::new(), containers_asked: None, containers_tx, containers_rx, sni: HashMap::new(), hello_parts: HashMap::new(), prof: crate::profile::Profile::from_env(), containers_tried: HashSet::new(), asks_tried: HashSet::new(), exe_scan_every: 1, guard: Guard::default(), blocked: HashMap::new(), kernel_blocked: HashSet::new(), listen_watch: Default::default(), new_listeners: Vec::new(), conn_log: None, usage: None, discovery: None, devices: Vec::new(), alerts: Default::default(), new_alerts: Vec::new(), log_done: HashSet::new(), log_pending: HashSet::new() };
         Ok((mon, errors))
     }
 
@@ -289,6 +292,7 @@ impl<K: Kernel> Monitor<K> {
             rules: self.rules.clone(),
             questions: self.asks.pending.iter().cloned().collect(),
             capture: self.capture.as_ref().map(|c| c.info.clone()),
+            devices: self.devices.clone(),
         }
     }
 
@@ -320,6 +324,13 @@ impl<K: Kernel> Monitor<K> {
                 Err(e) => format!("capture failed: {e:#}"),
             },
             Request::StopCapture => self.stop_capture(),
+            Request::ScanDevices => match &self.discovery {
+                Some(d) => {
+                    d.scan();
+                    "device scan started: ARP requests to every address of the LANs".into()
+                }
+                None => "device discovery is off (netmond --no-devices)".into(),
+            },
         }
     }
 
@@ -447,6 +458,25 @@ impl<K: Kernel> Monitor<K> {
                 errors.push(e);
             }
             self.prof.add("alerts", t);
+        }
+        if let Some(d) = self.discovery.as_mut() {
+            let (list, new, err) = d.take();
+            if let Some(list) = list {
+                self.devices = list;
+            }
+            if self.rules.alerts.new_device {
+                for n in new {
+                    let maker = if n.vendor.is_empty() { String::new() } else { format!(" ({})", n.vendor) };
+                    self.new_alerts.push(format!(
+                        "new device on {}: {} {}{maker}",
+                        n.iface,
+                        n.ip,
+                        crate::devices::mac_text(&n.mac)
+                    ));
+                }
+            }
+            errors.extend(err);
+            errors.extend(d.save(now, false));
         }
         if let Some(u) = self.usage.as_mut() {
             let t = Instant::now();

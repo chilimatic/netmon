@@ -106,6 +106,36 @@ pub fn dns_answers(p: &[u8]) -> Vec<(IpAddr, String, u32)> {
     out
 }
 
+const TYPE_PTR: u16 = 12;
+
+/// The first PTR target in the answers of a DNS or mDNS response, without
+/// the trailing dot. For reverse lookups: `1.1.168.192.in-addr.arpa` ->
+/// `printer.local`. Works with and without the question section (mDNS
+/// answers often have none).
+pub fn ptr_answer(p: &[u8]) -> Option<String> {
+    let (flags, qd, an) = (u16_at(p, 2)?, u16_at(p, 4)?, u16_at(p, 6)?);
+    if flags & 0x8000 == 0 || flags & 0x000f != 0 {
+        return None;
+    }
+    let mut off = 12;
+    for _ in 0..qd.min(8) {
+        off = read_name(p, off)?.1 + 4;
+    }
+    for _ in 0..(an as usize).min(MAX_ANSWERS) {
+        let (_, after) = read_name(p, off)?;
+        let (ty, rdlen) = (u16_at(p, after)?, u16_at(p, after + 8)? as usize);
+        let data = after + 10;
+        p.get(data..data + rdlen)?;
+        if ty == TYPE_PTR {
+            let (name, _) = read_name(p, data)?;
+            let name = name.trim_end_matches('.').to_string();
+            return hostname(name.as_bytes()).filter(|n| n.len() <= MAX_NAME);
+        }
+        off = data + rdlen;
+    }
+    None
+}
+
 /// The server name (SNI) of a TLS ClientHello that starts at `p[0]`. None
 /// if the bytes are not a ClientHello, have no SNI, or the SNI is cut off
 /// (it is past the first segment) or is not a plausible hostname.

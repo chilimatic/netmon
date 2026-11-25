@@ -238,7 +238,9 @@ usage file for the Usage tab). Options of the daemon: `--socket PATH`,
 `--group NAME` (the group that can connect, default `netmon`), `--log PATH`
 (the connection log, default `/var/log/netmon/connections.log`),
 `--no-log` (no connection log), `--usage PATH` (the usage file, default
-`/var/lib/netmon/usage.json`) and `--no-usage` (no usage count).
+`/var/lib/netmon/usage.json`), `--no-usage` (no usage count),
+`--devices PATH` (the known devices, default `/var/lib/netmon/devices.json`)
+and `--no-devices` (no ARP requests and no Devices tab).
 
 ## The user interface
 
@@ -251,12 +253,12 @@ usage file for the Usage tab). Options of the daemon: `--socket PATH`,
  │─────────────────────────────── 120 samples ────────────────────────────│
  │ ↑ upload (magenta) below the zero line                                 │
  └────────────────────────────────────────────────────────────────────────┘
-  1 Connections  2 Processes  3 Interfaces  4 Capture  5 Rules  6 Graph  7 Hosts  8 Log  9 Usage  3
+  1 Connections  2 Processes  3 Interfaces  4 Capture  5 Rules  6 Graph  7 Hosts  8 Log  9 Usage  0 Devices  3
  Process      PID   Proto Local            Remote             Iface  State ...  4
  firefox      4242  tcp   10.0.0.2:51234   example.com:443    enp5s0 ESTAB
  ...
  93.184.215.14:443 (name from tls)   exe /usr/lib/firefox/firefox   ...         5
- q quit  ←→/1-9 view  Enter capture  b/B block ip/port  r/t/n sort ...         6
+ q quit  ←→/0-9 view  Enter capture  b/B block ip/port  r/t/n sort ...         6
 ```
 
 1. Header. It shows the total upload and download rate of the physical
@@ -278,7 +280,7 @@ usage file for the Usage tab). Options of the daemon: `--socket PATH`,
 | Key | Where | Action |
 |---|---|---|
 | `q`, `Ctrl-C` | everywhere | Quit |
-| `←` `→` `Tab` `1`-`9` | everywhere | Select a tab |
+| `←` `→` `Tab` `1`-`9` `0` | everywhere | Select a tab (`0`: Devices) |
 | `↑` `↓` `PgUp` `PgDn` `Home` | tables | Select a row |
 | `/` | tables | Type a filter. `Enter` keeps it, `Esc` clears it. |
 | `Esc` | tables | Clear the filter (never quits) |
@@ -308,6 +310,8 @@ usage file for the Usage tab). Options of the daemon: `--socket PATH`,
 | `Enter` | Graph | Show the Connections tab, filtered to the selected node |
 | `b` | Graph | Block the selected node: its exe, hostname or address |
 | `z` | Graph | Switch the level: process, container, domain |
+| `s` `S` | Usage | Sort by the next column, reverse the order |
+| `r` | Devices | Send ARP requests to the LANs now |
 | `a` `A` `d` `D` `o` `x` | question window | Answer a question (see [Ask mode](#ask-mode)) |
 | `Esc` | question window | Put the questions aside: the tab gets its keys back |
 | `?` | everywhere | Show the questions again |
@@ -602,6 +606,42 @@ sort column. Programs sort from A to Z, byte counts from the largest.
   stops. The file belongs to root and group `netmon`, mode 0640. A crash
   loses at most the last minute.
 - With `sudo netmon --local`, no usage is counted.
+
+### Devices tab
+
+The Devices tab shows the devices on the local networks of the host: IP
+address, MAC address, maker, name, interface, the time since the device
+was last seen and the date it was first seen. `r` starts a scan now. `/`
+filters by any column. A gray row is a device that was not seen for 15
+minutes.
+
+The monitor finds devices in three ways:
+
+1. It sends an ARP request (the "who has this address" question of
+   Ethernet) to every address of each LAN at start, every 10 minutes and
+   when you press `r`. A /24 network takes about 0.5 s. For a network
+   larger than 1024 addresses, it asks only the /24 of the host.
+2. It records the ARP traffic of other devices that it hears.
+3. It reads the kernel neighbor table (`/proc/net/arp`) every 5 s.
+
+Only physical Ethernet and Wi-Fi interfaces with an IPv4 network count as
+LANs. Bridges, veths (containers), VPNs and IPv6-only devices are not
+shown.
+
+- The maker comes from the IEEE OUI list in `/usr/share/hwdata/oui.txt`
+  (package `hwdata`). Phones and laptops often use a random MAC address
+  on Wi-Fi. Their maker shows as `(random MAC)`.
+- The name comes from mDNS (a query to the device on port 5353; Apple
+  devices, printers and Linux with Avahi answer) or else from reverse DNS
+  (the router often knows the DHCP names). Many devices answer neither.
+- `(router)` marks a default gateway of the host, `(this host)` the host
+  itself.
+- `netmond` keeps the known devices in `/var/lib/netmon/devices.json`
+  (root, group `netmon`, 0640) and writes it every 60 s and when it
+  stops. `new_device = true` in `[alerts]` sends an alert for each device
+  that is not in the file (see [Alerts](#alerts)).
+- Some managed networks report ARP sweeps as a scan. On such a network,
+  start `netmond --no-devices`.
 
 ### Country and network owner
 
@@ -975,7 +1015,7 @@ systemctl --user enable --now netmon-notify
 
 ### Alerts
 
-`netmond` can send two kinds of alerts. Both are off until the rules file
+`netmond` can send three kinds of alerts. All are off until the rules file
 (or the active profile) has an `[alerts]` table. Put it after the
 `default` line, before the first `[[rule]]`:
 
@@ -984,6 +1024,7 @@ systemctl --user enable --now netmon-notify
 rate_mb = 50          # a program above 50 MB/s (up and down together)
 rate_seconds = 10     # for this many seconds in a row (default 10)
 new_country = true    # a program connects to a country it never used
+new_device = true     # a device that netmond never saw joins a LAN
 ```
 
 An alert goes to the journal (`netmond: alert: ...`), the UI status line
@@ -1004,6 +1045,9 @@ An alert goes to the journal (`netmond: alert: ...`), the UI status line
   before `netmond` read it. Then one program can show under two names.
 - With `new_country`, netmond reads the two DB-IP files into memory
   (about 18 MB).
+- New device: a MAC address that is not in `/var/lib/netmon/devices.json`
+  (see [Devices tab](#devices-tab)). Without that file, the first 2
+  minutes only learn. The host itself never alerts.
 
 ### New listeners
 
@@ -1202,7 +1246,8 @@ rules end.
   rules file)
 - runs as root with only the capabilities it needs (`CAP_BPF`,
   `CAP_PERFMON`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, `CAP_DAC_READ_SEARCH`,
-  `CAP_SYS_RESOURCE`, `CAP_CHOWN`, `CAP_FOWNER`). Kernels before 5.8 also
+  `CAP_SYS_RESOURCE`, `CAP_CHOWN`, `CAP_FOWNER`, and `CAP_NET_RAW` for the
+  ARP requests of the Devices tab). Kernels before 5.8 also
   need `CAP_SYS_ADMIN`.
 - runs with `ProtectSystem=strict`. Only `/run`, `/sys/fs/bpf` and
   `/etc/netmon` (for `s` in the Rules tab) are writable.

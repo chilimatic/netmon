@@ -111,6 +111,8 @@ pub fn run() -> anyhow::Result<()> {
         if let Some(secs) = args.once {
             return print_once(&mut mon, secs);
         }
+        // Local mode keeps no devices file.
+        mon.discovery = Some(crate::devices::Discovery::start(None, None).0);
         let engine = Box::new(Engine::new(mon, args.monitor.interval()));
         let snapshot = engine.mon.snapshot();
         let interval = engine.interval();
