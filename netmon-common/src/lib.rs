@@ -576,6 +576,9 @@ pub const NAME_DNS: u8 = 1;
 pub const NAME_TLS: u8 = 2;
 /// The next segment of a ClientHello longer than its first segment.
 pub const NAME_TLS_CONT: u8 = 3;
+/// A DNS answer over TCP: a 2-byte length, then the message (the first
+/// segment only).
+pub const NAME_DNS_TCP: u8 = 4;
 /// Payload bytes kept per name event. Egress packets are often GSO
 /// super-packets: a ClientHello with post-quantum key shares (~1.8 KB) is
 /// then one packet here.

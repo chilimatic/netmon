@@ -32,7 +32,13 @@ impl<K: Kernel> Monitor<K> {
         let unix = rules::unix_now();
         self.probe.drain_names(NAME_BATCH, |ev| {
             let data = &ev.data[..(ev.len as usize).min(ev.data.len())];
-            match ev.kind {
+            // DNS over TCP: the message follows a 2-byte length.
+            let (kind, data) = match ev.kind {
+                netmon_common::NAME_DNS_TCP if data.len() > 2 => (netmon_common::NAME_DNS, &data[2..]),
+                netmon_common::NAME_DNS_TCP => (0, data),
+                k => (k, data),
+            };
+            match kind {
                 netmon_common::NAME_DNS => {
                     if let Some(a) = names::dns_answer(data)
                         && dns.len() < crate::dnslog::MAX_ENTRIES

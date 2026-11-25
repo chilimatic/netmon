@@ -375,6 +375,38 @@ pub struct Lan {
     pub prefix: u8,
 }
 
+/// The host's own IPv6 addresses on an interface, global ones first: the
+/// neighbor table never holds them.
+fn own_ipv6(iface: &str) -> Vec<Ipv6Addr> {
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: as in lans(): the list lives until freeifaddrs.
+    unsafe {
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return out;
+        }
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let a = &*cur;
+            cur = a.ifa_next;
+            if a.ifa_addr.is_null() || (*a.ifa_addr).sa_family as i32 != libc::AF_INET6 {
+                continue;
+            }
+            if std::ffi::CStr::from_ptr(a.ifa_name).to_bytes() != iface.as_bytes() {
+                continue;
+            }
+            let ip = Ipv6Addr::from((*(a.ifa_addr as *const libc::sockaddr_in6)).sin6_addr.s6_addr);
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+        libc::freeifaddrs(ifap);
+    }
+    out.sort_by_key(|a| (a.segments()[0] & 0xffc0) == 0xfe80);
+    out.truncate(MAX_IPV6);
+    out
+}
+
 /// IPv4 subnets on physical Ethernet and Wi-Fi interfaces that use ARP.
 /// Bridges and veths (containers) are left out.
 fn lans() -> Vec<Lan> {
@@ -777,6 +809,13 @@ fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::S
                         d.name = host.clone();
                         st.changed = true;
                     }
+                    let own = own_ipv6(&l.name);
+                    if let Some(d) = st.devices.get_mut(&l.mac)
+                        && d.ipv6 != own
+                    {
+                        d.ipv6 = own;
+                        st.changed = true;
+                    }
                 }
                 let mut changed = false;
                 for d in st.devices.values_mut() {
@@ -1097,6 +1136,12 @@ mod tests {
         for n in 0..buf.len() {
             parse_neigh_dump(&buf[..n], &mut Vec::new());
         }
+    }
+
+    #[test]
+    fn own_ipv6_of_loopback_and_unknown() {
+        assert!(own_ipv6("lo").contains(&Ipv6Addr::LOCALHOST) || own_ipv6("lo").is_empty(), "lo may have IPv6 off");
+        assert!(own_ipv6("no-such-iface0").is_empty());
     }
 
     #[test]

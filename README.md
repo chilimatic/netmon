@@ -656,7 +656,8 @@ the result and the DNS server that answered.
   show: the program with the local server, the resolver with the
   upstream server.
 - Encrypted DNS (DNS over HTTPS or TLS, for example in a browser) is not
-  visible. Answers over TCP are not logged.
+  visible. Answers over TCP (port 53) are logged from their first segment:
+  a very large answer shows only the records in that segment.
 - `netmond` keeps the newest 5000 answers in memory only, and sends them
   to a UI when it connects. A restart of `netmond` clears them.
 
@@ -714,7 +715,7 @@ IPv6: with each sweep, the monitor also sends one ICMPv6 echo request to
 all nodes of the link (`ff02::1`). Every IPv6 device answers, and the
 monitor reads their addresses from the kernel neighbor table (rtnetlink).
 The line under the table shows the IPv6 addresses of the selected
-device. A device that has only IPv6 shows its first IPv6 address in the
+device. For the host itself, they come from its interface. A device that has only IPv6 shows its first IPv6 address in the
 IP column.
 
 - `o` connects to 26 common TCP ports of the selected device (remote

@@ -551,6 +551,11 @@ Small, independent features after the firewall core:
   extension walk goes on when the first segment ends between two
   extensions. Tested with a ClientHello split after a 1000-byte padding
   extension: example.org answered, ad.doubleclick.net dropped.
+- **DNS over TCP and own IPv6: done (2026-11-25).** The TC program sends
+  the first segment of TCP answers from port 53 as NAME_DNS_TCP;
+  userspace drops the 2-byte length and parses it like UDP (DNS log and
+  hostnames). The host's own device gets its IPv6 addresses from
+  getifaddrs. Tested: a TCP query to 1.0.0.1 logged with its program.
 - **Packaging: done (2026-11-25).** `packaging/install-tree.sh` (shared
   layout), `packaging/arch/PKGBUILD` (`netmon-git`, nightly via rustup in
   prepare), `packaging/deb/build.sh` (dpkg-deb). Not published: the AUR

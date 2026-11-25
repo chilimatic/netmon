@@ -1042,3 +1042,26 @@ fn host_blocks_reach_the_kernel_server_name_check() {
     m.request(Request::RemoveHost(id));
     assert!(m.probe.sni.is_empty());
 }
+
+#[test]
+fn dns_answers_over_tcp_are_logged() {
+    let (mut m, t0) = monitor();
+    let mut dns = vec![0, 2, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+    dns.extend_from_slice(b"\x03cdn\x07example\x03com\x00\x00\x01\x00\x01");
+    dns.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 5]);
+    let mut tcp = (dns.len() as u16).to_be_bytes().to_vec();
+    tcp.extend_from_slice(&dns);
+    let mut ev = netmon_common::NameEvent {
+        key: key(53),
+        len: tcp.len() as u16,
+        kind: netmon_common::NAME_DNS_TCP,
+        _pad: 0,
+        data: [0; netmon_common::NAME_DATA],
+    };
+    ev.data[..tcp.len()].copy_from_slice(&tcp);
+    m.probe.names.push_back(ev);
+    m.tick_at(secs(t0, 1));
+    let e = m.dns_log.back().expect("logged");
+    assert_eq!((e.name.as_str(), e.answers.clone()), ("cdn.example.com", vec!["203.0.113.5".to_string()]));
+    assert_eq!(m.hosts.get("203.0.113.5".parse().unwrap(), secs(t0, 1)), Some("cdn.example.com"), "names flows too");
+}

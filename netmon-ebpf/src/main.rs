@@ -16,7 +16,7 @@ use aya_ebpf::{
 };
 use netmon_common::{
     ACTION_ALLOW, ACTION_ASK, ACTION_DENY, CFG_LIMITS, Limit, take_tokens, CFG_SNI, FNV_OFFSET, MAX_SNI_LEN,
-    MAX_SNI_NAMES, SNI_BELOW, SNI_SELF, sni_step, ASK_RING_BYTES, AskEvent, DENY_RING_BYTES, DenyEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
+    MAX_SNI_NAMES, SNI_BELOW, SNI_SELF, sni_step, NAME_DNS_TCP, ASK_RING_BYTES, AskEvent, DENY_RING_BYTES, DenyEvent, CAPTURE_FLOWS, CAPTURE_IFACE, CAPTURE_LEN, CAPTURE_RING_BYTES,
     CFG_ACTIVE, CFG_COUNT, CFG_DEFAULT, CFG_GEN, CFG_LEN, CaptureConfig, ConnKey, ConnState, DIR_IN,
     DIR_OUT, FlowKey, FlowStats, GuardKey, IPPROTO_TCP, IPPROTO_UDP, LOOPBACK_IFINDEX, ListenKey,
     ListenOwner, MAX_CAPTURE_FLOWS, MAX_CONNS, NAME_DATA, NAME_DNS, NAME_RING_BYTES, NAME_TLS, NAME_TLS_CONT, MAX_HELLO_PENDING, NameEvent, MAX_EXE_PATH, MAX_FLOWS, MAX_GUARD, MAX_IFACES,
@@ -813,8 +813,12 @@ fn handle(ctx: &TcContext, egress: bool) -> i32 {
         // DNS answers: from port 53, on every interface (lo carries the
         // answers of a local stub resolver). Only answers to a query of
         // this host: the names show in questions.
-        if !egress && !denied && key.proto == IPPROTO_UDP && key.remote_port == 53 && dns_solicited(key) {
-            name_event(ctx, key, payload as u32, NAME_DNS);
+        if !egress && !denied && key.remote_port == 53 && payload > 0 && dns_solicited(key) {
+            if key.proto == IPPROTO_UDP {
+                name_event(ctx, key, payload as u32, NAME_DNS);
+            } else if key.proto == IPPROTO_TCP {
+                name_event(ctx, key, payload as u32, NAME_DNS_TCP);
+            }
         }
     }
 
