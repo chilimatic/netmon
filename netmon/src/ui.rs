@@ -135,7 +135,7 @@ pub fn draw(f: &mut Frame, app: &mut App, c: &Collector, names: &Names, cap: Opt
         )
     } else if app.tab == Tab::Devices {
         format!(
-            " q quit  ←→/0-9 view  ↑↓ select  r scan now  / filter [{}]   netmond sweeps every 10 min; gray: not seen for 15 min",
+            " q quit  ←→/0-9 view  ↑↓ select  r scan now  o check ports  w wake (WoL)  / filter [{}]   gray: not seen for 15 min",
             app.filter
         )
     } else if app.tab == Tab::Log {
@@ -763,8 +763,23 @@ fn draw_devices(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let now = crate::rules::unix_now();
+    let [area, detail] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
     let rows = app.device_rows();
     let ids: Vec<RowId> = rows.iter().map(|d| RowId::Device(d.mac)).collect();
+    // The selected device's IPv6 addresses and port check.
+    if let Some(d) = app.selected_in(&ids).map(|i| rows[i]) {
+        let v6: Vec<String> = d.ipv6.iter().map(|a| a.to_string()).collect();
+        let v6 = if v6.is_empty() { "no IPv6 address".to_string() } else { format!("IPv6 {}", v6.join("  ")) };
+        let ports = if d.ports_checked == 0 {
+            "ports not checked (o)".to_string()
+        } else {
+            match crate::devices::ago(d.ports_checked, now).as_str() {
+                "now" => "ports checked just now".to_string(),
+                t => format!("ports checked {t} ago"),
+            }
+        };
+        f.render_widget(Paragraph::new(format!(" {}   {v6}   {ports}", crate::devices::mac_text(&d.mac))).style(Style::new().fg(Color::Cyan)), detail);
+    }
     let lines: Vec<Row> = rows
         .iter()
         .map(|d| {
@@ -774,11 +789,21 @@ fn draw_devices(f: &mut Frame, app: &mut App, area: Rect) {
                     name = if name.is_empty() { format!("({tag})") } else { format!("{name} ({tag})") };
                 }
             }
+            let ip = match (d.ip.is_unspecified(), d.ipv6.first()) {
+                (true, Some(v6)) => v6.to_string(),
+                _ => d.ip.to_string(),
+            };
+            let ports = match (d.ports_checked, d.open_ports.is_empty()) {
+                (0, _) => String::new(),
+                (_, true) => "none".to_string(),
+                _ => d.open_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "),
+            };
             let row = Row::new(vec![
-                Cell::from(d.ip.to_string()),
+                Cell::from(ip),
                 Cell::from(crate::devices::mac_text(&d.mac)),
                 Cell::from(d.vendor.clone()),
                 Cell::from(name),
+                Cell::from(ports),
                 Cell::from(d.iface.clone()),
                 Cell::from(Line::from(crate::devices::ago(d.last_seen, now)).right_aligned()),
                 Cell::from(crate::rulefile::utc(d.first_seen).get(..10).unwrap_or_default().to_string()),
@@ -797,12 +822,13 @@ fn draw_devices(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(17),
             Constraint::Fill(1),
             Constraint::Fill(1),
+            Constraint::Length(14),
             Constraint::Length(10),
             Constraint::Length(5),
             Constraint::Length(10),
         ],
     )
-    .header(header_row(&["IP", "MAC", "Maker", "Name", "Iface", "Seen", "First seen"]));
+    .header(header_row(&["IP", "MAC", "Maker", "Name", "Open ports", "Iface", "Seen", "First seen"]));
     render_table(f, app, table, &ids, area);
 }
 
@@ -1344,6 +1370,9 @@ mod tests {
             last_seen: last,
             this_host: false,
             gateway: ip[3] == 1,
+            ipv6: vec!["2a02::1".parse().unwrap()],
+            open_ports: vec![80, 443],
+            ports_checked: if ip[3] == 1 { now } else { 0 },
         };
         app.devices = vec![dev(now, [192, 168, 1, 1], "router-box"), dev(now - 7200, [192, 168, 1, 50], "")];
         let mut term = Terminal::new(TestBackend::new(140, 12)).unwrap();
@@ -1352,6 +1381,8 @@ mod tests {
         assert!(s.contains("0 Devices") && s.contains("Maker"), "{s}");
         let r = s.lines().find(|l| l.contains("192.168.1.1 ")).unwrap();
         assert!(r.contains("e8:1b:69:50:b4:01") && r.contains("router-box (router)") && r.contains("now") && r.contains("2025-11-24"), "{r}");
+        assert!(r.contains("80 443"), "{r}");
+        assert!(s.contains("IPv6 2a02::1") && s.contains("ports checked just now"), "detail line of the selected row: {s}");
         let old = s.lines().find(|l| l.contains("192.168.1.50")).unwrap();
         assert!(old.contains("2h"), "{old}");
         let y = s.lines().position(|l| l.contains("192.168.1.50")).unwrap() as u16;

@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// Version of this protocol. Client and daemon must have the same.
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 
 /// Where `netmond` listens.
 pub const DEFAULT_SOCKET: &str = "/run/netmon.sock";
@@ -92,6 +92,10 @@ pub enum Request {
     StopCapture,
     /// Send ARP requests to every address of the LANs now.
     ScanDevices,
+    /// Send a Wake-on-LAN packet to a device, by MAC address.
+    WakeDevice([u8; 6]),
+    /// Check common TCP ports of a device; the result comes as a status.
+    CheckPorts([u8; 6]),
     /// Adds allow rules at the end of the table (learning mode), with
     /// their comments. All or none.
     AddAllowRules(Vec<(crate::rules::Match, String)>),

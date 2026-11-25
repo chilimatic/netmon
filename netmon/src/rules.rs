@@ -330,6 +330,10 @@ pub struct AlertConfig {
     /// Alert when a device that netmond never saw joins a LAN.
     #[serde(default)]
     pub new_device: bool,
+    /// Alert when a known device changes its address, goes offline (15
+    /// minutes not seen) or comes back.
+    #[serde(default)]
+    pub device_changes: bool,
 }
 
 impl AlertConfig {

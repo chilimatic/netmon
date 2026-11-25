@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn rate_alert_after_the_seconds_and_not_again_soon() {
-        let cfg = rules::AlertConfig { rate_mb: Some(10.0), rate_seconds: 3, new_country: false, new_device: false };
+        let cfg = rules::AlertConfig { rate_mb: Some(10.0), rate_seconds: 3, new_country: false, new_device: false, device_changes: false };
         let mut a = Alerts::default();
         let mut c = Collector::new(30);
         let t0 = Instant::now();
@@ -208,7 +208,7 @@ mod tests {
             d
         };
         let path = d.join("countries.json");
-        let cfg = rules::AlertConfig { rate_mb: None, rate_seconds: 0, new_country: true, new_device: false };
+        let cfg = rules::AlertConfig { rate_mb: None, rate_seconds: 0, new_country: true, new_device: false, device_changes: false };
         let mut a = Alerts { path: Some(path.clone()), geo_dir: Some(dir.into()), ..Alerts::default() };
         let t0 = Instant::now();
         let mut c = Collector::new(30);

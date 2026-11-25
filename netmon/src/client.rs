@@ -242,6 +242,15 @@ impl Client {
             }
             Action::ReloadBlocklists => Ok(Request::ReloadBlocklists),
             Action::ScanDevices => Ok(Request::ScanDevices),
+            Action::WakeDevice | Action::CheckPorts => {
+                let rows = app.device_rows();
+                let ids: Vec<_> = rows.iter().map(|d| crate::app::RowId::Device(d.mac)).collect();
+                match app.selected_in(&ids).map(|i| rows[i].mac) {
+                    Some(mac) if action == Action::WakeDevice => Ok(Request::WakeDevice(mac)),
+                    Some(mac) => Ok(Request::CheckPorts(mac)),
+                    None => Err("no device selected".into()),
+                }
+            }
             Action::BlockDnsName => {
                 let rows = app.dns_rows();
                 let ids: Vec<_> = rows.iter().map(|(_, id)| id.clone()).collect();

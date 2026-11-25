@@ -339,6 +339,14 @@ impl<K: Kernel> Monitor<K> {
                 })
             }
             Request::SetLimit { exe, up_mb, down_mb } => self.change_rules(|r| r.set_limit(&exe, up_mb, down_mb, "")),
+            Request::WakeDevice(mac) => match &self.discovery {
+                Some(d) => d.wake(mac),
+                None => "device discovery is off (netmond --no-devices)".into(),
+            },
+            Request::CheckPorts(mac) => match &self.discovery {
+                Some(d) => d.check_ports(mac),
+                None => "device discovery is off (netmond --no-devices)".into(),
+            },
             Request::ScanDevices => match &self.discovery {
                 Some(d) => {
                     d.scan();
@@ -475,22 +483,22 @@ impl<K: Kernel> Monitor<K> {
             self.prof.add("alerts", t);
         }
         if let Some(d) = self.discovery.as_mut() {
-            let (list, new, err) = d.take();
-            if let Some(list) = list {
+            let found = d.take(rules::unix_now());
+            if let Some(list) = found.list {
                 self.devices = list;
             }
             if self.rules.alerts.new_device {
-                for n in new {
+                for n in found.new {
                     let maker = if n.vendor.is_empty() { String::new() } else { format!(" ({})", n.vendor) };
-                    self.new_alerts.push(format!(
-                        "new device on {}: {} {}{maker}",
-                        n.iface,
-                        n.ip,
-                        crate::devices::mac_text(&n.mac)
-                    ));
+                    let ip = if n.ip.is_unspecified() { "IPv6 only".to_string() } else { n.ip.to_string() };
+                    self.new_alerts.push(format!("new device on {}: {ip} {}{maker}", n.iface, crate::devices::mac_text(&n.mac)));
                 }
             }
-            errors.extend(err);
+            if self.rules.alerts.device_changes {
+                self.new_alerts.extend(found.changes);
+            }
+            errors.extend(found.messages);
+            errors.extend(found.error);
             errors.extend(d.save(now, false));
         }
         if let Some(u) = self.usage.as_mut() {

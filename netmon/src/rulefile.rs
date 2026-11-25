@@ -58,6 +58,8 @@ struct RawAlerts {
     new_country: bool,
     #[serde(default)]
     new_device: bool,
+    #[serde(default)]
+    device_changes: bool,
 }
 
 #[derive(Deserialize)]
@@ -286,6 +288,7 @@ pub fn parse(text: &str) -> Result<RulesFile, String> {
                 rate_seconds: a.rate_seconds.unwrap_or(0),
                 new_country: a.new_country,
                 new_device: a.new_device,
+                device_changes: a.device_changes,
             })
         })
         .transpose()?;
@@ -432,7 +435,7 @@ pub fn render(rules: &Rules) -> String {
     let mut out = String::from("# netmon rules, first match wins. Written by netmon.\n");
     let _ = writeln!(out, "default = {}", q(&rules.default.to_string()));
     let a = &rules.alerts;
-    if a.any() || a.new_device || a.rate_seconds != 0 {
+    if a.any() || a.new_device || a.device_changes || a.rate_seconds != 0 {
         out.push_str("\n[alerts]\n");
         if let Some(r) = a.rate_mb {
             let _ = writeln!(out, "rate_mb = {r:?}");
@@ -445,6 +448,9 @@ pub fn render(rules: &Rules) -> String {
         }
         if a.new_device {
             out.push_str("new_device = true\n");
+        }
+        if a.device_changes {
+            out.push_str("device_changes = true\n");
         }
     }
     for r in rules.rules.iter().filter(|r| !r.temporary) {
@@ -607,9 +613,9 @@ remote = "2001:db8::1"
 
     #[test]
     fn alerts_table_parses_checks_and_round_trips() {
-        let f = parse("default = \"allow\"\n\n[alerts]\nrate_mb = 50\nnew_country = true\nnew_device = true\n\n[[rule]]\naction = \"deny\"\nport = 25\n").unwrap();
+        let f = parse("default = \"allow\"\n\n[alerts]\nrate_mb = 50\nnew_country = true\nnew_device = true\ndevice_changes = true\n\n[[rule]]\naction = \"deny\"\nport = 25\n").unwrap();
         let a = f.alerts.unwrap();
-        assert_eq!((a.rate_mb, a.rate_seconds(), a.new_country, a.new_device), (Some(50.0), 10, true, true));
+        assert_eq!((a.rate_mb, a.rate_seconds(), a.new_country, a.new_device, a.device_changes), (Some(50.0), 10, true, true, true));
         assert!(parse("").unwrap().alerts.is_none());
         assert!(err("[alerts]\nrate_mb = 0\n").contains("above 0"));
         assert!(err("[alerts]\nrate_seconds = 0\n").contains("1 to 3600"));

@@ -314,6 +314,8 @@ and `--no-devices` (no ARP requests and no Devices tab).
 | `z` | Graph | Switch the level: process, container, domain |
 | `s` `S` | Usage | Sort by the next column, reverse the order |
 | `r` | Devices | Send ARP requests to the LANs now |
+| `o` | Devices | Check 26 common TCP ports of the selected device |
+| `w` | Devices | Send a Wake-on-LAN packet to the selected device |
 | `d` | Log | Switch between the connection log and the DNS log |
 | `b` | Log (DNS) | Block the name of the selected DNS answer |
 | `a` `A` `d` `D` `o` `x` | question window | Answer a question (see [Ask mode](#ask-mode)) |
@@ -654,8 +656,23 @@ The monitor finds devices in three ways:
 3. It reads the kernel neighbor table (`/proc/net/arp`) every 5 s.
 
 Only physical Ethernet and Wi-Fi interfaces with an IPv4 network count as
-LANs. Bridges, veths (containers), VPNs and IPv6-only devices are not
-shown.
+LANs. Bridges, veths (containers) and VPNs are not shown.
+
+IPv6: with each sweep, the monitor also sends one ICMPv6 echo request to
+all nodes of the link (`ff02::1`). Every IPv6 device answers, and the
+monitor reads their addresses from the kernel neighbor table (rtnetlink).
+The line under the table shows the IPv6 addresses of the selected
+device. A device that has only IPv6 shows its first IPv6 address in the
+IP column.
+
+- `o` connects to 26 common TCP ports of the selected device (remote
+  access, file sharing, printers, media, smart home), 0.4 s each. The
+  status line shows the open ports with their usual service, and the Open
+  ports column keeps them. Only use it on devices that you own or may
+  check.
+- `w` sends a Wake-on-LAN magic packet for the selected device to the
+  broadcast address of its LAN (UDP port 9). The device must support it,
+  and it must be on in the device settings.
 
 - The maker comes from the IEEE OUI list in `/usr/share/hwdata/oui.txt`
   (package `hwdata`). Phones and laptops often use a random MAC address
@@ -1111,7 +1128,7 @@ systemctl --user enable --now netmon-notify
 
 ### Alerts
 
-`netmond` can send three kinds of alerts. All are off until the rules file
+`netmond` can send four kinds of alerts. All are off until the rules file
 (or the active profile) has an `[alerts]` table. Put it after the
 `default` line, before the first `[[rule]]`:
 
@@ -1121,6 +1138,7 @@ rate_mb = 50          # a program above 50 MB/s (up and down together)
 rate_seconds = 10     # for this many seconds in a row (default 10)
 new_country = true    # a program connects to a country it never used
 new_device = true     # a device that netmond never saw joins a LAN
+device_changes = true # a known device changes its address, goes offline or comes back
 ```
 
 An alert goes to the journal (`netmond: alert: ...`), the UI status line
@@ -1144,6 +1162,9 @@ An alert goes to the journal (`netmond: alert: ...`), the UI status line
 - New device: a MAC address that is not in `/var/lib/netmon/devices.json`
   (see [Devices tab](#devices-tab)). Without that file, the first 2
   minutes only learn. The host itself never alerts.
+- `device_changes = true`: a known device changes its IPv4 address, goes
+  offline (not seen for 15 minutes) or comes back. Phones sleep often and
+  then cause many of these alerts.
 
 ### New listeners
 

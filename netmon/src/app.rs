@@ -359,6 +359,9 @@ pub enum Action {
     BlockDnsName,
     /// Next bandwidth limit of the selected process's exe (off, 1, 5, 20 MB/s).
     CycleLimit,
+    /// Wake-on-LAN and port check of the selected device.
+    WakeDevice,
+    CheckPorts,
     /// Suggest allow rules from the connection log (the client opens the list).
     SuggestRules,
     /// Add the picked suggestions.
@@ -601,6 +604,8 @@ impl App {
             Key::Char('d') if self.tab == Tab::Hosts => return Some(Action::RemoveHost),
             Key::Char('r') if self.tab == Tab::Hosts => return Some(Action::ReloadBlocklists),
             Key::Char('r') if self.tab == Tab::Devices => return Some(Action::ScanDevices),
+            Key::Char('w') if self.tab == Tab::Devices => return Some(Action::WakeDevice),
+            Key::Char('o') if self.tab == Tab::Devices => return Some(Action::CheckPorts),
             Key::Char('d') if self.tab == Tab::Log => {
                 self.show_dns = !self.show_dns;
                 self.reset_selection();
@@ -741,7 +746,11 @@ impl App {
     pub fn device_rows(&self) -> Vec<&crate::devices::Device> {
         self.devices
             .iter()
-            .filter(|d| self.matches(&[&d.ip.to_string(), &crate::devices::mac_text(&d.mac), &d.vendor, &d.name, &d.iface]))
+            .filter(|d| {
+                let v6: Vec<String> = d.ipv6.iter().map(|a| a.to_string()).collect();
+                let ports: Vec<String> = d.open_ports.iter().map(|p| p.to_string()).collect();
+                self.matches(&[&d.ip.to_string(), &crate::devices::mac_text(&d.mac), &d.vendor, &d.name, &d.iface, &v6.join(" "), &ports.join(" ")])
+            })
             .collect()
     }
 

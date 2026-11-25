@@ -12,7 +12,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket},
     path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
@@ -56,6 +56,179 @@ pub struct Device {
     /// A default gateway of the host.
     #[serde(default)]
     pub gateway: bool,
+    /// IPv6 addresses from the neighbor table, global ones first.
+    #[serde(default)]
+    pub ipv6: Vec<Ipv6Addr>,
+    /// Open TCP ports of the last port check, and when it ran (0: never).
+    #[serde(default)]
+    pub open_ports: Vec<u16>,
+    #[serde(default)]
+    pub ports_checked: u64,
+}
+
+/// IPv6 addresses kept per device.
+const MAX_IPV6: usize = 4;
+/// TCP ports of the port check: remote access, file sharing, printers,
+/// media and smart home services.
+pub const CHECK_PORTS: [u16; 26] = [
+    21, 22, 23, 53, 80, 139, 443, 445, 515, 548, 554, 631, 1883, 3389, 5000, 5900, 7000, 8008, 8009, 8080, 8443,
+    8883, 9100, 32400, 49152, 62078,
+];
+const PORT_WAIT: Duration = Duration::from_millis(400);
+/// What a port is usually for, for the result message.
+pub fn port_name(p: u16) -> &'static str {
+    match p {
+        21 => "ftp",
+        22 => "ssh",
+        23 => "telnet",
+        53 => "dns",
+        80 => "http",
+        139 | 445 => "smb",
+        443 | 8443 => "https",
+        515 | 631 | 9100 => "printer",
+        548 => "afp",
+        554 => "rtsp",
+        1883 | 8883 => "mqtt",
+        3389 => "rdp",
+        5900 => "vnc",
+        7000 => "airplay",
+        8008 | 8009 => "chromecast",
+        8080 => "http-alt",
+        32400 => "plex",
+        62078 => "iphone",
+        _ => "",
+    }
+}
+
+/// The magic packet of Wake-on-LAN: 6 bytes 0xff, then the MAC 16 times.
+pub fn magic_packet(mac: &[u8; 6]) -> [u8; 102] {
+    let mut p = [0xffu8; 102];
+    for i in 0..16 {
+        p[6 + i * 6..12 + i * 6].copy_from_slice(mac);
+    }
+    p
+}
+
+/// The broadcast address of a LAN.
+pub fn broadcast(ip: Ipv4Addr, prefix: u8) -> Ipv4Addr {
+    let host = if prefix >= 32 { 0 } else { u32::MAX >> prefix };
+    Ipv4Addr::from(u32::from(ip) | host)
+}
+
+const RTM_NEWNEIGH: u16 = 28;
+const RTM_GETNEIGH: u16 = 30;
+const NLMSG_DONE: u16 = 3;
+const NLMSG_ERROR: u16 = 2;
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
+/// NUD_INCOMPLETE and NUD_FAILED: no MAC address, or it did not answer.
+const NUD_UNUSABLE: u16 = 0x01 | 0x20;
+/// NUD_REACHABLE: the device answered in the last seconds.
+const NUD_REACHABLE: u16 = 0x02;
+
+/// One IPv6 neighbor: interface index, address, MAC, recently reachable.
+pub type Neighbor6 = (u32, Ipv6Addr, [u8; 6], bool);
+
+/// IPv6 entries of an RTM_GETNEIGH dump reply (one netlink datagram).
+/// Returns whether the dump is done.
+pub fn parse_neigh_dump(mut buf: &[u8], out: &mut Vec<Neighbor6>) -> bool {
+    while buf.len() >= 16 {
+        let len = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let ty = u16::from_ne_bytes(buf[4..6].try_into().unwrap());
+        if len < 16 || len > buf.len() {
+            return true;
+        }
+        if ty == NLMSG_DONE || ty == NLMSG_ERROR {
+            return true;
+        }
+        let msg = &buf[16..len];
+        // struct ndmsg: family u8, 3 pad, ifindex i32, state u16, flags u8, type u8.
+        if ty == RTM_NEWNEIGH && msg.len() >= 12 && msg[0] == libc::AF_INET6 as u8 {
+            let ifindex = i32::from_ne_bytes(msg[4..8].try_into().unwrap()) as u32;
+            let state = u16::from_ne_bytes(msg[8..10].try_into().unwrap());
+            let (mut dst, mut ll) = (None, None);
+            let mut a = &msg[12..];
+            while a.len() >= 4 {
+                let alen = u16::from_ne_bytes(a[0..2].try_into().unwrap()) as usize;
+                let aty = u16::from_ne_bytes(a[2..4].try_into().unwrap()) & 0x3fff;
+                if alen < 4 || alen > a.len() {
+                    break;
+                }
+                let v = &a[4..alen];
+                match (aty, v.len()) {
+                    (NDA_DST, 16) => dst = Some(Ipv6Addr::from(<[u8; 16]>::try_from(v).unwrap())),
+                    (NDA_LLADDR, 6) => ll = Some(<[u8; 6]>::try_from(v).unwrap()),
+                    _ => {}
+                }
+                a = &a[((alen + 3) & !3).min(a.len())..];
+            }
+            if let (Some(d), Some(m)) = (dst, ll)
+                && state & NUD_UNUSABLE == 0
+                && usable_mac(&m)
+                && !d.is_multicast()
+            {
+                out.push((ifindex, d, m, state & NUD_REACHABLE != 0));
+            }
+        }
+        buf = &buf[((len + 3) & !3).min(buf.len())..];
+    }
+    false
+}
+
+/// The kernel's IPv6 neighbor table, by rtnetlink dump.
+fn neighbors6() -> Vec<Neighbor6> {
+    let mut out = Vec::new();
+    // SAFETY: plain socket calls on a buffer that outlives them; the fd is
+    // closed before return.
+    unsafe {
+        let fd = libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE);
+        if fd < 0 {
+            return out;
+        }
+        let tv = libc::timeval { tv_sec: 1, tv_usec: 0 };
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO, &tv as *const _ as *const libc::c_void, size_of::<libc::timeval>() as u32);
+        let mut req = [0u8; 28];
+        req[0..4].copy_from_slice(&28u32.to_ne_bytes());
+        req[4..6].copy_from_slice(&RTM_GETNEIGH.to_ne_bytes());
+        // NLM_F_REQUEST | NLM_F_DUMP
+        req[6..8].copy_from_slice(&0x301u16.to_ne_bytes());
+        req[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        req[16] = libc::AF_INET6 as u8;
+        if libc::send(fd, req.as_ptr().cast(), req.len(), 0) == req.len() as isize {
+            let mut buf = vec![0u8; 32768];
+            for _ in 0..64 {
+                let n = libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0);
+                if n <= 0 || parse_neigh_dump(&buf[..n as usize], &mut out) {
+                    break;
+                }
+            }
+        }
+        libc::close(fd);
+    }
+    out
+}
+
+/// An ICMPv6 echo request to all nodes of the link (ff02::1): every IPv6
+/// device answers, so the kernel learns their MAC addresses.
+fn ping_all_nodes(ifindex: u32) -> std::io::Result<()> {
+    // SAFETY: plain socket calls; the fd is closed before return.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::IPPROTO_ICMPV6);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut to: libc::sockaddr_in6 = std::mem::zeroed();
+        to.sin6_family = libc::AF_INET6 as u16;
+        to.sin6_addr.s6_addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1).octets();
+        to.sin6_scope_id = ifindex;
+        // Echo request: type 128, code 0; the kernel fills the checksum
+        // and the identifier.
+        let echo = [128u8, 0, 0, 0, 0, 0, 0, 1];
+        let n = libc::sendto(fd, echo.as_ptr().cast(), echo.len(), 0, &to as *const _ as *const libc::sockaddr, size_of::<libc::sockaddr_in6>() as u32);
+        let err = std::io::Error::last_os_error();
+        libc::close(fd);
+        if n < 0 { Err(err) } else { Ok(()) }
+    }
 }
 
 pub fn mac_text(m: &[u8; 6]) -> String {
@@ -259,6 +432,14 @@ struct State {
     error: Option<String>,
     /// Default gateways of the host: interface and address.
     gateways: Vec<(String, Ipv4Addr)>,
+    /// The LANs as last read, for Wake-on-LAN.
+    lans: Vec<Lan>,
+    /// Address changes since the last `take` (for the device_changes alert),
+    /// and results of port checks and wake requests (status messages).
+    changes: Vec<String>,
+    messages: Vec<String>,
+    /// A port check runs.
+    checking: bool,
 }
 
 impl State {
@@ -269,6 +450,10 @@ impl State {
     fn see(&mut self, oui: &HashMap<[u8; 3], String>, iface: &str, mac: [u8; 6], ip: Ipv4Addr, heard: bool, unix: u64, now: Instant) -> bool {
         if let Some(d) = self.devices.get_mut(&mac) {
             let moved = d.ip != ip || d.iface != iface;
+            if moved && !d.ip.is_unspecified() && !ip.is_unspecified() && !d.this_host {
+                let who = if d.name.is_empty() { mac_text(&mac) } else { d.name.clone() };
+                self.changes.push(format!("device {who} moved from {} to {ip} on {iface}", d.ip));
+            }
             if moved {
                 d.ip = ip;
                 d.iface = iface.to_string();
@@ -297,6 +482,9 @@ impl State {
             last_seen: unix,
             this_host: false,
             gateway: self.gateways.iter().any(|(dev, gw)| dev == iface && *gw == ip),
+            ipv6: Vec::new(),
+            open_ports: Vec::new(),
+            ports_checked: 0,
         };
         self.devices.insert(mac, d);
         if self.learn_until.is_none_or(|t| now >= t) {
@@ -306,6 +494,46 @@ impl State {
         self.dirty = true;
         true
     }
+
+    /// Records an IPv6 neighbor. A MAC that has no IPv4 address yet
+    /// becomes a device with the address 0.0.0.0.
+    #[allow(clippy::too_many_arguments)]
+    fn see6(&mut self, oui: &HashMap<[u8; 3], String>, iface: &str, mac: [u8; 6], ip: Ipv6Addr, reachable: bool, unix: u64, now: Instant) {
+        if !self.devices.contains_key(&mac) {
+            if !self.see(oui, iface, mac, Ipv4Addr::UNSPECIFIED, true, unix, now) {
+                return;
+            }
+        } else if reachable
+            && let Some(d) = self.devices.get_mut(&mac)
+            && d.last_seen != unix
+        {
+            d.last_seen = unix;
+            self.changed = true;
+        }
+        let Some(d) = self.devices.get_mut(&mac) else { return };
+        if d.ipv6.contains(&ip) {
+            return;
+        }
+        d.ipv6.push(ip);
+        // Global addresses first; link-local (fe80::/10) last.
+        d.ipv6.sort_by_key(|a| (a.segments()[0] & 0xffc0) == 0xfe80);
+        d.ipv6.truncate(MAX_IPV6);
+        self.changed = true;
+        self.dirty = true;
+    }
+}
+
+/// What the discovery found since the last `take`.
+#[derive(Default)]
+pub(crate) struct Found {
+    /// The device list, if it changed.
+    pub list: Option<Vec<Device>>,
+    pub new: Vec<Device>,
+    /// Address changes and devices that went offline or came back.
+    pub changes: Vec<String>,
+    /// Results of port checks and wake requests.
+    pub messages: Vec<String>,
+    pub error: Option<String>,
 }
 
 /// The discovery threads and their results. Dropping it stops them.
@@ -316,6 +544,8 @@ pub(crate) struct Discovery {
     path: Option<PathBuf>,
     gid: Option<u32>,
     saved: Option<Instant>,
+    /// Devices online at the last `take`; None before the first.
+    online: Option<HashSet<[u8; 6]>>,
 }
 
 impl Discovery {
@@ -345,7 +575,7 @@ impl Discovery {
         let (names_tx, names_rx) = mpsc::channel();
         // Tests never send ARP requests into the network they run on.
         if cfg!(test) {
-            return (Discovery { state, scan, path, gid, saved: None }, msg);
+            return (Discovery { state, scan, path, gid, saved: None, online: None }, msg);
         }
         let s = state.clone();
         std::thread::Builder::new()
@@ -354,7 +584,7 @@ impl Discovery {
             .ok();
         let s = state.clone();
         std::thread::Builder::new().name("netmon-names".into()).spawn(move || name_thread(s, names_rx)).ok();
-        (Discovery { state, scan, path, gid, saved: None }, msg)
+        (Discovery { state, scan, path, gid, saved: None, online: None }, msg)
     }
 
     /// Asks for a sweep now.
@@ -362,17 +592,108 @@ impl Discovery {
         let _ = self.scan.send(());
     }
 
-    /// The device list if it changed, the new devices since the last call,
-    /// and an error of the threads (once).
-    pub(crate) fn take(&mut self) -> (Option<Vec<Device>>, Vec<Device>, Option<String>) {
-        let Ok(mut st) = self.state.lock() else { return (None, Vec::new(), None) };
+    /// What was found since the last call. Online and offline changes
+    /// start at the second call: the first only notes who is online.
+    pub(crate) fn take(&mut self, unix: u64) -> Found {
+        let Ok(mut st) = self.state.lock() else { return Found::default() };
         let new: Vec<Device> = std::mem::take(&mut st.new).iter().filter_map(|m| st.devices.get(m).cloned()).collect();
+        let mut changes = std::mem::take(&mut st.changes);
+        let online: HashSet<[u8; 6]> = st
+            .devices
+            .values()
+            .filter(|d| !d.this_host && unix.saturating_sub(d.last_seen) <= ONLINE_SECS)
+            .map(|d| d.mac)
+            .collect();
+        if let Some(before) = &self.online {
+            let label = |m: &[u8; 6]| {
+                st.devices.get(m).map_or(mac_text(m), |d| {
+                    let ip = if d.ip.is_unspecified() { String::new() } else { format!(" {}", d.ip) };
+                    let name = if d.name.is_empty() { mac_text(m) } else { d.name.clone() };
+                    format!("{name}{ip}")
+                })
+            };
+            let new_macs: HashSet<[u8; 6]> = new.iter().map(|d| d.mac).collect();
+            for m in online.difference(before).filter(|m| !new_macs.contains(*m)) {
+                changes.push(format!("device {} is online again", label(m)));
+            }
+            for m in before.difference(&online) {
+                changes.push(format!("device {} went offline (not seen for 15 min)", label(m)));
+            }
+        }
+        self.online = Some(online);
         let list = std::mem::take(&mut st.changed).then(|| {
             let mut l: Vec<Device> = st.devices.values().cloned().collect();
             l.sort_by_key(|d| (d.iface.clone(), u32::from(d.ip)));
             l
         });
-        (list, new, st.error.take())
+        Found { list, new, changes, messages: std::mem::take(&mut st.messages), error: st.error.take() }
+    }
+
+    /// Sends a Wake-on-LAN packet for `mac` to the broadcast address of its
+    /// LAN. Returns the status message.
+    pub(crate) fn wake(&self, mac: [u8; 6]) -> String {
+        let Ok(st) = self.state.lock() else { return "device list busy".into() };
+        let Some(d) = st.devices.get(&mac) else { return "unknown device".into() };
+        let Some(l) = st.lans.iter().find(|l| l.name == d.iface) else { return format!("{} is not up", d.iface) };
+        let to = broadcast(l.ip, l.prefix);
+        let sent = UdpSocket::bind((l.ip, 0)).and_then(|s| {
+            s.set_broadcast(true)?;
+            s.send_to(&magic_packet(&mac), (to, 9))
+        });
+        match sent {
+            Ok(_) => format!("Wake-on-LAN packet sent to {} via {to}", mac_text(&mac)),
+            Err(e) => format!("Wake-on-LAN failed: {e}"),
+        }
+    }
+
+    /// Starts a check of CHECK_PORTS on the device; the result comes as a
+    /// message. Returns the status message.
+    pub(crate) fn check_ports(&self, mac: [u8; 6]) -> String {
+        let ip = {
+            let Ok(mut st) = self.state.lock() else { return "device list busy".into() };
+            if st.checking {
+                return "a port check runs already".into();
+            }
+            let Some(d) = st.devices.get(&mac) else { return "unknown device".into() };
+            if d.ip.is_unspecified() {
+                return "the device has no IPv4 address".into();
+            }
+            let ip = d.ip;
+            st.checking = true;
+            ip
+        };
+        let state = self.state.clone();
+        let spawned = std::thread::Builder::new().name("netmon-ports".into()).spawn(move || {
+            let open: Vec<u16> = CHECK_PORTS
+                .iter()
+                .copied()
+                .filter(|p| TcpStream::connect_timeout(&SocketAddr::from((ip, *p)), PORT_WAIT).is_ok())
+                .collect();
+            if let Ok(mut st) = state.lock() {
+                st.checking = false;
+                let text = if open.is_empty() {
+                    "none".to_string()
+                } else {
+                    open.iter().map(|p| format!("{p} {}", port_name(*p)).trim().to_string()).collect::<Vec<_>>().join(", ")
+                };
+                st.messages.push(format!("open ports of {ip}: {text} ({} checked)", CHECK_PORTS.len()));
+                if let Some(d) = st.devices.get_mut(&mac) {
+                    d.open_ports = open;
+                    d.ports_checked = crate::rules::unix_now();
+                }
+                st.changed = true;
+                st.dirty = true;
+            }
+        });
+        match spawned {
+            Ok(_) => format!("checking {} TCP ports of {ip}", CHECK_PORTS.len()),
+            Err(e) => {
+                if let Ok(mut st) = self.state.lock() {
+                    st.checking = false;
+                }
+                format!("port check failed: {e}")
+            }
+        }
     }
 
     /// Writes the devices file if it changed and a minute passed (or
@@ -444,6 +765,7 @@ fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::S
             let gws = std::fs::read_to_string("/proc/net/route").map(|t| gateways(&t)).unwrap_or_default();
             if let Ok(mut st) = state.lock() {
                 st.gateways = gws.clone();
+                st.lans = lan_list.clone();
                 for l in &lan_list {
                     st.see(&oui, &l.name, l.mac, l.ip, true, unix, now);
                     // The host itself is no new device, and has its own name.
@@ -478,6 +800,8 @@ fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::S
                 if let Err(e) = sweep(fd, l) {
                     report(format!("ARP sweep on {}: {e}", l.name));
                 }
+                // No IPv6 on the LAN is no error.
+                let _ = ping_all_nodes(l.index);
             }
         }
         if now >= next_neigh {
@@ -489,6 +813,13 @@ fn arp_thread(state: Arc<Mutex<State>>, scan: mpsc::Receiver<()>, names: mpsc::S
                         && st.see(&oui, &l.name, mac, ip, false, unix, now)
                     {
                         lookup(mac, ip);
+                    }
+                }
+                for (index, ip, mac, reachable) in neighbors6() {
+                    if let Some(l) = lan_list.iter().find(|l| l.index == index)
+                        && mac != l.mac
+                    {
+                        st.see6(&oui, &l.name, mac, ip, reachable, unix, now);
                     }
                 }
             }
@@ -728,6 +1059,87 @@ mod tests {
         assert_eq!(ago(100, 100 + 3 * 3600), "3h");
     }
 
+    /// One RTM_NEWNEIGH message for `ip` on interface 2.
+    fn neigh_msg(ip: Ipv6Addr, mac: [u8; 6], state: u16) -> Vec<u8> {
+        let mut m = vec![0u8; 16];
+        m[4..6].copy_from_slice(&RTM_NEWNEIGH.to_ne_bytes());
+        let mut nd = vec![libc::AF_INET6 as u8, 0, 0, 0];
+        nd.extend_from_slice(&2i32.to_ne_bytes());
+        nd.extend_from_slice(&state.to_ne_bytes());
+        nd.extend_from_slice(&[0, 0]);
+        m.extend_from_slice(&nd);
+        m.extend_from_slice(&20u16.to_ne_bytes());
+        m.extend_from_slice(&NDA_DST.to_ne_bytes());
+        m.extend_from_slice(&ip.octets());
+        m.extend_from_slice(&10u16.to_ne_bytes());
+        m.extend_from_slice(&NDA_LLADDR.to_ne_bytes());
+        m.extend_from_slice(&mac);
+        m.extend_from_slice(&[0, 0]);
+        let len = m.len() as u32;
+        m[0..4].copy_from_slice(&len.to_ne_bytes());
+        m
+    }
+
+    #[test]
+    fn parses_ipv6_neighbor_dumps() {
+        let a: Ipv6Addr = "2a02:8388::1".parse().unwrap();
+        let b: Ipv6Addr = "fe80::1".parse().unwrap();
+        let mut buf = neigh_msg(a, [0, 1, 2, 3, 4, 5], NUD_REACHABLE);
+        buf.extend(neigh_msg(b, [0, 1, 2, 3, 4, 6], 0x04));
+        buf.extend(neigh_msg(b, [0, 1, 2, 3, 4, 7], 0x20));
+        let mut out = Vec::new();
+        assert!(!parse_neigh_dump(&buf, &mut out), "no DONE yet");
+        assert_eq!(out, vec![(2, a, [0, 1, 2, 3, 4, 5], true), (2, b, [0, 1, 2, 3, 4, 6], false)], "FAILED left out");
+        let mut done = vec![0u8; 20];
+        done[0..4].copy_from_slice(&20u32.to_ne_bytes());
+        done[4..6].copy_from_slice(&NLMSG_DONE.to_ne_bytes());
+        assert!(parse_neigh_dump(&done, &mut out));
+        for n in 0..buf.len() {
+            parse_neigh_dump(&buf[..n], &mut Vec::new());
+        }
+    }
+
+    #[test]
+    fn wake_packet_and_broadcast() {
+        let p = magic_packet(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&p[..6], &[0xff; 6]);
+        assert_eq!(&p[96..], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(broadcast(Ipv4Addr::new(192, 168, 1, 140), 24), Ipv4Addr::new(192, 168, 1, 255));
+        assert_eq!(broadcast(Ipv4Addr::new(10, 1, 2, 3), 22), Ipv4Addr::new(10, 1, 3, 255));
+        assert_eq!(port_name(9100), "printer");
+    }
+
+    #[test]
+    fn changes_ipv6_and_online_state() {
+        let oui = HashMap::new();
+        let t0 = Instant::now();
+        let (mut d, _) = Discovery::start(None, None);
+        let (a, b) = ([0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 6]);
+        {
+            let mut st = d.state.lock().unwrap();
+            st.learn_until = None;
+            st.see(&oui, "eth0", a, Ipv4Addr::new(10, 0, 0, 2), true, 1000, t0);
+            st.devices.get_mut(&a).unwrap().name = "nas".into();
+            st.see6(&oui, "eth0", a, "fe80::5".parse().unwrap(), false, 1000, t0);
+            st.see6(&oui, "eth0", a, "2a02::5".parse().unwrap(), false, 1000, t0);
+            st.see6(&oui, "eth0", b, "2a02::6".parse().unwrap(), true, 1000, t0);
+        }
+        let f = d.take(1000);
+        assert!(f.changes.is_empty(), "the first take only notes who is online");
+        let list = f.list.unwrap();
+        let da = list.iter().find(|x| x.mac == a).unwrap();
+        assert_eq!(da.ipv6, vec!["2a02::5".parse::<Ipv6Addr>().unwrap(), "fe80::5".parse().unwrap()], "global first");
+        assert!(list.iter().any(|x| x.mac == b && x.ip.is_unspecified()), "IPv6-only device");
+        d.state.lock().unwrap().see(&oui, "eth0", a, Ipv4Addr::new(10, 0, 0, 9), true, 1100, t0);
+        assert_eq!(d.take(1100).changes, vec!["device nas moved from 10.0.0.2 to 10.0.0.9 on eth0"]);
+        let f = d.take(1000 + ONLINE_SECS + 50);
+        assert_eq!(f.changes.len(), 1, "{:?}", f.changes);
+        assert!(f.changes[0].contains("02:03:04:06") || f.changes[0].starts_with("device 00:01:02:03:04:06 went offline"), "{:?}", f.changes);
+        d.state.lock().unwrap().see(&oui, "eth0", b, Ipv4Addr::new(10, 0, 0, 7), true, 1000 + ONLINE_SECS + 60, t0);
+        let f = d.take(1000 + ONLINE_SECS + 60);
+        assert!(f.changes.iter().any(|c| c == "device 00:01:02:03:04:06 10.0.0.7 is online again"), "{:?}", f.changes);
+    }
+
     #[test]
     fn discovery_saves_and_loads_the_file() {
         let _lock = crate::test_fs_lock();
@@ -749,9 +1161,9 @@ mod tests {
         assert_eq!(saved.len(), 1, "the host itself is not saved");
         drop(d);
         let (mut d, _) = Discovery::start(Some(path.clone()), None);
-        let (list, new, _) = d.take();
-        assert!(list.unwrap().iter().any(|x| x.mac == [0, 1, 2, 3, 4, 5]));
-        assert!(new.is_empty());
+        let found = d.take(100);
+        assert!(found.list.unwrap().iter().any(|x| x.mac == [0, 1, 2, 3, 4, 5]));
+        assert!(found.new.is_empty());
         assert!(d.state.lock().unwrap().learn_until.is_none(), "with a file: no learning");
         std::fs::remove_dir_all(&dir).unwrap();
     }

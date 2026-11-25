@@ -532,6 +532,13 @@ Small, independent features after the firewall core:
   (replies). A picker adds the picked rules at the end
   (`Request::AddAllowRules`, all or none). Protocol 11. Tested on the
   real log: 36 305 lines gave 65 suggestions.
+- **Devices extras: done (2026-11-25).** IPv6 neighbors by rtnetlink dump
+  after an ICMPv6 echo to ff02::1 per sweep; IPv6-only devices get
+  0.0.0.0. `o` checks 26 TCP ports (thread, 0.4 s each, one at a time),
+  `w` sends a Wake-on-LAN packet to the LAN broadcast. `device_changes` in
+  `[alerts]`: address change, offline (15 min), online again (from the
+  second take on). Protocol 12. Tested: router ports 53/80/443/49152,
+  WoL sent, IPv6 of two devices.
 - **History**: per-process daily totals in SQLite.
 
 ## Phase 9 – Connection graph
